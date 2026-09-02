@@ -1,0 +1,3738 @@
+#!/usr/bin/env python3
+"""
+nsx-toolkit.py -- NSX Zero Trust Segmentation Toolkit
+
+GENERATED FILE -- do not edit directly.
+Built from src/nsx_toolkit/ by tools/build_single_file.py.
+Edit the package and rebuild; CI fails if this file is out of date.
+
+Single file, no install required. Works with the 'requests' library when it is
+present and falls back to the Python standard library when it is not.
+
+    python3 nsx-toolkit.py              guided setup, then interactive menu
+    python3 nsx-toolkit.py --help       every non-interactive flag
+    python3 nsx-toolkit.py --dashboard  taxonomy compliance posture
+
+DESIGN NOTES
+  - API CONTRACT: every path, parameter and field is declared once, in the
+    API CONTRACT section. A future NSX release changes ONE constant.
+  - Credentials resolve before anything else runs, and are never printed.
+  - Scope follows the action: tag ops = LMs only; group/rule ops = GM + LMs.
+  - Writes are audit-logged with before/after state, and are undoable.
+  - Console listings truncate for readability; exports never do.
+"""
+
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import argparse
+import base64
+import csv
+import datetime
+import getpass
+import json
+import os
+import platform
+import random
+import re
+import socket
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+# ==========================================================================
+# version.py  --  Tool identity. Single source of truth for name and version strings.
+# ==========================================================================
+
+VERSION = "3.0.0"
+VERSION_DATE = "2026-09-02"
+TOOL_NAME = "NSX Toolkit"
+TOOL_TAGLINE = "Zero Trust Segmentation · Groups, Tags & DFW"
+
+
+# ==========================================================================
+# errors.py  --  Exception types shared across the toolkit.
+# ==========================================================================
+
+class NsxError(Exception):
+    """Any failure talking to (or interpreting a response from) NSX."""
+
+
+class UserAbort(Exception):
+    """The operator backed out of a prompt ('b', Ctrl-C, or EOF)."""
+
+
+class ConfigError(Exception):
+    """Inventory, taxonomy, or credential configuration is unusable."""
+
+
+# ==========================================================================
+# paths.py  --  Filesystem locations and time helpers.
+# ==========================================================================
+
+def utc_now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+
+
+def utc_now_stamp():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC")
+
+
+def local_stamp():
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".nsx_toolkit")
+DEFAULT_INVENTORY_NAME = "inventory.json"
+DEFAULT_TAXONOMY_NAMES = ("taxonomy.yaml", "taxonomy.yml", "taxonomy.json")
+DEFAULT_CREDS_FILE = os.path.join(DATA_DIR, "credentials.env")
+DEFAULT_AUDIT_FILE = os.path.join(DATA_DIR, "audit.log")
+
+# Audit log rotates at this size so it never grows without bound.
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_KEEP = 3
+
+
+def _default_export_base():
+    """Windows -> Documents\\nsxtoolkit ; Linux/Mac -> ~/nsxtoolkit"""
+    home = os.path.expanduser("~")
+    if os.name == "nt":
+        docs = os.path.join(home, "Documents")
+        base = docs if os.path.isdir(docs) else home
+        return os.path.join(base, "nsxtoolkit")
+    return os.path.join(home, "nsxtoolkit")
+
+
+DEFAULT_EXPORT_DIR = os.path.join(_default_export_base(), "exports")
+DEFAULT_TICKET_DIR = os.path.join(_default_export_base(), "change_plans")
+DEFAULT_SNAPSHOT_DIR = os.path.join(_default_export_base(), "snapshots")
+
+
+def config_search_dirs():
+    """Where we look for inventory.json / taxonomy.yaml, in priority order.
+
+    Current directory first so a per-project inventory wins, then the
+    per-user data dir so a personal default always exists.
+    """
+    return [os.getcwd(), DATA_DIR]
+
+
+# ==========================================================================
+# output.py  --  Console output: color, tables, spinners, prompts, and run-mode state.
+# ==========================================================================
+
+W = 76
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+# === RUN MODE ===
+def _enable_ansi_windows():
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-11)
+        m = ctypes.c_ulong()
+        k.GetConsoleMode(h, ctypes.byref(m))
+        k.SetConsoleMode(h, m.value | 0x0004)
+        return True
+    except Exception:
+        return False
+
+
+_color_enabled = (sys.stdout.isatty() and "NO_COLOR" not in os.environ
+                  and _enable_ansi_windows())
+_json_mode = False
+_interactive = sys.stdin.isatty()
+_assume_yes = False
+_debug = False
+
+
+def set_color(enabled):
+    global _color_enabled
+    _color_enabled = bool(enabled)
+
+
+def set_json_mode(enabled):
+    """JSON mode implies no color and no prompting: stdout must stay parseable."""
+    global _json_mode, _color_enabled, _interactive
+    _json_mode = bool(enabled)
+    if _json_mode:
+        _color_enabled = False
+        _interactive = False
+
+
+def is_json_mode():
+    return _json_mode
+
+
+def set_interactive(enabled):
+    global _interactive
+    _interactive = bool(enabled)
+
+
+def is_interactive():
+    return _interactive
+
+
+def set_assume_yes(enabled):
+    global _assume_yes
+    _assume_yes = bool(enabled)
+
+
+def assume_yes():
+    return _assume_yes
+
+
+def set_debug(enabled):
+    global _debug
+    _debug = bool(enabled)
+
+
+def is_debug():
+    return _debug
+
+
+# === COLOR ===
+def _c(code, text):
+    return "\033[{}m{}\033[0m".format(code, text) if _color_enabled else str(text)
+
+
+def cG(t):
+    return _c("32", t)
+
+
+def cR(t):
+    return _c("31", t)
+
+
+def cY(t):
+    return _c("33", t)
+
+
+def cC(t):
+    return _c("36", t)
+
+
+def cB(t):
+    return _c("1", t)
+
+
+def cD(t):
+    return _c("2", t)
+
+
+def cBG(t):
+    return _c("1;32", t)
+
+
+def cBR(t):
+    return _c("1;31", t)
+
+
+def cBY(t):
+    return _c("1;33", t)
+
+
+def cBC(t):
+    return _c("1;36", t)
+
+
+def strip_ansi(text):
+    return _ANSI_RE.sub("", str(text))
+
+
+# === MESSAGES ===
+def say(msg=""):
+    if not _json_mode:
+        print(msg, flush=True)
+
+
+def err(msg):
+    print("  {} {}".format(cBR("[ERROR]"), msg), file=sys.stderr, flush=True)
+
+
+def warn(msg):
+    if not _json_mode:
+        print("  {}  {}".format(cBY("[WARN]"), msg), flush=True)
+
+
+def ok_msg(msg):
+    if not _json_mode:
+        print("  {}    {}".format(cBG("[OK]"), msg), flush=True)
+
+
+def debug(msg):
+    """Diagnostic trace. Goes to stderr so it never pollutes --json stdout."""
+    if _debug:
+        print("  {} {}".format(cD("[debug]"), msg), file=sys.stderr, flush=True)
+
+
+def hr(char="-"):
+    say(cD(char * W))
+
+
+def section(title):
+    say("\n{}\n  {}\n{}".format(cBC("=" * W), cB(title), cBC("=" * W)))
+
+
+def progress_bar(cur, total, width=25):
+    if total == 0:
+        return "[" + " " * width + "]   0%"
+    filled = int(width * cur / total)
+    bar = "=" * filled + " " * (width - filled)
+    pct = int(100 * cur / total)
+    fn = cBG if pct >= 80 else (cBY if pct >= 50 else cBR)
+    return "[{}] {}".format(fn(bar), fn("{:3d}%".format(pct)))
+
+
+def table(headers, rows, indent=2):
+    if not rows:
+        say(" " * indent + cD("(no data)"))
+        return
+    widths = [len(h) for h in headers]
+    sr = []
+    for row in rows:
+        cells = [str(c) for c in row]
+        while len(cells) < len(headers):
+            cells.append("")
+        sr.append(cells)
+        for i, c in enumerate(cells):
+            if i < len(widths):
+                widths[i] = max(widths[i], len(strip_ansi(c)))
+    pad = " " * indent
+    say(pad + "  ".join(cB(h.ljust(widths[i])) for i, h in enumerate(headers)))
+    say(pad + "  ".join(cD("-" * widths[i]) for i in range(len(headers))))
+    for cells in sr:
+        parts = []
+        for i, c in enumerate(cells):
+            cl = len(strip_ansi(c))
+            parts.append(c.ljust(widths[i] + len(c) - cl))
+        say(pad + "  ".join(parts))
+
+
+def more_note(shown, total, where="full set in export"):
+    """Console truncation notice. Truncation is display-only -- exports and
+    JSON always carry every row."""
+    if total > shown:
+        say("    {}".format(cD("... +{} more ({})".format(total - shown, where))))
+
+
+class Spinner:
+    FRAMES = ["|", "/", "-", "\\"]
+
+    def __init__(self, label="Working"):
+        self._label = label
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        if _json_mode or not sys.stdout.isatty():
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=2)
+            sys.stdout.write("\r" + " " * (len(self._label) + 12) + "\r")
+            sys.stdout.flush()
+
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            sys.stdout.write("\r  {} {} ...".format(cC(self.FRAMES[i % 4]), self._label))
+            sys.stdout.flush()
+            i += 1
+            self._stop.wait(0.15)
+
+
+def parallel_run(items, fn, label="Querying", max_workers=8, key=None):
+    """Run fn over items concurrently. Returns {key(item): result_or_Exception}.
+
+    Exceptions are captured per item rather than raised, so one unreachable
+    manager never aborts a sweep across the rest.
+    """
+    results = {}
+    n = len(items)
+    if n == 0:
+        return results
+    if key is None:
+        def key(x):
+            return getattr(x, "name", x)
+    with ThreadPoolExecutor(max_workers=min(n, max_workers)) as pool:
+        futures = {pool.submit(fn, it): it for it in items}
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            it = futures[future]
+            if not _json_mode and sys.stdout.isatty():
+                counter = cC("[{}/{}]".format(done, n))
+                sys.stdout.write("\r  {} {} ...".format(counter, label))
+                sys.stdout.flush()
+            try:
+                results[key(it)] = future.result()
+            except Exception as e:
+                results[key(it)] = e
+    if not _json_mode and sys.stdout.isatty():
+        sys.stdout.write("\r" + " " * 60 + "\r")
+        sys.stdout.flush()
+    return results
+
+
+# === PROMPTS ===
+def ask(prompt, default=None, allow_back=True):
+    """Prompt for input. In non-interactive mode the default is returned
+    rather than blocking on a stdin that will never deliver."""
+    if not _interactive:
+        if default is not None:
+            return default
+        raise UserAbort()
+    try:
+        val = input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        raise UserAbort() from None
+    if allow_back and val.lower() == "b":
+        raise UserAbort()
+    return val if val else (default if default is not None else val)
+
+
+def confirm(prompt):
+    """Yes/no gate. --yes auto-confirms; non-interactive without --yes is a
+    refusal, never an assumed yes."""
+    if _assume_yes:
+        say("{}{}".format(prompt, cG("yes (--yes)")))
+        return True
+    if not _interactive:
+        return False
+    return ask(prompt, default="n", allow_back=False).lower() in ("y", "yes")
+
+
+# ==========================================================================
+# api.py  --  NSX API contract.
+# ==========================================================================
+
+# --- Bases -----------------------------------------------------------------
+API_BASE_LM = "/policy/api/v1/infra"
+API_BASE_GM_CANDIDATES = [
+    "/global-manager/api/v1/global-infra",
+    "/policy/api/v1/global-infra",
+]
+
+# --- Policy paths (relative to a base) -------------------------------------
+PATH_GROUPS = "/domains/{domain}/groups"
+PATH_GROUP_MEMBERS = "/domains/{domain}/groups/{gid}/members/virtual-machines"
+PATH_SEC_POLICIES = "/domains/{domain}/security-policies"
+PATH_SEC_RULES = "/domains/{domain}/security-policies/{pid}/rules"
+PATH_DOMAINS = "/domains"
+
+# Reverse lookup: groups a VM belongs to, regardless of the group's member
+# type (VirtualMachine, VIF, IPAddress, Segment, SegmentPort, ...). This is
+# the same index NSX's own group-search UI uses. NOT domain-scoped -- it
+# hangs directly off {base}, not {base}/domains/{domain}/...
+PATH_VM_GROUP_ASSOC = "/virtual-machine-group-associations"
+
+# --- Manager (non-policy) paths, absolute ----------------------------------
+PATH_FABRIC_VMS = "/api/v1/fabric/virtual-machines"
+PATH_SESSION_CREATE = "/api/session/create"
+PATH_NODE_VERSION = "/api/v1/node/version"
+
+# --- Query parameters ------------------------------------------------------
+PARAM_CURSOR = "cursor"
+PARAM_PAGE_SIZE = "page_size"
+PARAM_DISPLAY_NAME = "display_name"
+PARAM_ACTION = "action"
+PARAM_VM_EXTERNAL_ID = "vm_external_id"
+ACTION_UPDATE_TAGS = "update_tags"
+PAGE_SIZE = 1000
+
+# --- Response fields -------------------------------------------------------
+F_RESULTS, F_CURSOR, F_RESULT_COUNT = "results", "cursor", "result_count"
+F_ID, F_DISPLAY_NAME, F_PATH = "id", "display_name", "path"
+F_DESCRIPTION, F_EXPRESSION = "description", "expression"
+F_TAGS, F_TAG_SCOPE, F_TAG_VALUE = "tags", "scope", "tag"
+F_EXTERNAL_ID, F_POWER_STATE = "external_id", "power_state"
+F_SOURCE_GROUPS, F_DEST_GROUPS = "source_groups", "destination_groups"
+F_SCOPE, F_ACTION_FIELD = "scope", "action"
+F_SEQUENCE_NUMBER, F_CATEGORY = "sequence_number", "category"
+F_RULES = "rules"
+F_TARGET_ID = "target_id"
+F_TARGET_DISPLAY_NAME = "target_display_name"
+F_TARGET_TYPE = "target_type"
+F_IS_VALID = "is_valid"
+F_NODE_VERSION = "node_version"
+F_PRODUCT_VERSION = "product_version"
+
+# --- Expression / criteria types -------------------------------------------
+RT = "resource_type"
+RT_CONDITION, RT_CONJUNCTION = "Condition", "ConjunctionOperator"
+RT_NESTED, RT_IPADDRESS = "NestedExpression", "IPAddressExpression"
+RT_PATHEXPR, RT_EXTERNALID = "PathExpression", "ExternalIDExpression"
+F_CONJ_OP, F_KEY, F_OPERATOR, F_VALUE = (
+    "conjunction_operator", "key", "operator", "value")
+F_MEMBER_TYPE, F_EXPRESSIONS = "member_type", "expressions"
+F_IP_ADDRESSES, F_PATHS, F_EXTERNAL_IDS = "ip_addresses", "paths", "external_ids"
+KEY_TAG, TAG_SCOPE_SEPARATOR = "Tag", "|"
+
+# --- Roles and domains -----------------------------------------------------
+DEFAULT_DOMAIN = "default"
+ROLE_GM, ROLE_LM = "gm", "lm"
+ROLE_LABEL = {ROLE_GM: "Global Manager", ROLE_LM: "Local Manager"}
+
+# NSX marks where an object was authored via its path: GM-authored objects
+# keep a '/global-infra/...' path even when read back from an LM they've been
+# realized onto; LM-native objects use '/infra/...'. This is how we tell "this
+# LM rule is actually a GM rule realized locally" apart from a genuinely
+# LM-native rule -- used to dedupe GM rules across many LMs.
+_GLOBAL_INFRA_PREFIX = "/global-infra/"
+
+
+def origin_of_path(path):
+    if not path:
+        return "LM"
+    return "GM" if path.startswith(_GLOBAL_INFRA_PREFIX) else "LM"
+
+
+# --- Path builders ---------------------------------------------------------
+def p_groups(base, domain):
+    return base + PATH_GROUPS.format(domain=domain)
+
+
+def p_group_members(base, domain, gid):
+    return base + PATH_GROUP_MEMBERS.format(domain=domain, gid=gid)
+
+
+def p_sec_policies(base, domain):
+    return base + PATH_SEC_POLICIES.format(domain=domain)
+
+
+def p_sec_rules(base, domain, pid):
+    return base + PATH_SEC_RULES.format(domain=domain, pid=pid)
+
+
+def p_vm_group_assoc(base):
+    return base + PATH_VM_GROUP_ASSOC
+
+
+def p_domains(base):
+    return base + PATH_DOMAINS
+
+
+def group_id_from_path(path):
+    """Last path segment of a group path, which is its id."""
+    return path.rsplit("/", 1)[-1] if "/" in str(path) else str(path)
+
+
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)")
+
+
+def parse_version(text):
+    """('4.1.2.0') -> (4, 1). Returns None when unparseable -- callers treat
+    that as 'assume the conservative path'."""
+    m = _VERSION_RE.match(str(text or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+# ==========================================================================
+# taxonomy.py  --  Tag taxonomy -- loaded from configuration, not baked into source.
+# ==========================================================================
+
+# The scheme the toolkit shipped with before taxonomy was configurable. Used
+# when no taxonomy file exists, so behaviour is unchanged out of the box.
+DEFAULT_TAXONOMY = {
+    "format": r"^[a-z0-9][a-z0-9\-]*$",
+    "allow_unknown_scopes": False,
+    "scopes": {
+        "tenant": {"required": True},
+        "app": {"required": True},
+        "env": {"required": True,
+                "values": ["prod", "uat", "dev", "staging", "dr"]},
+        "tier": {"required": True,
+                 "values": ["web", "app", "db", "mgmt", "dmz"]},
+        "site": {"required": True},
+        "server": {"required": True},
+        "owner": {"required": False},
+        "criticality": {"required": False,
+                        "values": ["critical", "high", "medium", "low"]},
+        "data-class": {"required": False},
+        "managed-by": {"required": False},
+    },
+}
+
+
+class Taxonomy:
+    def __init__(self, spec=None, source="built-in default"):
+        spec = spec or DEFAULT_TAXONOMY
+        self.source = source
+        scopes = spec.get("scopes") or {}
+        if not isinstance(scopes, dict):
+            raise ConfigError("taxonomy 'scopes' must be an object")
+        self.allow_unknown_scopes = bool(spec.get("allow_unknown_scopes", False))
+        try:
+            self.format_re = re.compile(
+                spec.get("format") or DEFAULT_TAXONOMY["format"])
+        except re.error as e:
+            raise ConfigError(
+                "taxonomy 'format' is not a valid regex: {}".format(e)) from e
+        self.mandatory = []
+        self.conditional = []
+        self.values = {}
+        for name, cfg in scopes.items():
+            cfg = cfg or {}
+            if cfg.get("required"):
+                self.mandatory.append(name)
+            else:
+                self.conditional.append(name)
+            vals = cfg.get("values")
+            self.values[name] = list(vals) if vals else None
+
+    @property
+    def all_scopes(self):
+        return self.mandatory + self.conditional
+
+    def values_for(self, scope):
+        return self.values.get(scope)
+
+    def validate_tag(self, scope, value):
+        """Warnings for a single scope=value pair. Empty list means clean."""
+        w = []
+        if scope and not self.format_re.match(scope):
+            w.append("scope '{}' bad format".format(scope))
+        if value and not self.format_re.match(value):
+            w.append("tag '{}' bad format".format(value))
+        if scope and scope not in self.values and not self.allow_unknown_scopes:
+            w.append("scope '{}' not in taxonomy".format(scope))
+        allowed = self.values.get(scope)
+        if allowed is not None and value and value not in allowed:
+            w.append("'{}' not allowed for '{}' ({})".format(
+                value, scope, ", ".join(allowed)))
+        return w
+
+    def validate_vm_tags(self, pairs):
+        """(is_clean, issues) for a VM's full tag set."""
+        issues = []
+        scopes = {s for s, _ in pairs if s}
+        for req in self.mandatory:
+            if req not in scopes:
+                issues.append("mandatory scope '{}' missing".format(req))
+        for s, t in pairs:
+            issues.extend(self.validate_tag(s, t))
+        return (not issues), issues
+
+
+def _load_mapping(path):
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if path.lower().endswith((".yaml", ".yml")):
+        try:
+            import yaml
+        except ImportError:
+            raise ConfigError(
+                "{} is YAML but PyYAML is not installed. Convert it to JSON "
+                "(taxonomy.json) or run: pip install pyyaml".format(path)) from None
+        try:
+            return yaml.safe_load(text) or {}
+        except Exception as e:
+            raise ConfigError("Invalid YAML in {}: {}".format(path, e)) from e
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        raise ConfigError("Invalid JSON in {}: {}".format(path, e)) from e
+
+
+def load_taxonomy(explicit_path=None, search_dirs=(), names=()):
+    """Resolve a taxonomy file, falling back to the built-in default.
+
+    Returns a Taxonomy. An explicitly requested path that does not exist is an
+    error; an absent default file simply means 'use the built-in scheme'.
+    """
+    if explicit_path:
+        if not os.path.isfile(explicit_path):
+            raise ConfigError("Taxonomy file not found: {}".format(explicit_path))
+        return Taxonomy(_load_mapping(explicit_path), source=explicit_path)
+    for d in search_dirs:
+        for name in names:
+            cand = os.path.join(d, name)
+            if os.path.isfile(cand):
+                return Taxonomy(_load_mapping(cand), source=cand)
+    return Taxonomy()
+
+
+# ==========================================================================
+# config.py  --  Inventory loading and validation.
+# ==========================================================================
+
+VALID_AUTH_MODES = ("session", "basic", "token", "cert")
+
+
+def inventory_candidates(explicit_path=None, search_dirs=()):
+    if explicit_path:
+        return [explicit_path]
+    return [os.path.join(d, DEFAULT_INVENTORY_NAME) for d in search_dirs]
+
+
+def find_inventory(explicit_path=None, search_dirs=()):
+    """First existing candidate path, or None. Never raises."""
+    for c in inventory_candidates(explicit_path, search_dirs):
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def validate_manager(entry, index):
+    """Normalize one manager entry in place and return a list of problems."""
+    problems = []
+    where = entry.get("name") or "manager[{}]".format(index)
+    if not entry.get("name"):
+        problems.append("{}: missing 'name'".format(where))
+    if not entry.get("host"):
+        problems.append("{}: missing 'host'".format(where))
+    role = (entry.get("role") or "").lower()
+    if role not in (ROLE_GM, ROLE_LM):
+        problems.append(
+            "{}: 'role' must be '{}' or '{}' (got {!r})".format(
+                where, ROLE_GM, ROLE_LM, entry.get("role")))
+    entry["role"] = role
+    auth = (entry.get("auth") or "session").lower()
+    if auth not in VALID_AUTH_MODES:
+        problems.append("{}: 'auth' must be one of {} (got {!r})".format(
+            where, ", ".join(VALID_AUTH_MODES), entry.get("auth")))
+    entry["auth"] = auth
+    try:
+        entry["port"] = int(entry.get("port", 443))
+    except (TypeError, ValueError):
+        problems.append("{}: 'port' must be a number".format(where))
+    return problems
+
+
+def load_inventory(path):
+    """Read and validate an inventory file. Raises ConfigError on any problem."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except ValueError as e:
+        raise ConfigError("Invalid JSON in {}: {}".format(path, e)) from e
+    except OSError as e:
+        raise ConfigError("Cannot read {}: {}".format(path, e)) from e
+    if not isinstance(data, dict):
+        raise ConfigError("{}: top level must be an object".format(path))
+    managers = data.get("managers")
+    if not managers:
+        raise ConfigError("{} has no 'managers'.".format(path))
+    if not isinstance(managers, list):
+        raise ConfigError("{}: 'managers' must be a list".format(path))
+    problems = []
+    seen = set()
+    for i, entry in enumerate(managers):
+        if not isinstance(entry, dict):
+            problems.append("manager[{}] is not an object".format(i))
+            continue
+        problems.extend(validate_manager(entry, i))
+        name = entry.get("name")
+        if name and name in seen:
+            problems.append("duplicate manager name {!r}".format(name))
+        seen.add(name)
+    if problems:
+        raise ConfigError("{}:\n      - {}".format(path, "\n      - ".join(problems)))
+    return managers
+
+
+def default_env_names(name):
+    """Credential env-var names derived from a manager name, so the wizard
+    never has to ask the operator to invent them."""
+    slug = "".join(ch.upper() if ch.isalnum() else "_" for ch in str(name))
+    return "NSX_{}_USER".format(slug), "NSX_{}_PASS".format(slug)
+
+
+def write_inventory(path, managers):
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"managers": managers}, f, indent=2)
+        f.write("\n")
+    return path
+
+
+# ==========================================================================
+# creds.py  --  Credential resolution and storage.
+# ==========================================================================
+
+KEYRING_SERVICE = "nsx-toolkit"
+
+# "auto" | "keyring" | "plaintext" | "none"
+_store_policy = "auto"
+_creds_cache = None
+_consent_cache = None
+
+
+def set_store_policy(policy):
+    global _store_policy
+    _store_policy = policy or "auto"
+
+
+def creds_file_path():
+    return os.environ.get("NSX_TOOLKIT_CREDENTIALS_FILE", DEFAULT_CREDS_FILE)
+
+
+def reset_cache():
+    global _creds_cache, _consent_cache
+    _creds_cache = None
+    _consent_cache = None
+
+
+# === KEYRING ===
+def _keyring():
+    try:
+        import keyring
+        # A keyring with no usable backend raises only on use, so probe it.
+        keyring.get_keyring()
+        return keyring
+    except Exception:
+        return None
+
+
+def keyring_available():
+    return _keyring() is not None
+
+
+def _keyring_get(var):
+    kr = _keyring()
+    if not kr:
+        return None
+    try:
+        return kr.get_password(KEYRING_SERVICE, var)
+    except Exception:
+        return None
+
+
+def _keyring_set(var, value):
+    kr = _keyring()
+    if not kr:
+        return False
+    try:
+        kr.set_password(KEYRING_SERVICE, var, value)
+        return True
+    except Exception:
+        return False
+
+
+# === PLAINTEXT FILE ===
+def _secure_file(path):
+    """Best-effort lockdown: owner-only on POSIX, single-user ACL on Windows."""
+    try:
+        if os.name == "nt":
+            import subprocess
+            user = os.environ.get("USERNAME", "")
+            domain = os.environ.get("USERDOMAIN", "")
+            subprocess.run(["icacls", path, "/inheritance:r"],
+                           capture_output=True, timeout=10)
+            if user:
+                subprocess.run(
+                    ["icacls", path, "/grant:r",
+                     "{}\\{}:F".format(domain, user) if domain else "{}:F".format(user)],
+                    capture_output=True, timeout=10)
+        else:
+            os.chmod(path, 0o600)
+    except Exception:
+        pass  # hardening is best-effort; never block a write on it
+
+
+def _load_creds_file():
+    global _creds_cache
+    if _creds_cache is not None:
+        return _creds_cache
+    creds = {}
+    path = creds_file_path()
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    creds[k.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            pass
+    _creds_cache = creds
+    return creds
+
+
+def _write_creds_file(updates):
+    global _creds_cache
+    path = creds_file_path()
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    existing = dict(_load_creds_file())
+    existing.update({k: v for k, v in updates.items() if k})
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# Managed by nsx-toolkit -- do not edit by hand.\n")
+        f.write("# Use --set-credentials to update entries.\n")
+        for k, v in existing.items():
+            f.write('{}="{}"\n'.format(k, v))
+    _secure_file(path)
+    _creds_cache = None
+    return path
+
+
+# === RESOLVE / STORE ===
+def resolve_secret(var):
+    if not var:
+        return None
+    return (os.environ.get(var)
+            or _keyring_get(var)
+            or _load_creds_file().get(var))
+
+
+def _plaintext_consent():
+    """Ask once per run whether plaintext storage is acceptable."""
+    global _consent_cache
+    if _consent_cache is not None:
+        return _consent_cache
+    if not is_interactive():
+        _consent_cache = False
+        return False
+    say("\n  {} No OS keyring is available on this machine.".format(cD("note:")))
+    say("  Credentials can be saved to {} (readable by".format(cC(creds_file_path())))
+    say("  your user account only), or not saved at all -- you would then be")
+    say("  prompted each run, or set the environment variables yourself.")
+    answer = ask("  Save credentials to that file? [y/N]: ",
+                 default="n", allow_back=False).lower()
+    _consent_cache = answer in ("y", "yes")
+    return _consent_cache
+
+
+def store_secrets(updates):
+    """Persist {env_var: value}. Returns a short description of where they went."""
+    updates = {k: v for k, v in updates.items() if k and v}
+    if not updates or _store_policy == "none":
+        return "not saved"
+    if _store_policy in ("auto", "keyring"):
+        stored = [k for k in updates if _keyring_set(k, updates[k])]
+        if len(stored) == len(updates):
+            return "saved to OS keyring"
+        if _store_policy == "keyring":
+            warn("keyring unavailable -- credentials were not saved.")
+            return "not saved"
+    if _store_policy == "plaintext" or _plaintext_consent():
+        path = _write_creds_file(updates)
+        return "saved to {}".format(path)
+    return "not saved (will prompt again next run)"
+
+
+def credentials_for(entry, allow_prompt=True):
+    """(user, password, source) for one manager entry."""
+    name = entry.get("name", "?")
+    u_env = entry.get("username_env")
+    p_env = entry.get("password_env")
+    user, pwd = resolve_secret(u_env), resolve_secret(p_env)
+    if user and pwd:
+        return user, pwd, "stored"
+    if not allow_prompt or not is_interactive():
+        raise NsxError(
+            "No credentials available for '{}'. Set {} and {}, or run "
+            "--set-credentials.".format(name, u_env or "<username_env>",
+                                        p_env or "<password_env>"))
+    try:
+        if not user:
+            user = input("    username for {}: ".format(name)).strip()
+        if not pwd:
+            pwd = getpass.getpass("    password for {}: ".format(name))
+    except (EOFError, KeyboardInterrupt):
+        raise UserAbort() from None
+    if not (user and pwd):
+        raise NsxError("Credentials not provided for '{}'.".format(name))
+    where = store_secrets({u_env: user, p_env: pwd})
+    return user, pwd, "prompted, {}".format(where)
+
+
+def force_set_credentials(managers, only=None):
+    """--set-credentials: always prompt and overwrite whatever is stored."""
+    targets = [m for m in managers if not only or m.get("name") in only]
+    if not targets:
+        err("No matching managers in inventory.")
+        return 2
+    if not is_interactive():
+        err("--set-credentials needs an interactive terminal.")
+        return 2
+    say("\n  {} ({} manager(s)) ...".format(
+        cB("Updating stored credentials"), len(targets)))
+    updated = 0
+    for m in targets:
+        name = m.get("name", "?")
+        u_env, p_env = m.get("username_env"), m.get("password_env")
+        if not (u_env or p_env):
+            warn("{}: no username_env/password_env in inventory, skipped.".format(name))
+            continue
+        try:
+            user = input("    username for {}: ".format(name)).strip()
+            pwd = getpass.getpass("    password for {}: ".format(name))
+        except (EOFError, KeyboardInterrupt):
+            raise UserAbort() from None
+        if not (user and pwd):
+            warn("{}: empty input, skipped.".format(name))
+            continue
+        where = store_secrets({u_env: user, p_env: pwd})
+        ok_msg("{}: {}.".format(name, where))
+        updated += 1
+    say("\n  {} of {} updated.".format(cG(str(updated)), len(targets)))
+    return 0
+
+
+# ==========================================================================
+# http.py  --  NSX transport and session.
+# ==========================================================================
+
+RETRY_STATUS = (429, 500, 502, 503, 504)
+DEFAULT_RETRIES = 3
+DEFAULT_BACKOFF = 1.0
+MAX_BACKOFF = 20.0
+
+_tls_warnings_suppressed = False
+_suppress_lock = threading.Lock()
+
+
+def _suppress_tls_warnings():
+    """Silence 'unverified HTTPS' noise -- only ever called when a manager is
+    actually configured with verify_ssl false, never globally at import."""
+    global _tls_warnings_suppressed
+    with _suppress_lock:
+        if _tls_warnings_suppressed:
+            return
+        _tls_warnings_suppressed = True
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+
+
+def have_requests():
+    try:
+        import requests  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class TransportError(Exception):
+    """Connection-level failure (DNS, refused, reset, timeout)."""
+
+
+class Response:
+    __slots__ = ("status", "headers", "body")
+
+    def __init__(self, status, headers, body):
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+    def json(self):
+        if not self.body:
+            return {}
+        try:
+            return json.loads(self.body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            raise NsxError("Response was not valid JSON: {}".format(e)) from e
+
+    def text(self, limit=400):
+        try:
+            return self.body.decode("utf-8", "replace")[:limit]
+        except Exception:
+            return ""
+
+
+class RequestsTransport:
+    name = "requests"
+
+    def __init__(self, pool_size=16):
+        import requests
+        from requests.adapters import HTTPAdapter
+        self._requests = requests
+        self.s = requests.Session()
+        adapter = HTTPAdapter(pool_connections=pool_size,
+                              pool_maxsize=pool_size, max_retries=0)
+        self.s.mount("https://", adapter)
+        self.s.mount("http://", adapter)
+
+    def request(self, method, url, headers, body, timeout, verify, cert):
+        try:
+            r = self.s.request(method, url, headers=headers, data=body,
+                               timeout=timeout, verify=verify, cert=cert,
+                               allow_redirects=False)
+        except self._requests.exceptions.RequestException as e:
+            raise TransportError(str(e)) from e
+        return Response(r.status_code, dict(r.headers), r.content)
+
+    def close(self):
+        try:
+            self.s.close()
+        except Exception:
+            pass
+
+
+class UrllibTransport:
+    """Stdlib fallback. Same interface, no third-party dependency."""
+
+    name = "urllib"
+
+    def __init__(self, pool_size=16):
+        self._cookies = {}
+        self._lock = threading.Lock()
+
+    def _context(self, verify):
+        if verify is False:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+        if isinstance(verify, str):
+            return ssl.create_default_context(cafile=verify)
+        return ssl.create_default_context()
+
+    def request(self, method, url, headers, body, timeout, verify, cert):
+        if cert:
+            raise NsxError(
+                "Client-certificate auth needs the 'requests' library "
+                "(pip install requests).")
+        hdrs = dict(headers or {})
+        with self._lock:
+            if self._cookies:
+                hdrs["Cookie"] = "; ".join(
+                    "{}={}".format(k, v) for k, v in self._cookies.items())
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
+        try:
+            with urllib.request.urlopen(
+                    req, timeout=timeout, context=self._context(verify)) as r:
+                resp = Response(r.status, dict(r.headers), r.read())
+        except urllib.error.HTTPError as e:
+            resp = Response(e.code, dict(e.headers or {}), e.read() or b"")
+        except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as e:
+            raise TransportError(str(e)) from e
+        self._absorb_cookies(resp.headers)
+        return resp
+
+    def _absorb_cookies(self, headers):
+        raw = headers.get("Set-Cookie") or headers.get("set-cookie")
+        if not raw:
+            return
+        with self._lock:
+            for chunk in str(raw).split(","):
+                pair = chunk.split(";", 1)[0].strip()
+                if "=" in pair:
+                    k, _, v = pair.partition("=")
+                    if k.strip():
+                        self._cookies[k.strip()] = v.strip()
+
+    def close(self):
+        pass
+
+
+def make_transport(pool_size=16):
+    return (RequestsTransport(pool_size) if have_requests()
+            else UrllibTransport(pool_size))
+
+
+class Nsx:
+    """One authenticated NSX manager."""
+
+    def __init__(self, entry, user, pwd, transport=None, retries=DEFAULT_RETRIES):
+        self.entry = entry
+        self.name = entry.get("name", "?")
+        self.role = (entry.get("role") or "").lower() or None
+        host = entry.get("host")
+        if not host:
+            raise NsxError("'{}' has no 'host'.".format(self.name))
+        self.host = host
+        # 'scheme' exists for test harnesses and plaintext lab appliances.
+        # Production NSX is always https, which is why that is the default.
+        scheme = (entry.get("scheme") or "https").lower()
+        self.base_url = "{}://{}:{}".format(scheme, host, entry.get("port", 443))
+        self.timeout = entry.get("timeout", 30)
+        self.retries = retries
+        self.auth_mode = (entry.get("auth") or "session").lower()
+        self._user, self._pwd = user, pwd
+        self._base = entry.get("policy_base")
+        self._version = None
+        self._vm_index = None
+        self._vm_lock = threading.Lock()
+        self._base_lock = threading.Lock()
+        self._auth_lock = threading.Lock()
+        self._session_headers = {}
+        self._authenticated = False
+
+        verify = entry.get("verify_ssl", True)
+        ca = entry.get("ca_bundle")
+        if verify and ca:
+            self.verify = ca
+        else:
+            self.verify = bool(verify)
+        if self.verify is False:
+            _suppress_tls_warnings()
+        self.cert = entry.get("client_cert")
+        self.t = transport or make_transport()
+
+    # --- auth --------------------------------------------------------------
+    def _basic_header(self):
+        raw = "{}:{}".format(self._user, self._pwd).encode("utf-8")
+        return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
+
+    def _ensure_auth(self):
+        """Establish session-token auth once. Falls back to Basic if the
+        manager does not offer session create."""
+        if self._authenticated:
+            return
+        with self._auth_lock:
+            if self._authenticated:
+                return
+            if self.auth_mode == "basic":
+                self._session_headers = self._basic_header()
+            elif self.auth_mode == "token":
+                token = self.entry.get("token") or self._pwd
+                header = self.entry.get("token_header") or "X-NSX-Auth-Token"
+                self._session_headers = {header: token}
+            elif self.auth_mode == "cert":
+                self._session_headers = {}
+            else:
+                self._session_headers = self._session_login()
+            self._authenticated = True
+
+    def _session_login(self):
+        body = urllib.parse.urlencode(
+            {"j_username": self._user, "j_password": self._pwd}).encode("utf-8")
+        url = self.base_url + PATH_SESSION_CREATE
+        try:
+            r = self._send("POST", url, {
+                "Content-Type": "application/x-www-form-urlencoded"}, body)
+        except (TransportError, NsxError) as e:
+            debug("{}: session create failed ({}), falling back to Basic".format(
+                self.name, e))
+            return self._basic_header()
+        if r.status >= 400:
+            debug("{}: session create HTTP {}, falling back to Basic".format(
+                self.name, r.status))
+            return self._basic_header()
+        headers = {}
+        xsrf = r.headers.get("x-xsrf-token") or r.headers.get("X-XSRF-TOKEN")
+        if xsrf:
+            headers["X-XSRF-TOKEN"] = xsrf
+        cookie = r.headers.get("Set-Cookie") or r.headers.get("set-cookie")
+        if cookie:
+            jar = [c.split(";", 1)[0].strip() for c in str(cookie).split(",")
+                   if "=" in c.split(";", 1)[0]]
+            if jar:
+                headers["Cookie"] = "; ".join(jar)
+        if not headers:
+            debug("{}: session create returned no token, using Basic".format(self.name))
+            return self._basic_header()
+        debug("{}: authenticated via session token".format(self.name))
+        return headers
+
+    # --- request plumbing --------------------------------------------------
+    def _send(self, method, url, headers, body):
+        return self.t.request(method, url, headers, body, self.timeout,
+                              self.verify, self.cert)
+
+    def _sleep_for(self, attempt, response):
+        if response is not None:
+            ra = (response.headers or {}).get("Retry-After")
+            if ra:
+                try:
+                    return min(float(ra), MAX_BACKOFF)
+                except ValueError:
+                    pass
+        return min(DEFAULT_BACKOFF * (2 ** attempt), MAX_BACKOFF) * (
+            0.5 + random.random() / 2.0)
+
+    def _req(self, method, path, body=None, params=None):
+        self._ensure_auth()
+        url = self.base_url + path
+        if params:
+            clean = {k: v for k, v in params.items() if v is not None}
+            if clean:
+                url += "?" + urllib.parse.urlencode(clean)
+        headers = dict(self._session_headers)
+        headers.setdefault("Accept", "application/json")
+        payload = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            payload = json.dumps(body).encode("utf-8")
+
+        last_exc = None
+        for attempt in range(self.retries + 1):
+            started = time.time()
+            try:
+                r = self._send(method, url, headers, payload)
+            except TransportError as e:
+                last_exc = NsxError("[{}] {} {} -> {}".format(
+                    self.name, method, url, e))
+                debug("{} {} -> transport error: {} (attempt {}/{})".format(
+                    method, url, e, attempt + 1, self.retries + 1))
+                if attempt < self.retries:
+                    time.sleep(self._sleep_for(attempt, None))
+                    continue
+                raise last_exc from e
+            elapsed = (time.time() - started) * 1000
+            debug("{} {} -> {} ({:.0f}ms)".format(method, url, r.status, elapsed))
+            if r.status in RETRY_STATUS and attempt < self.retries:
+                wait = self._sleep_for(attempt, r)
+                debug("  retrying after {:.1f}s (HTTP {})".format(wait, r.status))
+                time.sleep(wait)
+                continue
+            if r.status >= 400:
+                raise NsxError("[{}] {} {} -> HTTP {}: {}".format(
+                    self.name, method, url, r.status, r.text()))
+            return r.json()
+        raise last_exc or NsxError("[{}] {} {} -> exhausted retries".format(
+            self.name, method, url))
+
+    def get(self, path, params=None):
+        return self._req("GET", path, params=params)
+
+    def post(self, path, body=None, params=None):
+        return self._req("POST", path, body=body, params=params)
+
+    def patch(self, path, body=None, params=None):
+        return self._req("PATCH", path, body=body, params=params)
+
+    def delete(self, path, params=None):
+        return self._req("DELETE", path, params=params)
+
+    def get_all(self, path, params=None):
+        """Follow NSX's opaque cursor pagination to completion."""
+        out, cursor = [], None
+        while True:
+            p = dict(params or {})
+            p.setdefault(PARAM_PAGE_SIZE, PAGE_SIZE)
+            if cursor:
+                p[PARAM_CURSOR] = cursor
+            data = self.get(path, params=p)
+            out.extend(data.get(F_RESULTS, []))
+            cursor = data.get(F_CURSOR)
+            if not cursor:
+                break
+        return out
+
+    # --- capability detection ---------------------------------------------
+    def base(self, domain=DEFAULT_DOMAIN, verbose=False):
+        """Policy API base. GM answers on one of two paths depending on
+        version, so probe rather than guess."""
+        if self._base:
+            return self._base
+        with self._base_lock:
+            if self._base:
+                return self._base
+            if self.role != ROLE_GM:
+                self._base = API_BASE_LM
+                return self._base
+            notes = []
+            for cand in API_BASE_GM_CANDIDATES:
+                try:
+                    self.get(p_groups(cand, domain), params={PARAM_PAGE_SIZE: 1})
+                    self._base = cand
+                    if verbose:
+                        say("    GM answers on: {}".format(cG(cand)))
+                    return self._base
+                except NsxError as e:
+                    notes.append(str(e)[:160])
+            raise NsxError("GM did not answer on any known base.\n" +
+                           "\n".join("      {}".format(n) for n in notes))
+
+    def version(self):
+        """(major, minor) of the manager, or None if it cannot be read."""
+        if self._version is not None:
+            return self._version or None
+        try:
+            d = self.get(PATH_NODE_VERSION)
+            raw = d.get(F_NODE_VERSION) or d.get(F_PRODUCT_VERSION)
+            self._version = parse_version(raw) or ()
+        except NsxError:
+            self._version = ()
+        return self._version or None
+
+    # --- VM inventory ------------------------------------------------------
+    def all_vms(self, refresh=False):
+        """Full VM inventory, fetched at most once per session.
+
+        This is the fix for bulk tagging: resolving 500 CSV rows previously
+        triggered up to 500 full inventory sweeps per manager.
+        """
+        with self._vm_lock:
+            if self._vm_index is None or refresh:
+                self._vm_index = self.get_all(PATH_FABRIC_VMS)
+            return self._vm_index
+
+    def invalidate_vms(self):
+        with self._vm_lock:
+            self._vm_index = None
+
+    def find_vms(self, needle, exact=False):
+        """VMs whose display name matches. Tries the server-side exact filter
+        first (cheap), then falls back to the cached index for substrings."""
+        if not needle:
+            return []
+        try:
+            hits = self.get(PATH_FABRIC_VMS,
+                            params={PARAM_DISPLAY_NAME: needle}).get(F_RESULTS, [])
+            if hits:
+                return hits
+        except NsxError:
+            pass
+        n = str(needle).lower()
+        vms = self.all_vms()
+        if exact:
+            return [v for v in vms if str(v.get(F_DISPLAY_NAME, "")).lower() == n]
+        return [v for v in vms if n in str(v.get(F_DISPLAY_NAME, "")).lower()]
+
+    def get_vm_by_external_id(self, ext_id):
+        for v in self.all_vms():
+            if v.get(F_EXTERNAL_ID) == ext_id:
+                return v
+        return None
+
+    def refresh_vm(self, vm):
+        """Re-read one VM straight from NSX, bypassing the cache. Used
+        immediately before a write so a stale plan cannot clobber someone
+        else's concurrent change."""
+        ext = vm.get(F_EXTERNAL_ID)
+        name = vm.get(F_DISPLAY_NAME, "")
+        try:
+            hits = self.get(PATH_FABRIC_VMS,
+                            params={PARAM_DISPLAY_NAME: name}).get(F_RESULTS, [])
+            for h in hits:
+                if h.get(F_EXTERNAL_ID) == ext:
+                    return h
+        except NsxError:
+            pass
+        for v in self.all_vms(refresh=True):
+            if v.get(F_EXTERNAL_ID) == ext:
+                return v
+        return None
+
+    def update_vm_tags(self, vm, pairs):
+        ext = vm.get(F_EXTERNAL_ID)
+        if not ext:
+            raise NsxError("VM has no external_id.")
+        self.post(PATH_FABRIC_VMS,
+                  body={F_EXTERNAL_ID: ext,
+                        F_TAGS: [{F_TAG_SCOPE: s, F_TAG_VALUE: t} for s, t in pairs]},
+                  params={PARAM_ACTION: ACTION_UPDATE_TAGS})
+        self.invalidate_vms()
+
+    def close(self):
+        try:
+            self.t.close()
+        except Exception:
+            pass
+
+
+# ==========================================================================
+# audit.py  --  Append-only audit log of every write, with before/after state for undo.
+# ==========================================================================
+
+def current_user():
+    return (os.environ.get("USERNAME") or os.environ.get("USER") or "unknown")
+
+
+class AuditLog:
+    def __init__(self, path=None, max_bytes=AUDIT_MAX_BYTES, keep=AUDIT_KEEP):
+        self.path = path or DEFAULT_AUDIT_FILE
+        self.max_bytes = max_bytes
+        self.keep = keep
+        d = os.path.dirname(self.path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+    def _rotate_if_needed(self):
+        try:
+            if not os.path.isfile(self.path):
+                return
+            if os.path.getsize(self.path) < self.max_bytes:
+                return
+            oldest = "{}.{}".format(self.path, self.keep)
+            if os.path.exists(oldest):
+                os.remove(oldest)
+            for i in range(self.keep - 1, 0, -1):
+                src = "{}.{}".format(self.path, i)
+                if os.path.exists(src):
+                    os.replace(src, "{}.{}".format(self.path, i + 1))
+            os.replace(self.path, "{}.1".format(self.path))
+        except OSError as e:
+            err("audit rotation failed: {}".format(e))
+
+    def log(self, action, manager, vm_name, vm_ext_id, tags_before, tags_after,
+            status="success", detail=""):
+        entry = {
+            "timestamp": utc_now_iso(),
+            "user": current_user(),
+            "host": platform.node(),
+            "manager": manager,
+            "action": action,
+            "vm_display_name": vm_name,
+            "vm_external_id": vm_ext_id,
+            "tags_before": [{"scope": s, "tag": t} for s, t in tags_before],
+            "tags_after": [{"scope": s, "tag": t} for s, t in tags_after],
+            "status": status,
+            "detail": detail,
+        }
+        self._rotate_if_needed()
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as e:
+            err("audit write failed: {}".format(e))
+        return entry
+
+    def _tail_lines(self, n):
+        """Last n non-empty lines without reading the whole file."""
+        if not os.path.isfile(self.path):
+            return []
+        chunk = 8192
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                data = b""
+                while size > 0 and data.count(b"\n") <= n:
+                    step = min(chunk, size)
+                    size -= step
+                    f.seek(size)
+                    data = f.read(step) + data
+        except OSError:
+            return []
+        text = data.decode("utf-8", "replace")
+        return [ln for ln in text.splitlines() if ln.strip()][-n:]
+
+    def last_n(self, n=20):
+        entries = []
+        for line in self._tail_lines(n):
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                pass
+        return entries
+
+
+# ==========================================================================
+# export.py  --  Result staging and export.
+# ==========================================================================
+
+class ResultSet:
+    __slots__ = ("label", "headers", "rows")
+
+    def __init__(self, label, headers, rows):
+        self.label = label
+        self.headers = headers
+        self.rows = rows
+
+    def as_dicts(self):
+        return [{self.headers[i]: (row[i] if i < len(row) else "")
+                 for i in range(len(self.headers))} for row in self.rows]
+
+
+class Exporter:
+    def __init__(self, export_dir=None):
+        self.export_dir = export_dir or DEFAULT_EXPORT_DIR
+        self._sets = []
+
+    def stage(self, label, headers, rows):
+        """Add a result set. Empty sets are still recorded so --json reports
+        'this action ran and found nothing' rather than staying silent."""
+        self._sets.append(ResultSet(label, list(headers), list(rows)))
+
+    @property
+    def sets(self):
+        return list(self._sets)
+
+    def has_staged(self):
+        return any(rs.rows for rs in self._sets)
+
+    def clear(self):
+        self._sets = []
+
+    def _ensure_dir(self, path):
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+
+    def _gen(self, label, ext):
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", label or "export")[:40]
+        return os.path.join(self.export_dir,
+                            "{}_{}.{}".format(safe, local_stamp(), ext))
+
+    def _target(self, base_path, rs, index, total, ext):
+        """One file per result set. With several sets the label is appended so
+        nothing is silently overwritten."""
+        if not base_path:
+            return self._gen(rs.label, ext)
+        if total == 1:
+            return base_path
+        root, dot_ext = os.path.splitext(base_path)
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "_", rs.label or str(index))[:40]
+        return "{}_{}{}".format(root, safe, dot_ext or "." + ext)
+
+    def to_csv(self, path=None):
+        written = []
+        sets = [rs for rs in self._sets if rs.rows]
+        for i, rs in enumerate(sets):
+            target = self._target(path, rs, i, len(sets), "csv")
+            self._ensure_dir(target)
+            with open(target, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(rs.headers)
+                w.writerows(rs.rows)
+            written.append(target)
+        return written
+
+    def to_json(self, path=None):
+        written = []
+        sets = [rs for rs in self._sets if rs.rows]
+        if path and len(sets) > 1:
+            # One JSON file can hold every set, so keep them together.
+            self._ensure_dir(path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"exported": utc_now_iso(),
+                           "results": [{"label": rs.label,
+                                        "count": len(rs.rows),
+                                        "records": rs.as_dicts()} for rs in sets]},
+                          f, indent=2, ensure_ascii=False)
+            return [path]
+        for i, rs in enumerate(sets):
+            target = self._target(path, rs, i, len(sets), "json")
+            self._ensure_dir(target)
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump({"exported": utc_now_iso(), "label": rs.label,
+                           "count": len(rs.rows), "records": rs.as_dicts()},
+                          f, indent=2, ensure_ascii=False)
+            written.append(target)
+        return written
+
+    def json_payload(self):
+        return [{"label": rs.label, "count": len(rs.rows),
+                 "records": rs.as_dicts()} for rs in self._sets]
+
+
+def offer_export(exporter):
+    """Interactive post-action export prompt. A no-op in JSON mode, where the
+    results are emitted in the envelope instead."""
+    if is_json_mode() or not exporter.has_staged():
+        return
+    total = sum(len(rs.rows) for rs in exporter.sets)
+    say("\n  {} record(s) available.".format(cC(str(total))))
+    c = ask("  Export? [c]sv / [j]son / [n]o: ",
+            default="n", allow_back=False).lower()
+    if c in ("c", "csv"):
+        for p in exporter.to_csv():
+            ok_msg("Saved: {}".format(p))
+    elif c in ("j", "json"):
+        for p in exporter.to_json():
+            ok_msg("Saved: {}".format(p))
+    exporter.clear()
+
+
+# ==========================================================================
+# render.py  --  Shared formatting for tags and group membership criteria.
+# ==========================================================================
+
+def tags_of(obj):
+    return [(t.get(F_TAG_SCOPE, ""), t.get(F_TAG_VALUE, ""))
+            for t in (obj.get(F_TAGS) or [])]
+
+
+def fmt_tags(pairs):
+    if not pairs:
+        return cD("(none)")
+    return ", ".join("{}={}".format(cC(s), t) if s else t
+                     for s, t in sorted(pairs))
+
+
+def fmt_tags_plain(pairs):
+    if not pairs:
+        return "(none)"
+    return ", ".join("{}={}".format(s, t) if s else t for s, t in sorted(pairs))
+
+
+def describe_expression(expr):
+    """Human-readable lines for a group's membership criteria."""
+    if not expr:
+        return [cD("(no criteria)")]
+    lines = []
+    for item in expr:
+        rt = item.get(RT)
+        if rt == RT_CONJUNCTION:
+            lines.append("  {}".format(cB(item.get(F_CONJ_OP, "?"))))
+        elif rt == RT_CONDITION:
+            key = item.get(F_KEY, "?")
+            op = item.get(F_OPERATOR, "?")
+            val = item.get(F_VALUE, "")
+            mt = item.get(F_MEMBER_TYPE, "")
+            if key == KEY_TAG and TAG_SCOPE_SEPARATOR in str(val):
+                s, _, t = str(val).partition(TAG_SCOPE_SEPARATOR)
+                lines.append("  {} Tag {} {}={}".format(mt, op, cC(s), cG(t)))
+            else:
+                lines.append("  {} {} {} '{}'".format(mt, key, op, val))
+        elif rt == RT_NESTED:
+            lines.append("  ( nested:")
+            for sub in describe_expression(item.get(F_EXPRESSIONS, [])):
+                lines.append("  {}".format(sub))
+            lines.append("  )")
+        elif rt == RT_IPADDRESS:
+            ips = item.get(F_IP_ADDRESSES, [])
+            lines.append("  IPs ({}): {}{}".format(
+                len(ips), ", ".join(map(str, ips[:8])),
+                " ..." if len(ips) > 8 else ""))
+        elif rt == RT_PATHEXPR:
+            paths = item.get(F_PATHS, [])
+            lines.append("  Paths ({}):".format(len(paths)))
+            for p in paths[:10]:
+                lines.append("    {}".format(p))
+        else:
+            lines.append("  {}: {}".format(rt or "unknown", json.dumps(item)[:160]))
+    return lines
+
+
+def criteria_summary(expr, parts=3):
+    """Flat one-line version of the criteria, for CSV columns."""
+    lines = describe_expression(expr)
+    return "; ".join(strip_ansi(ln).strip() for ln in lines[:parts])
+
+
+# ==========================================================================
+# actions/groups.py  --  Group search: criteria, and optionally VM members.
+# ==========================================================================
+
+CONSOLE_MEMBER_LIMIT = 30
+
+GROUPS_HEADERS = ["manager", "group_id", "display_name", "path", "criteria",
+                  "members"]
+
+
+def act_groups(sessions, domain, needle, show_members, exporter):
+    rows = []
+    for nsx in sessions:
+        try:
+            base = nsx.base(domain)
+        except NsxError as e:
+            err(str(e))
+            continue
+        section("{}  [{}]".format(nsx.name, ROLE_LABEL.get(nsx.role, "?")))
+        with Spinner("Fetching groups from {}".format(nsx.name)):
+            try:
+                groups = nsx.get_all(p_groups(base, domain))
+            except NsxError as e:
+                err(str(e))
+                continue
+        say("  {} group(s).".format(len(groups)))
+        if needle:
+            n = needle.lower()
+            groups = [g for g in groups
+                      if n in str(g.get(F_DISPLAY_NAME, "")).lower()
+                      or n in str(g.get(F_ID, "")).lower()]
+            say("  {} match '{}'.".format(cC(str(len(groups))), needle))
+        for g in sorted(groups, key=lambda x: str(x.get(F_DISPLAY_NAME, "")).lower()):
+            gid = g.get(F_ID, "?")
+            dname = g.get(F_DISPLAY_NAME, gid)
+            hr()
+            say("  Group        : {}".format(cB(dname)))
+            if gid != dname:
+                say("  id           : {}   {}".format(gid, cBY("[id != name]")))
+            else:
+                say("  id           : {}".format(gid))
+            say("  path         : {}".format(cD(g.get(F_PATH, "?"))))
+            if g.get(F_DESCRIPTION):
+                say("  description  : {}".format(g[F_DESCRIPTION]))
+            say("  criteria     :")
+            for line in describe_expression(g.get(F_EXPRESSION)):
+                say("    {}".format(line))
+            member_count = ""
+            if show_members:
+                try:
+                    vms = nsx.get_all(p_group_members(base, domain, gid))
+                    member_count = str(len(vms))
+                    say("  VM members ({}):".format(cC(member_count)))
+                    for vm in vms[:CONSOLE_MEMBER_LIMIT]:
+                        say("    {}".format(vm.get(F_DISPLAY_NAME, vm.get(F_ID, "?"))))
+                    more_note(CONSOLE_MEMBER_LIMIT, len(vms), "member count in export")
+                except NsxError as e:
+                    say("  VM members: {} ({})".format(cR("error"), e))
+                    member_count = "error"
+            rows.append([nsx.name, gid, dname, g.get(F_PATH, ""),
+                         criteria_summary(g.get(F_EXPRESSION)), member_count])
+    hr()
+    exporter.stage("groups", GROUPS_HEADERS, rows)
+
+
+# ==========================================================================
+# actions/verify.py  --  Connectivity, authentication and API-base verification.
+# ==========================================================================
+
+def act_verify(sessions, domain=DEFAULT_DOMAIN):
+    all_ok = True
+    for nsx in sessions:
+        section("{}  [{}]  {}".format(
+            nsx.name, ROLE_LABEL.get(nsx.role, "?"), nsx.base_url))
+        say("  {} transport={} auth={} verify_ssl={}".format(
+            cD("config:"), nsx.t.name, nsx.auth_mode, nsx.verify))
+        if nsx.role == ROLE_GM:
+            try:
+                base = nsx.base(domain, verbose=True)
+            except NsxError as e:
+                err(str(e))
+                all_ok = False
+                continue
+            checks = [("groups", p_groups(base, domain)),
+                      ("security-policies", p_sec_policies(base, domain))]
+        elif nsx.role == ROLE_LM:
+            base = nsx.base(domain)
+            checks = [("groups", p_groups(base, domain)),
+                      ("security-policies", p_sec_policies(base, domain)),
+                      ("VM inventory", PATH_FABRIC_VMS)]
+        else:
+            say("  {}".format(cBR("no role")))
+            all_ok = False
+            continue
+        ver = nsx.version()
+        if ver:
+            say("  {} NSX {}.{}".format(cD("version:"), ver[0], ver[1]))
+        for label, path in checks:
+            try:
+                d = nsx.get(path, params={PARAM_PAGE_SIZE: 1})
+                n = d.get(F_RESULT_COUNT, len(d.get(F_RESULTS, [])))
+                say("  {}    {:22s}  {} item(s)".format(cBG("OK"), label, n))
+            except NsxError as e:
+                say("  {}  {:22s}  {}".format(cBR("FAIL"), label, str(e)[:120]))
+                all_ok = False
+    hr()
+    say("  {}.".format("All " + cBG("OK") if all_ok else cBR("Failures detected")))
+    return all_ok
+
+
+# ==========================================================================
+# actions/dashboard.py  --  Taxonomy compliance posture across every Local Manager.
+# ==========================================================================
+
+DASHBOARD_HEADERS = ["vm_name", "manager", "tag_count", "mandatory_present",
+                  "missing", "status"]
+
+
+def _pct(part, whole):
+    return int(100 * part / whole) if whole else 0
+
+
+def act_dashboard(sessions, exporter, taxonomy):
+    lms = [s for s in sessions if s.role == ROLE_LM]
+    if not lms:
+        say("  No Local Managers connected -- tags are LM-local objects.")
+        exporter.stage("dashboard", DASHBOARD_HEADERS, [])
+        return
+    section("COMPLIANCE DASHBOARD    {}".format(
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M")))
+    say("  Taxonomy: {}".format(cC(taxonomy.source)))
+    fetched = parallel_run(lms, lambda s: s.all_vms(),
+                           label="Fetching VM inventories")
+    vms = []
+    for name, result in fetched.items():
+        if isinstance(result, Exception):
+            err("{}: {}".format(name, result))
+            continue
+        for vm in (result or []):
+            vms.append((name, vm))
+    total = len(vms)
+    if total == 0:
+        say("  No VMs found.")
+        exporter.stage("dashboard", DASHBOARD_HEADERS, [])
+        return
+
+    mandatory = taxonomy.mandatory
+    coverage = dict.fromkeys(mandatory, 0)
+    untagged = full = partial = 0
+    rows = []
+    for mgr, vm in vms:
+        pairs = tags_of(vm)
+        scopes = {s for s, _ in pairs if s}
+        present = [s for s in mandatory if s in scopes]
+        missing = [s for s in mandatory if s not in scopes]
+        if not pairs:
+            untagged += 1
+            status = "untagged"
+        elif len(present) == len(mandatory):
+            full += 1
+            status = "complete"
+        else:
+            partial += 1
+            status = "partial"
+        for s in present:
+            coverage[s] += 1
+        rows.append([vm.get(F_DISPLAY_NAME, "?"), mgr, str(len(pairs)),
+                     str(len(present)), ", ".join(missing) or "none", status])
+
+    say("\n  {} ({} VMs)\n".format(cB("Scope Coverage"), total))
+    table(["Scope", "Coverage", "Progress"],
+          [[cC(s), "{}/{}".format(coverage[s], total),
+            progress_bar(coverage[s], total)] for s in mandatory], indent=4)
+
+    say("\n  {}".format(cB("Summary")))
+    hr()
+    say("    Total VMs              : {}".format(cB(str(total))))
+    say("    Fully tagged ({}/{})     : {} ({}%)".format(
+        len(mandatory), len(mandatory), cBG(str(full)), _pct(full, total)))
+    say("    Partially tagged       : {} ({}%)".format(
+        cBY(str(partial)), _pct(partial, total)))
+    say("    Untagged               : {} ({}%)".format(
+        cBR(str(untagged)), _pct(untagged, total)))
+    say("    Migration progress     : {}".format(progress_bar(full, total)))
+
+    say("\n  {}".format(cB("Per-Manager")))
+    mrows = []
+    for nsx in lms:
+        mine = [vm for mgr, vm in vms if mgr == nsx.name]
+        mt = len(mine)
+        mf = sum(1 for v in mine
+                 if len({s for s, _ in tags_of(v) if s} & set(mandatory))
+                 == len(mandatory))
+        mu = sum(1 for v in mine if not tags_of(v))
+        mrows.append([cC(nsx.name), str(mt), cG(str(mf)), cR(str(mu)),
+                      progress_bar(mf, mt)])
+    table(["Manager", "VMs", "Complete", "Untagged", "Progress"], mrows, indent=4)
+    hr()
+    exporter.stage("dashboard", DASHBOARD_HEADERS, rows)
+
+
+# ==========================================================================
+# actions/tags.py  --  VM tag inspection and interactive add/remove.
+# ==========================================================================
+
+CONSOLE_VM_LIMIT = 50
+CONSOLE_MATCH_LIMIT = 40
+
+TAGS_HEADERS = ["manager", "vm_name", "external_id", "power_state",
+                "tag_scope", "tag_value"]
+BY_TAG_HEADERS = ["manager", "vm_name", "external_id", "all_tags"]
+
+
+def act_vm_tags(sessions, needle, exporter, taxonomy):
+    rows = []
+    total = 0
+    for nsx in sessions:
+        section("{}  [{}]".format(nsx.name, ROLE_LABEL.get(nsx.role, "?")))
+        with Spinner("Searching VMs on {}".format(nsx.name)):
+            try:
+                matches = nsx.find_vms(needle)
+            except NsxError as e:
+                err(str(e))
+                continue
+        if not matches:
+            say("  No VM matching '{}'".format(needle))
+            continue
+        total += len(matches)
+        ordered = sorted(matches,
+                         key=lambda v: str(v.get(F_DISPLAY_NAME, "")).lower())
+        for i, vm in enumerate(ordered):
+            name = vm.get(F_DISPLAY_NAME, "?")
+            ext = vm.get(F_EXTERNAL_ID, "?")
+            power = vm.get(F_POWER_STATE, "")
+            pairs = tags_of(vm)
+            # Export every match; only the console listing is capped.
+            if pairs:
+                for s, t in sorted(pairs):
+                    rows.append([nsx.name, name, ext, power, s, t])
+            else:
+                rows.append([nsx.name, name, ext, power, "", ""])
+            if i >= CONSOLE_VM_LIMIT:
+                continue
+            hr()
+            say("  VM           : {}".format(cB(name)))
+            say("  external_id  : {}".format(cD(ext)))
+            if power:
+                say("  power_state  : {}".format(
+                    cG(power) if "ON" in power else cY(power)))
+            say("  tags ({})    :".format(len(pairs)))
+            if pairs:
+                for s, t in sorted(pairs):
+                    say("    {:30s} = {}".format(cC(s), t))
+                clean, issues = taxonomy.validate_vm_tags(pairs)
+                say("  taxonomy     : {}".format(
+                    cBG("OK") if clean else cBY("{} issue(s)".format(len(issues)))))
+                for issue in issues[:5]:
+                    warn(issue)
+            else:
+                say("    {}".format(cD("(none)")))
+        more_note(CONSOLE_VM_LIMIT, len(ordered))
+    hr()
+    say("  {} VM(s) across {} manager(s).".format(cC(str(total)), len(sessions)))
+    exporter.stage("vm_tags", TAGS_HEADERS, rows)
+
+
+def act_vms_by_tag(sessions, scope, tag, exporter):
+    crit = " and ".join(x for x in [
+        "scope='{}'".format(scope) if scope else "",
+        "tag='{}'".format(tag) if tag else ""] if x)
+    rows = []
+    total = 0
+    lms = [s for s in sessions if s.role == ROLE_LM]
+    fetched = parallel_run(lms, lambda s: s.all_vms(), label="Scanning inventories")
+
+    def hit(vm):
+        for s, t in tags_of(vm):
+            if scope and s.lower() != scope.lower():
+                continue
+            if tag and t.lower() != tag.lower():
+                continue
+            return True
+        return False
+
+    for nsx in lms:
+        section(nsx.name)
+        vms = fetched.get(nsx.name)
+        if isinstance(vms, Exception):
+            err(str(vms))
+            continue
+        if not vms:
+            continue
+        matches = [v for v in vms if hit(v)]
+        total += len(matches)
+        say("  {} of {} VM(s) carry {}".format(
+            cC(str(len(matches))), len(vms), crit))
+        for vm in sorted(matches,
+                         key=lambda v: str(v.get(F_DISPLAY_NAME, "")).lower()):
+            name = vm.get(F_DISPLAY_NAME, "?")
+            say("    {:45s} {}".format(name, fmt_tags(tags_of(vm))))
+            rows.append([nsx.name, name, vm.get(F_EXTERNAL_ID, ""),
+                         fmt_tags_plain(tags_of(vm))])
+    hr()
+    say("  {} VM(s) across {} LM(s).".format(cC(str(total)), len(lms)))
+    exporter.stage("vms_by_tag", BY_TAG_HEADERS, rows)
+
+
+def _pick_scope(taxonomy):
+    say("\n    {} (* = mandatory):".format(cB("Scopes")))
+    scopes = taxonomy.all_scopes
+    for i, s in enumerate(scopes, 1):
+        mark = cBG("*") if s in taxonomy.mandatory else " "
+        vals = taxonomy.values_for(s)
+        hint = "  {}".format(cD(", ".join(vals))) if vals else ""
+        say("      {:2d}. {} {}{}".format(i, mark, cC(s), hint))
+    say("       0. {}".format(cD("custom")))
+    c = ask("    Scope [# or name]: ", default="")
+    if c.isdigit():
+        idx = int(c)
+        if idx == 0:
+            return ask("    Custom scope: ", default="")
+        if 1 <= idx <= len(scopes):
+            return scopes[idx - 1]
+    return c.lower().strip()
+
+
+def _pick_value(taxonomy, scope):
+    allowed = taxonomy.values_for(scope)
+    if not allowed:
+        return ask("    Tag value: ")
+    say("\n    {} {}:".format(cB("Values for"), cC(scope)))
+    for i, v in enumerate(allowed, 1):
+        say("      {}. {}".format(i, v))
+    say("      0. {}".format(cD("custom")))
+    c = ask("    Value [# or name]: ", default="")
+    if c.isdigit():
+        idx = int(c)
+        if idx == 0:
+            return ask("    Custom value: ")
+        if 1 <= idx <= len(allowed):
+            return allowed[idx - 1]
+    return c.lower().strip()
+
+
+def _apply(nsx, vm, new_pairs, old_pairs, audit):
+    """Re-read immediately before writing so a concurrent change by another
+    operator is detected rather than silently overwritten."""
+    fresh = nsx.refresh_vm(vm)
+    if fresh is None:
+        raise NsxError("VM disappeared from inventory before write.")
+    live = sorted(tags_of(fresh))
+    if live != sorted(old_pairs):
+        raise NsxError(
+            "tags changed on NSX since this plan was built "
+            "(now: {}). Re-run to pick up the current state.".format(
+                fmt_tags_plain(live)))
+    nsx.update_vm_tags(fresh, new_pairs)
+    audit.log("update_tags", nsx.name, fresh.get(F_DISPLAY_NAME, "?"),
+              fresh.get(F_EXTERNAL_ID), old_pairs, new_pairs)
+
+
+def act_manage_tags(sessions, needle, audit, write_enabled, taxonomy):
+    if not write_enabled:
+        say("  {}. Toggle with menu 12 or --enable-writes.".format(
+            cBY("Writes disabled")))
+        return
+    if not is_interactive():
+        err("Interactive tag management needs a terminal. "
+            "Use --bulk-tag for scripted changes.")
+        return
+    found = []
+    for nsx in sessions:
+        try:
+            for vm in nsx.find_vms(needle):
+                found.append((nsx, vm))
+        except NsxError as e:
+            err(str(e))
+    if not found:
+        say("  No VM matching '{}'.".format(needle))
+        return
+    if len(found) == 1:
+        nsx, vm = found[0]
+    else:
+        say("\n  {} matches:".format(len(found)))
+        for i, (n, v) in enumerate(found[:CONSOLE_MATCH_LIMIT], 1):
+            say("    {}. [{}] {:40s} {}".format(
+                i, cC(n.name), v.get(F_DISPLAY_NAME, "?"), fmt_tags(tags_of(v))))
+        more_note(CONSOLE_MATCH_LIMIT, len(found), "narrow the search")
+        say("    b. back")
+        while True:
+            c = ask("  Which VM? ")
+            if c.isdigit() and 1 <= int(c) <= min(len(found), CONSOLE_MATCH_LIMIT):
+                nsx, vm = found[int(c) - 1]
+                break
+            say("    Invalid.")
+
+    while True:
+        current = nsx.refresh_vm(vm) or vm
+        pairs = sorted(tags_of(current))
+        hr()
+        say("  VM  : {}   [{}]".format(
+            cB(current.get(F_DISPLAY_NAME, "?")), cC(nsx.name)))
+        say("  tags ({}):".format(len(pairs)))
+        for i, (s, t) in enumerate(pairs, 1):
+            flag = "  {}".format(cBY("!!")) if taxonomy.validate_tag(s, t) else ""
+            say("    {:2d}. {:30s} = {}{}".format(i, cC(s), t, flag))
+        if not pairs:
+            say("      {}".format(cD("(none)")))
+        hr()
+        say("    1. {}".format(cG("Add")))
+        say("    2. {}".format(cR("Remove")))
+        say("    b. Back")
+        c = ask("  Choice: ", allow_back=False).lower()
+        if c == "b":
+            return
+        if c == "1":
+            scope = _pick_scope(taxonomy)
+            if not scope:
+                say("    Scope required.")
+                continue
+            value = _pick_value(taxonomy, scope)
+            if not value:
+                say("    Value required.")
+                continue
+            warnings = taxonomy.validate_tag(scope, value)
+            if warnings:
+                for w in warnings:
+                    warn(w)
+                if not confirm("    Proceed? [y/N]: "):
+                    continue
+            if (scope, value) in pairs:
+                say("    Already has it.")
+                continue
+            new = pairs + [(scope, value)]
+            say("\n    Result ({} tags):".format(len(new)))
+            for s, t in sorted(new):
+                mark = "  {}".format(cBG("<-- NEW")) if (s, t) == (scope, value) else ""
+                say("      {:30s} = {}{}".format(cC(s), t, mark))
+            if not confirm("    Apply? [y/N]: "):
+                say("    Cancelled.")
+                continue
+            try:
+                _apply(nsx, current, new, pairs, audit)
+                ok_msg("Applied.")
+            except NsxError as e:
+                err(str(e))
+        elif c == "2":
+            if not pairs:
+                say("    No tags.")
+                continue
+            sel = ask("    Tag # to remove: ")
+            if not sel.isdigit() or not (1 <= int(sel) <= len(pairs)):
+                say("    Invalid.")
+                continue
+            victim = pairs[int(sel) - 1]
+            new = [p for p in pairs if p != victim]
+            say("\n    Removing: {}".format(cR("{}={}".format(*victim))))
+            say("    {}: may affect dynamic groups and DFW rules.".format(cBY("NOTE")))
+            if not confirm("    Apply? [y/N]: "):
+                continue
+            try:
+                _apply(nsx, current, new, pairs, audit)
+                ok_msg("Removed.")
+            except NsxError as e:
+                err(str(e))
+
+
+# ==========================================================================
+# actions/bulk.py  --  Bulk tagging from CSV.
+# ==========================================================================
+
+REQUIRED_COLUMNS = {"vm_name", "scope", "tag", "action"}
+VALID_ACTIONS = ("add", "remove")
+
+
+def read_bulk_csv(path):
+    """Rows plus any structural problems. Raises only for unusable files."""
+    if not os.path.isfile(path):
+        raise NsxError("Not found: {}".format(path))
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise NsxError("CSV empty: {}".format(path))
+    missing = REQUIRED_COLUMNS - {k for k in rows[0].keys() if k}
+    if missing:
+        raise NsxError("CSV missing column(s): {}".format(", ".join(sorted(missing))))
+    problems = []
+    clean = []
+    for i, row in enumerate(rows, 2):  # header is line 1
+        name = (row.get("vm_name") or "").strip()
+        scope = (row.get("scope") or "").strip()
+        tag = (row.get("tag") or "").strip()
+        action = (row.get("action") or "").strip().lower()
+        if not name:
+            problems.append("line {}: empty vm_name".format(i))
+            continue
+        if action not in VALID_ACTIONS:
+            problems.append("line {}: action must be add|remove (got {!r})".format(
+                i, row.get("action")))
+            continue
+        if not scope and not tag:
+            problems.append("line {}: needs a scope, a tag, or both".format(i))
+            continue
+        clean.append({"line": i, "vm_name": name, "scope": scope,
+                      "tag": tag, "action": action})
+    return clean, problems
+
+
+def build_vm_index(sessions):
+    """{lowercase display name: [(nsx, vm), ...]} from one fetch per manager."""
+    fetched = parallel_run(sessions, lambda s: s.all_vms(),
+                           label="Indexing VM inventories")
+    index = {}
+    for nsx in sessions:
+        vms = fetched.get(nsx.name)
+        if isinstance(vms, Exception):
+            err("{}: {}".format(nsx.name, vms))
+            continue
+        for vm in (vms or []):
+            key = str(vm.get(F_DISPLAY_NAME, "")).lower()
+            if key:
+                index.setdefault(key, []).append((nsx, vm))
+    return index
+
+
+def plan_bulk(sessions, rows):
+    """Compute per-VM tag changes without touching NSX beyond the index build.
+
+    Returns (plan, unresolved, ambiguous) where plan entries are
+    {nsx, vm, before, after, added, removed, ops}.
+    """
+    index = build_vm_index(sessions)
+    by_vm = {}
+    for row in rows:
+        by_vm.setdefault(row["vm_name"], []).append(row)
+
+    plan, unresolved, ambiguous = [], [], []
+    for name, ops in sorted(by_vm.items()):
+        candidates = index.get(name.lower(), [])
+        if not candidates:
+            unresolved.append(name)
+            continue
+        if len({n.name for n, _ in candidates}) > 1:
+            ambiguous.append((name, sorted({n.name for n, _ in candidates})))
+            continue
+        nsx, vm = candidates[0]
+        before = sorted(tags_of(vm))
+        after = list(before)
+        for op in ops:
+            pair = (op["scope"], op["tag"])
+            if op["action"] == "add":
+                if pair not in after:
+                    after.append(pair)
+            else:
+                after = [p for p in after if p != pair]
+        after = sorted(after)
+        plan.append({
+            "nsx": nsx, "vm": vm, "before": before, "after": after,
+            "added": [p for p in after if p not in before],
+            "removed": [p for p in before if p not in after],
+            "ops": ops,
+        })
+    return plan, unresolved, ambiguous
+
+
+def act_bulk_tag(sessions, csv_path, audit, write_enabled, dry_run=True,
+                 taxonomy=None, force=False):
+    """Returns a result dict; also prints a human-readable plan/outcome."""
+    result = {"applied": 0, "skipped": 0, "failed": 0, "unresolved": 0,
+              "unchanged": 0}
+    try:
+        rows, problems = read_bulk_csv(csv_path)
+    except NsxError as e:
+        err(str(e))
+        return result
+    for p in problems:
+        warn(p)
+    if not rows:
+        err("No usable rows in {}.".format(csv_path))
+        return result
+
+    if taxonomy:
+        for row in rows:
+            if row["action"] == "add":
+                for w in taxonomy.validate_tag(row["scope"], row["tag"]):
+                    warn("line {}: {}".format(row["line"], w))
+
+    if not dry_run and not write_enabled:
+        say("  {}. Re-run with --enable-writes.".format(cBY("Writes disabled")))
+        return result
+
+    plan, unresolved, ambiguous = plan_bulk(sessions, rows)
+    label = cBY("DRY RUN") if dry_run else cBG("APPLYING")
+    say("\n  {} -- {} op(s) across {} VM(s)".format(label, len(rows), len(plan)))
+    hr()
+
+    for name in unresolved:
+        say("  {:45s}  {}".format(name, cR("NOT FOUND")))
+        result["unresolved"] += 1
+    for name, mgrs in ambiguous:
+        say("  {:45s}  {} on {}".format(
+            name, cBR("AMBIGUOUS"), ", ".join(mgrs)))
+        say("      {}".format(cD("resolve with --manager to pick one")))
+        result["skipped"] += 1
+
+    for item in plan:
+        name = item["vm"].get(F_DISPLAY_NAME, "?")
+        if not item["added"] and not item["removed"]:
+            say("  {:45s}  {}".format(name, cD("no change")))
+            result["unchanged"] += 1
+            continue
+        change = []
+        if item["added"]:
+            change.append(cG("+{}".format(len(item["added"]))))
+        if item["removed"]:
+            change.append(cR("-{}".format(len(item["removed"]))))
+        if dry_run:
+            say("  {:45s}  [{}]  would: {}".format(
+                name, cC(item["nsx"].name), ", ".join(change)))
+            for s, t in item["added"]:
+                say("      {}".format(cG("+ {}={}".format(s, t))))
+            for s, t in item["removed"]:
+                say("      {}".format(cR("- {}={}".format(s, t))))
+            result["applied"] += 1
+            continue
+        try:
+            _write_row(item, audit, force)
+            say("  {:45s}  [{}]  applied: {}".format(
+                name, cC(item["nsx"].name), ", ".join(change)))
+            result["applied"] += 1
+        except NsxError as e:
+            say("  {:45s}  {}".format(name, cBR("FAILED")))
+            say("      {}".format(cD(str(e)[:160])))
+            result["failed"] += 1
+
+    hr()
+    say("  Complete: {} {}, {} unchanged, {} not found, {} failed.".format(
+        cG(str(result["applied"])), "planned" if dry_run else "applied",
+        cY(str(result["unchanged"])), cR(str(result["unresolved"])),
+        cR(str(result["failed"]))))
+    return result
+
+
+def _write_row(item, audit, force):
+    nsx, vm = item["nsx"], item["vm"]
+    fresh = nsx.refresh_vm(vm)
+    if fresh is None:
+        raise NsxError("VM disappeared from inventory before write.")
+    live = sorted(tags_of(fresh))
+    if live != item["before"] and not force:
+        raise NsxError(
+            "tags changed on NSX since the plan was built (now: {}); "
+            "re-run, or pass --force to overwrite.".format(fmt_tags_plain(live)))
+    nsx.update_vm_tags(fresh, item["after"])
+    audit.log("bulk_update_tags", nsx.name, fresh.get(F_DISPLAY_NAME, "?"),
+              fresh.get(F_EXTERNAL_ID), item["before"], item["after"])
+
+
+# ==========================================================================
+# actions/reverse.py  --  Reverse lookup: VM -> groups -> DFW rules impact analysis.
+# ==========================================================================
+
+REVERSE_HEADERS = ["vm", "manager", "manager_role", "group_id", "group_name",
+                  "group_origin", "policy", "rule", "rule_origin", "action",
+                  "direction"]
+
+
+def _collect_associations(nsx, domain, ext_id):
+    base = nsx.base(domain)
+    return nsx.get_all(p_vm_group_assoc(base),
+                       params={PARAM_VM_EXTERNAL_ID: ext_id})
+
+
+def _fetch_rules(nsx, domain, policies):
+    """Rules for every policy on one manager, fetched concurrently.
+
+    Serially this was an N+1: one round trip per policy per manager, so eight
+    LMs with 200 policies each meant 1,600 sequential requests.
+    """
+    if not policies:
+        return []
+    results = parallel_run(
+        policies,
+        lambda pol: nsx.get_all(p_sec_rules(nsx.base(domain), domain,
+                                            pol.get(F_ID, "?"))),
+        label="Rules on {}".format(nsx.name),
+        key=lambda pol: pol.get(F_ID, "?"))
+    out = []
+    for pol in policies:
+        rules = results.get(pol.get(F_ID, "?"))
+        if isinstance(rules, Exception):
+            continue
+        for rule in (rules or []):
+            out.append((pol, rule))
+    return out
+
+
+def act_reverse_lookup(all_sessions, needle, domain, exporter):
+    """VM -> groups -> DFW rules impact analysis.
+
+    GROUP MEMBERSHIP: uses NSX's own reverse-association endpoint
+    (virtual-machine-group-associations) instead of sweeping every group's
+    /members/virtual-machines sub-resource. That sub-resource only returns
+    results for groups whose criteria resolves to the VirtualMachine member
+    type -- groups matched on VIF, IPAddress, Segment, or SegmentPort criteria
+    silently come back empty there even though the VM is an effective member.
+    The association endpoint is member-type agnostic: it's the same index NSX's
+    own Groups search UI reads, so results match what you see there. Queried on
+    the VM's home LM (tags/VMs are LM-local), with a best-effort supplementary
+    query on any connected GM.
+
+    DFW RULES: GM-authored security policies are realized read-only on every LM
+    registered beneath it, so an LM's own rule listing contains both its native
+    rules AND a copy of every GM rule. Scanned across GM + all LMs, that means
+    each GM rule would otherwise be reported once per LM (once per site, up to
+    8x). Rules are deduped globally by their NSX 'path' -- first-seen wins, GM
+    sessions are scanned before LM sessions, so a GM-origin rule is always
+    attributed to 'GM' exactly once and never re-listed per LM. Rules with no
+    GM session connected (or genuinely LM-native rules) still get counted,
+    tagged with the appropriate origin.
+    """
+    rows = []
+    gm_sessions = [s for s in all_sessions if s.role == ROLE_GM]
+    lm_sessions = [s for s in all_sessions if s.role == ROLE_LM]
+
+    # Tags/VMs are LM-local objects -- find the VM on whichever LM has it.
+    found_vm = None
+    for nsx in lm_sessions:
+        try:
+            hits = nsx.find_vms(needle)
+            if hits:
+                found_vm = (nsx, hits[0])
+                break
+        except NsxError:
+            continue
+    if not found_vm:
+        say("  No VM matching '{}' on any Local Manager.".format(needle))
+        exporter.stage("reverse_lookup", REVERSE_HEADERS, rows)
+        return
+
+    nsx_lm, vm = found_vm
+    vname = vm.get(F_DISPLAY_NAME, "?")
+    ext_id = vm.get(F_EXTERNAL_ID)
+    say("\n  VM      : {}".format(cB(vname)))
+    say("  Found on: {}  (Local Manager)".format(cC(nsx_lm.name)))
+    say("  tags    : {}".format(fmt_tags(tags_of(vm))))
+    if not ext_id:
+        say("  {} -- cannot resolve group associations.".format(
+            cBR("VM has no external_id")))
+        exporter.stage("reverse_lookup", REVERSE_HEADERS, rows)
+        return
+
+    # --- Group membership: reverse-association lookup, any member type ---
+    section("Group Membership (any member type)")
+    matched = {}   # group_id -> (path, display_name, origin)
+    with Spinner("Association lookup on {}".format(nsx_lm.name)):
+        try:
+            assocs = _collect_associations(nsx_lm, domain, ext_id)
+        except NsxError as e:
+            err("association lookup on {} failed: {}".format(nsx_lm.name, e))
+            assocs = []
+    for a in assocs:
+        gpath = a.get(F_PATH, "")
+        gid = a.get(F_TARGET_ID) or (group_id_from_path(gpath) if gpath else "?")
+        matched[gid] = (gpath, a.get(F_TARGET_DISPLAY_NAME, gid),
+                        origin_of_path(gpath))
+
+    # Best-effort supplementary check on any connected GM -- catches the rare
+    # case of a Global Group not yet realized onto this specific LM.
+    # Non-fatal: GM doesn't hold VM inventory, so this may simply 404.
+    for nsx_gm in gm_sessions:
+        try:
+            g_assocs = _collect_associations(nsx_gm, domain, ext_id)
+        except NsxError:
+            continue
+        for a in g_assocs:
+            gpath = a.get(F_PATH, "")
+            gid = a.get(F_TARGET_ID) or (group_id_from_path(gpath) if gpath else "?")
+            if gid in matched:
+                continue
+            matched[gid] = (gpath, a.get(F_TARGET_DISPLAY_NAME, gid),
+                            origin_of_path(gpath))
+
+    if not matched:
+        say("  {}".format(cD("Not a member of any group on any manager.")))
+        exporter.stage("reverse_lookup", REVERSE_HEADERS, rows)
+        return
+    for gid, (_gpath, gname, origin) in sorted(matched.items(),
+                                              key=lambda kv: kv[1][1].lower()):
+        say("    [{}]  {}  {}".format(
+            cC("GM") if origin == "GM" else cD("LM"), cB(gname), cD("id=" + gid)))
+
+    group_paths = ({gp for gp, _, _ in matched.values() if gp}
+                   | set(matched.keys()))
+    group_lookup = {gid: gname for gid, (_, gname, _) in matched.items()}
+
+    # --- DFW rules: GM scanned first, then LM, deduped by rule path ---
+    section("DFW Rules Referencing These Groups")
+    say("  Scanning {} GM + {} LM ({}) ...".format(
+        len(gm_sessions), len(lm_sessions), cD("deduped by rule path")))
+    seen_rule_paths, hit_count = set(), 0
+    for nsx in gm_sessions + lm_sessions:
+        try:
+            base = nsx.base(domain)
+        except NsxError:
+            continue
+        with Spinner("Policies on {}".format(nsx.name)):
+            try:
+                policies = nsx.get_all(p_sec_policies(base, domain))
+            except NsxError:
+                continue
+        for pol, rule in _fetch_rules(nsx, domain, policies):
+            pid = pol.get(F_ID, "?")
+            rpath = rule.get(F_PATH, "")
+            refs = set(rule.get(F_SOURCE_GROUPS, [])
+                       + rule.get(F_DEST_GROUPS, [])
+                       + rule.get(F_SCOPE, []))
+            hits = refs & group_paths
+            if not hits:
+                continue
+            if rpath:
+                if rpath in seen_rule_paths:
+                    continue   # already reported via GM (or an earlier LM)
+                seen_rule_paths.add(rpath)
+            hit_count += 1
+            dirs = []
+            if set(rule.get(F_SOURCE_GROUPS, [])) & group_paths:
+                dirs.append("source")
+            if set(rule.get(F_DEST_GROUPS, [])) & group_paths:
+                dirs.append("dest")
+            if set(rule.get(F_SCOPE, [])) & group_paths:
+                dirs.append("applied_to")
+            act = rule.get(F_ACTION_FIELD, "?")
+            colour = cG if act == "ALLOW" else cR
+            role_lbl = ROLE_LABEL.get(nsx.role, "?")
+            if nsx.role == ROLE_GM:
+                rule_origin = "GM"
+            else:
+                rule_origin = origin_of_path(rpath)
+                if rule_origin == "GM" and not gm_sessions:
+                    rule_origin = "GM (via LM)"
+            say("    [{} / {} / {}]  {} / {}   {}   {}".format(
+                cC(nsx.name), cD(role_lbl), cD(rule_origin),
+                cB(pol.get(F_DISPLAY_NAME, pid)), rule.get(F_DISPLAY_NAME, "?"),
+                colour(act), cC(", ".join(dirs))))
+            for gpath in hits:
+                gi = group_id_from_path(gpath)
+                _, _, gorigin = matched.get(gi, (None, None, "?"))
+                rows.append([vname, nsx.name, role_lbl, gi,
+                             group_lookup.get(gi, gi), gorigin, pid,
+                             rule.get(F_ID, "?"), rule_origin, act,
+                             ", ".join(dirs)])
+    if hit_count == 0:
+        say("  {} reference these groups on any manager.".format(cG("No DFW rules")))
+    hr()
+    exporter.stage("reverse_lookup", REVERSE_HEADERS, rows)
+
+
+# ==========================================================================
+# actions/parity.py  --  Static vs dynamic group parity -- the core migration progress check.
+# ==========================================================================
+
+CONSOLE_LIMIT = 30
+PARITY_HEADERS = ["vm_name", "manager", "in_static", "in_dynamic", "status"]
+
+
+def _groups_on(nsx, domain):
+    base = nsx.base(domain)
+    return base, nsx.get_all(p_groups(base, domain))
+
+
+def _match(groups, name):
+    n = name.lower()
+    return [g for g in groups
+            if str(g.get(F_DISPLAY_NAME, "")).lower() == n
+            or str(g.get(F_ID, "")).lower() == n]
+
+
+def resolve_pair(sessions, domain, static_name, dynamic_name):
+    """(nsx, base, static_group, dynamic_group). Both from one manager."""
+    candidates = []
+    for nsx in sessions:
+        try:
+            base, groups = _groups_on(nsx, domain)
+        except NsxError:
+            continue
+        s_hits = _match(groups, static_name)
+        d_hits = _match(groups, dynamic_name)
+        if s_hits and d_hits:
+            candidates.append((nsx, base, s_hits[0], d_hits[0]))
+    if not candidates:
+        # Report which side is the problem rather than a bare "not found".
+        found_s, found_d = [], []
+        for nsx in sessions:
+            try:
+                _, groups = _groups_on(nsx, domain)
+            except NsxError:
+                continue
+            if _match(groups, static_name):
+                found_s.append(nsx.name)
+            if _match(groups, dynamic_name):
+                found_d.append(nsx.name)
+        if not found_s and not found_d:
+            raise NsxError("Neither '{}' nor '{}' found on any manager.".format(
+                static_name, dynamic_name))
+        if not found_s:
+            raise NsxError("Static group '{}' not found on any manager "
+                           "(dynamic found on: {}).".format(
+                               static_name, ", ".join(found_d) or "none"))
+        if not found_d:
+            raise NsxError("Dynamic group '{}' not found on any manager "
+                           "(static found on: {}).".format(
+                               dynamic_name, ", ".join(found_s) or "none"))
+        raise NsxError(
+            "'{}' and '{}' exist but never on the same manager "
+            "(static: {}; dynamic: {}). Comparing across managers would be "
+            "meaningless.".format(static_name, dynamic_name,
+                                  ", ".join(found_s), ", ".join(found_d)))
+    if len(candidates) > 1:
+        names = ", ".join(c[0].name for c in candidates)
+        say("  {} both groups exist on {} -- using {}. "
+            "Use --manager to pick another.".format(
+                cBY("note:"), names, cC(candidates[0][0].name)))
+    return candidates[0]
+
+
+def act_parity(sessions, domain, static_name, dynamic_name, exporter):
+    rows = []
+    try:
+        nsx, base, gs, gd = resolve_pair(sessions, domain, static_name, dynamic_name)
+    except NsxError as e:
+        err(str(e))
+        exporter.stage("parity", PARITY_HEADERS, rows)
+        return
+
+    section("Parity Validation")
+    say("  Manager : {}  [{}]".format(cC(nsx.name), ROLE_LABEL.get(nsx.role, "?")))
+    say("  Static  : {}".format(cB(gs.get(F_DISPLAY_NAME, "?"))))
+    say("  Dynamic : {}".format(cB(gd.get(F_DISPLAY_NAME, "?"))))
+    with Spinner("Fetching members"):
+        try:
+            static_members = nsx.get_all(p_group_members(base, domain, gs.get(F_ID)))
+            dynamic_members = nsx.get_all(p_group_members(base, domain, gd.get(F_ID)))
+        except NsxError as e:
+            err(str(e))
+            exporter.stage("parity", PARITY_HEADERS, rows)
+            return
+
+    s_map = {str(m.get(F_DISPLAY_NAME, "")).lower(): m for m in static_members}
+    d_map = {str(m.get(F_DISPLAY_NAME, "")).lower(): m for m in dynamic_members}
+    only_static = sorted(set(s_map) - set(d_map))
+    only_dynamic = sorted(set(d_map) - set(s_map))
+    both = sorted(set(s_map) & set(d_map))
+
+    say("\n  Static: {}  Dynamic: {}  Both: {}".format(
+        cC(str(len(s_map))), cC(str(len(d_map))), cBG(str(len(both)))))
+    say("  Only static: {} (need migration)  Only dynamic: {} (unexpected)".format(
+        cBR(str(len(only_static))), cBY(str(len(only_dynamic)))))
+
+    # Console listings are capped; every row is exported.
+    if only_static:
+        say("\n  {}:".format(cBR("Need migration")))
+        for n in only_static[:CONSOLE_LIMIT]:
+            say("    {} {}".format(cR("x"), s_map[n].get(F_DISPLAY_NAME, n)))
+        more_note(CONSOLE_LIMIT, len(only_static))
+    if only_dynamic:
+        say("\n  {}:".format(cBY("Unexpected")))
+        for n in only_dynamic[:CONSOLE_LIMIT]:
+            say("    {} {}".format(cY("?"), d_map[n].get(F_DISPLAY_NAME, n)))
+        more_note(CONSOLE_LIMIT, len(only_dynamic))
+
+    for n in only_static:
+        rows.append([s_map[n].get(F_DISPLAY_NAME, n), nsx.name, "yes", "no",
+                     "needs_migration"])
+    for n in only_dynamic:
+        rows.append([d_map[n].get(F_DISPLAY_NAME, n), nsx.name, "no", "yes",
+                     "unexpected"])
+    for n in both:
+        rows.append([s_map[n].get(F_DISPLAY_NAME, n), nsx.name, "yes", "yes",
+                     "migrated"])
+
+    say("\n  Parity: {}".format(progress_bar(len(both), len(s_map))))
+    say("  {}".format(cD("{} row(s) staged for export".format(len(rows)))))
+    hr()
+    exporter.stage("parity", PARITY_HEADERS, rows)
+
+
+# ==========================================================================
+# actions/change_ticket.py  --  Change plan generation from a bulk-tagging CSV.
+# ==========================================================================
+
+TICKET_HEADERS = ["vm_name", "manager", "status", "tags_before", "tags_after",
+                  "added", "removed"]
+
+
+def _rule(char="=", width=70):
+    return char * width
+
+
+def build_plan_lines(csv_path, plan, unresolved, ambiguous, problems, user):
+    adds = sum(len(p["added"]) for p in plan)
+    removes = sum(len(p["removed"]) for p in plan)
+    changing = [p for p in plan if p["added"] or p["removed"]]
+    noop = [p for p in plan if not p["added"] and not p["removed"]]
+
+    lines = [_rule(), "  CHANGE PLAN: Tag Migration Batch", _rule(),
+             "  Prepared by : {}".format(user),
+             "  Date        : {}".format(utc_now_stamp()),
+             "  Source      : {}".format(csv_path),
+             "  Host        : {}".format(platform.node()), "",
+             "  SCOPE", "  " + _rule("-", 40),
+             "  VMs changing     : {}".format(len(changing)),
+             "  VMs already ok   : {}".format(len(noop)),
+             "  VMs not found    : {}".format(len(unresolved)),
+             "  VMs ambiguous    : {}".format(len(ambiguous)),
+             "  Tags to add      : {}".format(adds),
+             "  Tags to remove   : {}".format(removes), ""]
+
+    if problems:
+        lines.extend(["  CSV PROBLEMS", "  " + _rule("-", 40)])
+        lines.extend("    {}".format(p) for p in problems)
+        lines.append("")
+
+    lines.extend(["  CHANGES BY VM  (verified against live NSX)",
+                  "  " + _rule("-", 40)])
+    for item in sorted(changing, key=lambda p: p["vm"].get(F_DISPLAY_NAME, "")):
+        lines.append("  {}   [{}]".format(
+            item["vm"].get(F_DISPLAY_NAME, "?"), item["nsx"].name))
+        lines.append("    current : {}".format(fmt_tags_plain(item["before"])))
+        lines.append("    proposed: {}".format(fmt_tags_plain(item["after"])))
+        for s, t in item["added"]:
+            lines.append("    + {}={}".format(s, t))
+        for s, t in item["removed"]:
+            lines.append("    - {}={}".format(s, t))
+        lines.append("")
+
+    if noop:
+        lines.extend(["  ALREADY IN DESIRED STATE (no action)",
+                      "  " + _rule("-", 40)])
+        lines.extend("    {}".format(p["vm"].get(F_DISPLAY_NAME, "?")) for p in noop)
+        lines.append("")
+    if unresolved:
+        lines.extend(["  NOT FOUND ON ANY MANAGER (will be skipped)",
+                      "  " + _rule("-", 40)])
+        lines.extend("    {}".format(n) for n in unresolved)
+        lines.append("")
+    if ambiguous:
+        lines.extend(["  AMBIGUOUS -- same name on several managers",
+                      "  " + _rule("-", 40)])
+        lines.extend("    {}  ({})".format(n, ", ".join(m)) for n, m in ambiguous)
+        lines.append("")
+
+    lines.extend(["  ROLLBACK", "  " + _rule("-", 40),
+                  "  Audit-log undo (menu 11) restores per-VM prior state,",
+                  "  or apply an inverse CSV with --bulk-tag.", "",
+                  "  PRE-CHANGE CHECKLIST", "  " + _rule("-", 40),
+                  "  1. --verify   (all managers reachable and authenticated)",
+                  "  2. --bulk-tag <file> --dry-run   (preview, no writes)",
+                  "  3. Confirm no active maintenance window conflicts",
+                  "  4. --bulk-tag <file> --enable-writes --yes", "", _rule()])
+    return lines
+
+
+def act_change_ticket(sessions, csv_path, exporter, out_dir=None):
+    try:
+        rows, problems = read_bulk_csv(csv_path)
+    except NsxError as e:
+        err(str(e))
+        return None
+    plan, unresolved, ambiguous = plan_bulk(sessions, rows)
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "unknown"
+    lines = build_plan_lines(csv_path, plan, unresolved, ambiguous, problems, user)
+
+    out_dir = out_dir or DEFAULT_TICKET_DIR
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "change_plan_{}.txt".format(local_stamp()))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    for line in lines:
+        if line.startswith("=" * 10):
+            say(cBC(line))
+        elif "CHANGE PLAN" in line:
+            say("  {}".format(cB(line.strip())))
+        elif line.strip().startswith("+") and "=" in line:
+            say(cG(line))
+        elif line.strip().startswith("- ") and "=" in line:
+            say(cR(line))
+        else:
+            say(line)
+
+    export_rows = []
+    for item in plan:
+        changing = bool(item["added"] or item["removed"])
+        export_rows.append([
+            item["vm"].get(F_DISPLAY_NAME, "?"), item["nsx"].name,
+            "change" if changing else "no_change",
+            fmt_tags_plain(item["before"]), fmt_tags_plain(item["after"]),
+            fmt_tags_plain(item["added"]), fmt_tags_plain(item["removed"])])
+    for name in unresolved:
+        export_rows.append([name, "", "not_found", "", "", "", ""])
+    for name, mgrs in ambiguous:
+        export_rows.append([name, ", ".join(mgrs), "ambiguous", "", "", "", ""])
+    exporter.stage("change_plan", TICKET_HEADERS, export_rows)
+
+    if unresolved or ambiguous:
+        say("  {} {} row(s) could not be resolved -- see the plan.".format(
+            cBY("WARNING:"), len(unresolved) + len(ambiguous)))
+    ok_msg("Saved: {}".format(out_path))
+    return out_path
+
+
+# ==========================================================================
+# actions/audit_view.py  --  Audit log viewing and single-entry undo.
+# ==========================================================================
+
+AUDIT_HEADERS = ["timestamp", "user", "manager", "action", "vm_name",
+                  "added", "removed", "status"]
+
+
+def _pairs(entries):
+    return [(t.get("scope", ""), t.get("tag", "")) for t in (entries or [])]
+
+
+def act_audit_log(audit, sessions, write_enabled, exporter=None, limit=20):
+    entries = audit.last_n(limit)
+    if not entries:
+        say("  Audit log empty.")
+        if exporter is not None:
+            exporter.stage("audit_log", AUDIT_HEADERS, [])
+        return
+    say("\n  Last {} entries:".format(cC(str(len(entries)))))
+    hr()
+    rows = []
+    for i, e in enumerate(entries, 1):
+        before = _pairs(e.get("tags_before"))
+        after = _pairs(e.get("tags_after"))
+        added = [p for p in after if p not in before]
+        removed = [p for p in before if p not in after]
+        say("  {:5s} {}  {:30s}  [{}]".format(
+            cD(str(i) + "."), cD(str(e.get("timestamp", "?"))[:19]),
+            e.get("vm_display_name", "?"), cC(e.get("manager", "?"))))
+        if added:
+            say("        {}".format(cG("+ " + fmt_tags_plain(added))))
+        if removed:
+            say("        {}".format(cR("- " + fmt_tags_plain(removed))))
+        rows.append([e.get("timestamp", ""), e.get("user", ""),
+                     e.get("manager", ""), e.get("action", ""),
+                     e.get("vm_display_name", ""), fmt_tags_plain(added),
+                     fmt_tags_plain(removed), e.get("status", "")])
+    if exporter is not None:
+        exporter.stage("audit_log", AUDIT_HEADERS, rows)
+
+    if not write_enabled:
+        say("\n  {}.".format(cBY("Undo needs write mode")))
+        return
+    if not is_interactive():
+        return
+    hr()
+    choice = ask("  Undo entry # (or b): ")
+    if not choice.isdigit() or not (1 <= int(choice) <= len(entries)):
+        say("  Cancelled.")
+        return
+    target = entries[int(choice) - 1]
+    restore_to = _pairs(target.get("tags_before"))
+    vm_name = target.get("vm_display_name", "?")
+    mgr_name = target.get("manager", "?")
+    ext = target.get("vm_external_id", "?")
+
+    nsx = next((s for s in sessions if s.name == mgr_name), None)
+    if not nsx:
+        err("Manager '{}' is not in this session.".format(mgr_name))
+        return
+    vm = nsx.get_vm_by_external_id(ext)
+    if not vm:
+        err("VM '{}' (external_id {}) not found on {}.".format(
+            vm_name, ext, mgr_name))
+        return
+    current = sorted(tags_of(vm))
+    say("\n  Restore '{}' on [{}]".format(cB(vm_name), cC(mgr_name)))
+    say("    current : {}".format(fmt_tags_plain(current)))
+    say("    restore : {}".format(fmt_tags_plain(sorted(restore_to))))
+    if current == sorted(restore_to):
+        say("  Already in that state -- nothing to undo.")
+        return
+    if not confirm("  Apply undo? [y/N]: "):
+        say("  Cancelled.")
+        return
+    try:
+        fresh = nsx.refresh_vm(vm) or vm
+        nsx.update_vm_tags(fresh, restore_to)
+        audit.log("undo", nsx.name, vm_name, fresh.get(F_EXTERNAL_ID),
+                  current, restore_to, detail="undo of {}".format(
+                      target.get("timestamp", "?")))
+        ok_msg("Undo applied.")
+    except NsxError as e:
+        err(str(e))
+
+
+# ==========================================================================
+# wizard.py  --  First-run setup.
+# ==========================================================================
+
+def _intro():
+    say(cBC("=" * W))
+    say("  {} v{} -- {}".format(cB(TOOL_NAME), VERSION, cB("first-run setup")))
+    say(cBC("=" * W))
+    say("")
+    say("  No inventory was found, so let's build one. You'll be asked for")
+    say("  each NSX manager you want the toolkit to talk to.")
+    say("")
+    say("  {} the Global Manager (if you have one), then each".format(cD("Add")))
+    say("  {} Local Manager. Tags and VM inventory live on Local".format(cD("")))
+    say("  Managers; groups and policies exist on both.")
+    say("")
+    if not have_requests():
+        say("  {} 'requests' is not installed -- using the built-in".format(
+            cD("note:")))
+        say("        stdlib transport. Everything works; client-certificate")
+        say("        authentication is the one feature that needs requests.")
+        say("")
+
+
+def _ask_role():
+    while True:
+        say("    1. Local Manager  {}".format(cD("(VMs, tags, local policy)")))
+        say("    2. Global Manager {}".format(cD("(federated groups and policy)")))
+        c = ask("  Role [1]: ", default="1").strip().lower()
+        if c in ("1", "lm", "local"):
+            return ROLE_LM
+        if c in ("2", "gm", "global"):
+            return ROLE_GM
+        say("    Pick 1 or 2.")
+
+
+def _ask_manager(index, used_names):
+    say("\n  {}".format(cB("Manager #{}".format(index))))
+    hr()
+    host = ask("  Hostname or IP: ").strip()
+    if not host:
+        return None
+    default_name = host.split(".")[0][:24] or "nsx{}".format(index)
+    while True:
+        name = ask("  Short name [{}]: ".format(default_name),
+                   default=default_name).strip()
+        if name not in used_names:
+            break
+        say("    '{}' is already used -- pick another.".format(name))
+    role = _ask_role()
+    port = ask("  Port [443]: ", default="443").strip()
+    verify = confirm("  Verify the TLS certificate? "
+                     "[y/N] (N is usual for self-signed): ")
+    entry = {
+        "name": name,
+        "role": role,
+        "host": host,
+        "port": int(port) if port.isdigit() else 443,
+        "verify_ssl": bool(verify),
+        "auth": "session",
+    }
+    if verify:
+        ca = ask("  CA bundle path (blank = system trust store): ",
+                 default="").strip()
+        if ca:
+            entry["ca_bundle"] = ca
+    u_env, p_env = default_env_names(name)
+    entry["username_env"] = u_env
+    entry["password_env"] = p_env
+    problems = validate_manager(entry, index)
+    for p in problems:
+        warn(p)
+    return entry
+
+
+def _test(entry):
+    """Authenticate and make one real call. Returns True when it works."""
+    name = entry.get("name", "?")
+    say("\n  Testing {} ...".format(cC(name)))
+    try:
+        user, pwd, src = credentials_for(entry, allow_prompt=True)
+    except (NsxError, UserAbort) as e:
+        err("{}: {}".format(name, e))
+        return False
+    say("    credentials {}".format(cD(src)))
+    try:
+        nsx = Nsx(entry, user, pwd, transport=make_transport())
+        base = nsx.base(verbose=True)
+        version = nsx.version()
+        say("    api base    {}".format(cD(base)))
+        if version:
+            say("    nsx version {}".format(cD("{}.{}".format(*version))))
+        ok_msg("{}: reachable and authenticated.".format(name))
+        nsx.close()
+        return True
+    except NsxError as e:
+        err("{}: {}".format(name, str(e)[:200]))
+        return False
+
+
+def run_wizard(explicit_path=None):
+    """Build an inventory interactively. Returns its path, or None."""
+    if not is_interactive():
+        err("No inventory file found, and this is not an interactive terminal.")
+        say("")
+        say("  Create one and re-run. Minimal example:")
+        say(cD('    {"managers": [{"name": "lm1", "role": "lm",'))
+        say(cD('       "host": "nsx.example.com", "verify_ssl": false,'))
+        say(cD('       "username_env": "NSX_LM1_USER",'))
+        say(cD('       "password_env": "NSX_LM1_PASS"}]}'))
+        say("")
+        say("  Save it as {} in the current directory or in {},".format(
+            cC(DEFAULT_INVENTORY_NAME), cC(DATA_DIR)))
+        say("  or pass --inventory <path>. Run with a terminal for guided setup.")
+        return None
+
+    _intro()
+    managers = []
+    used = set()
+    while True:
+        entry = _ask_manager(len(managers) + 1, used)
+        if entry is None:
+            if managers:
+                break
+            say("  A hostname is required.")
+            continue
+        managers.append(entry)
+        used.add(entry["name"])
+        if not confirm("\n  Add another manager? [y/N]: "):
+            break
+
+    if not managers:
+        err("No managers configured.")
+        return None
+
+    default_dir = explicit_path and os.path.dirname(os.path.abspath(explicit_path))
+    if not default_dir:
+        default_dir = DATA_DIR
+    target = explicit_path or os.path.join(default_dir, DEFAULT_INVENTORY_NAME)
+    say("\n  {}".format(cB("Where should the inventory live?")))
+    say("    1. {}  {}".format(
+        os.path.join(DATA_DIR, DEFAULT_INVENTORY_NAME),
+        cD("(found from anywhere)")))
+    say("    2. {}  {}".format(
+        os.path.join(os.getcwd(), DEFAULT_INVENTORY_NAME),
+        cD("(this directory only)")))
+    choice = ask("  Choice [1]: ", default="1").strip()
+    if choice == "2":
+        target = os.path.join(os.getcwd(), DEFAULT_INVENTORY_NAME)
+    elif not explicit_path:
+        target = os.path.join(DATA_DIR, DEFAULT_INVENTORY_NAME)
+
+    if os.path.exists(target) and not confirm(
+            "  {} exists. Overwrite? [y/N]: ".format(target)):
+        say("  Cancelled -- nothing written.")
+        return None
+
+    write_inventory(target, managers)
+    ok_msg("Wrote {}".format(target))
+
+    if not keyring_available():
+        say("  {} no OS keyring here, so you'll be asked whether to".format(
+            cD("note:")))
+        say("        store credentials on disk when you enter them.")
+
+    say("\n  {}".format(cB("Connectivity check")))
+    hr()
+    results = [(m.get("name"), _test(m)) for m in managers]
+    good = [n for n, k in results if k]
+    bad = [n for n, k in results if not k]
+
+    hr()
+    if bad:
+        say("  {} {} of {} manager(s) failed: {}".format(
+            cBY("WARNING:"), len(bad), len(results), ", ".join(bad)))
+        say("  The inventory was still written -- fix the entry and re-run")
+        say("  {} to retest, or {} to re-enter credentials.".format(
+            cC("--verify"), cC("--set-credentials")))
+    else:
+        say("  {} all {} manager(s) reachable.".format(cBG("Ready:"), len(good)))
+    say("")
+    say("  Next: {}   {}".format(cC("nsx-toolkit"), cD("(interactive menu)")))
+    say("        {}   {}".format(cC("nsx-toolkit --dashboard"),
+                                 cD("(compliance posture)")))
+    say("")
+    return target
+
+
+def maybe_bootstrap(explicit_path, search_dirs=None):
+    """Called when no inventory was found. Returns a path or None."""
+    search_dirs = search_dirs or config_search_dirs()
+    if explicit_path:
+        say("  {} {}".format(cBR("Inventory not found:"), explicit_path))
+    else:
+        looked = ", ".join(os.path.join(d, DEFAULT_INVENTORY_NAME)
+                           for d in search_dirs)
+        say("  {} looked in: {}".format(cD("No inventory found."), cD(looked)))
+    return run_wizard(explicit_path)
+
+
+# ==========================================================================
+# menu.py  --  Interactive menu.
+# ==========================================================================
+
+class AppContext:
+    """Everything an action needs, assembled once in cli.main()."""
+
+    def __init__(self, sessions, audit, exporter, taxonomy,
+                 write_enabled=False, domain=DEFAULT_DOMAIN):
+        self.sessions = sessions
+        self.audit = audit
+        self.exporter = exporter
+        self.taxonomy = taxonomy
+        self.write_enabled = write_enabled
+        self.domain = domain
+
+    def lms(self):
+        return [s for s in self.sessions if s.role == ROLE_LM]
+
+    def close(self):
+        for s in self.sessions:
+            s.close()
+
+
+def menu_text(mode_str):
+    h = cBC("=" * W)
+    d = cD("-" * 42)
+    return """
+{h}
+  {groups}   {gsub}
+  {d}
+    1.  Search groups + show criteria
+    2.  Search groups + criteria + VM members
+
+  {tags}     {tsub}
+  {d}
+    3.  Show all tags on a VM
+    4.  Find all VMs carrying a specific tag
+    5.  Add / remove tags                      {audit}
+
+  {bulk}
+  {d}
+    6.  Bulk tag from CSV                      {dry}
+    7.  Reverse lookup: VM -> groups -> rules  {rl}
+    8.  Parity validation (static vs dynamic)
+    9.  Compliance dashboard
+
+  {ops}
+  {d}
+   10.  Verify connectivity + API detection
+   11.  View audit log / undo
+   12.  Toggle write mode                      [{mode}]
+   13.  Generate change ticket from CSV
+   14.  List managers
+
+    m.  Show this menu again    q.  Quit
+{h}
+""".format(h=h, d=d, mode=mode_str,
+           groups=cB("GROUPS"), gsub=cD("(Global Manager + Local Managers)"),
+           tags=cB("TAGS"), tsub=cD("(Local Managers only)"),
+           bulk=cB("BULK & ANALYSIS"), ops=cB("OPERATIONS"),
+           audit=cD("(audit logged)"), dry=cD("(dry-run first)"),
+           rl=cD("(any member type, deduped)"))
+
+
+def select_managers(sessions, allow_roles, allow_all=False, label=""):
+    pool = [s for s in sessions if s.role in allow_roles]
+    if not pool:
+        say("\n  No managers of that type are connected.")
+        return []
+    if len(pool) == 1:
+        return pool
+    say("\n  Target for {}:".format(cB(label)))
+    for i, s in enumerate(pool, 1):
+        say("    {}. {:26s}  {:30s}  {}".format(
+            i, cC(s.name), s.host, cD(ROLE_LABEL.get(s.role, "?"))))
+    if allow_all:
+        note = "  (tags span LMs)" if tuple(allow_roles) == (ROLE_LM,) else ""
+        say("    a. ALL ({}){}".format(len(pool), note))
+    say("    b. back")
+    while True:
+        c = ask("  Choice: ").lower()
+        if allow_all and c == "a":
+            return pool
+        if c.isdigit() and 1 <= int(c) <= len(pool):
+            return [pool[int(c) - 1]]
+        say("    Invalid.")
+
+
+def _mode_str(ctx):
+    return cBG("READ-WRITE") if ctx.write_enabled else cBY("READ-ONLY")
+
+
+def interactive(ctx):
+    say(menu_text(_mode_str(ctx)))
+    say("  Tip: {}".format(cD("m = menu, b = back mid-prompt, q = quit")))
+
+    while True:
+        try:
+            c = ask("\n  Choice [{}{} ".format(_mode_str(ctx), cD("]:")),
+                    allow_back=False).strip().lower()
+        except UserAbort:
+            say("\n  Bye.")
+            return 0
+
+        try:
+            if c == "q":
+                say("  Bye.")
+                return 0
+
+            elif c == "m":
+                say(menu_text(_mode_str(ctx)))
+
+            elif c == "14":
+                say("")
+                table(["Name", "Host", "Role", "Auth"],
+                      [[cC(s.name), s.host, cD(ROLE_LABEL.get(s.role, "?")),
+                        cD(s.auth_mode)] for s in ctx.sessions])
+
+            elif c in ("1", "2"):
+                tgt = select_managers(ctx.sessions, (ROLE_GM, ROLE_LM),
+                                      allow_all=True, label="group search")
+                if not tgt:
+                    continue
+                domain = ask("  Domain [{}]: ".format(ctx.domain), default=ctx.domain)
+                needle = ask("  Name/id contains (blank=all): ", default="")
+                act_groups(tgt, domain, needle, show_members=(c == "2"),
+                           exporter=ctx.exporter)
+                offer_export(ctx.exporter)
+
+            elif c == "3":
+                tgt = select_managers(ctx.sessions, (ROLE_LM,),
+                                      allow_all=True, label="VM tag lookup")
+                if not tgt:
+                    continue
+                vm = ask("  VM name contains: ")
+                if vm:
+                    act_vm_tags(tgt, vm, ctx.exporter, ctx.taxonomy)
+                    offer_export(ctx.exporter)
+
+            elif c == "4":
+                tgt = select_managers(ctx.sessions, (ROLE_LM,),
+                                      allow_all=True, label="tag search")
+                if not tgt:
+                    continue
+                scope = ask("  Tag scope (blank=any): ", default="")
+                tag = ask("  Tag value (blank=any): ", default="")
+                if not scope and not tag:
+                    say("    Give a scope, a value, or both.")
+                    continue
+                act_vms_by_tag(tgt, scope, tag, ctx.exporter)
+                offer_export(ctx.exporter)
+
+            elif c == "5":
+                tgt = select_managers(ctx.sessions, (ROLE_LM,),
+                                      allow_all=True, label="tag management")
+                if not tgt:
+                    continue
+                vm = ask("  VM name contains: ")
+                if vm:
+                    act_manage_tags(tgt, vm, ctx.audit, ctx.write_enabled,
+                                    ctx.taxonomy)
+
+            elif c == "6":
+                tgt = select_managers(ctx.sessions, (ROLE_LM,),
+                                      allow_all=True, label="bulk tagging")
+                if not tgt:
+                    continue
+                csv_path = ask("  CSV file path: ")
+                if not csv_path:
+                    continue
+                say("\n  {} first ...".format(cBY("DRY RUN")))
+                act_bulk_tag(tgt, csv_path, ctx.audit, ctx.write_enabled,
+                             dry_run=True, taxonomy=ctx.taxonomy)
+                if not ctx.write_enabled:
+                    say("  {} -- enable write mode (12) to apply.".format(
+                        cBY("READ-ONLY")))
+                    continue
+                if confirm("\n  {} [y/N]: ".format(cB("Apply for real?"))):
+                    act_bulk_tag(tgt, csv_path, ctx.audit, ctx.write_enabled,
+                                 dry_run=False, taxonomy=ctx.taxonomy)
+                else:
+                    say("  Cancelled.")
+
+            elif c == "7":
+                # Always sweeps every connected manager -- see the docstring on
+                # act_reverse_lookup for why a partial selection is wrong here.
+                domain = ask("  Domain [{}]: ".format(ctx.domain), default=ctx.domain)
+                vm = ask("  VM name contains: ")
+                if vm:
+                    act_reverse_lookup(ctx.sessions, vm, domain, ctx.exporter)
+                    offer_export(ctx.exporter)
+
+            elif c == "8":
+                static = ask("  Static group name/id: ")
+                if not static:
+                    continue
+                dynamic = ask("  Dynamic group name/id: ")
+                if not dynamic:
+                    continue
+                domain = ask("  Domain [{}]: ".format(ctx.domain), default=ctx.domain)
+                act_parity(ctx.sessions, domain, static, dynamic, ctx.exporter)
+                offer_export(ctx.exporter)
+
+            elif c == "9":
+                act_dashboard(ctx.sessions, ctx.exporter, ctx.taxonomy)
+                offer_export(ctx.exporter)
+
+            elif c == "10":
+                tgt = select_managers(ctx.sessions, (ROLE_GM, ROLE_LM),
+                                      allow_all=True, label="verification")
+                if tgt:
+                    act_verify(tgt, ctx.domain)
+
+            elif c == "11":
+                act_audit_log(ctx.audit, ctx.sessions, ctx.write_enabled,
+                              ctx.exporter)
+                offer_export(ctx.exporter)
+
+            elif c == "12":
+                ctx.write_enabled = not ctx.write_enabled
+                # --yes is a non-interactive gate; in the menu every write is
+                # already confirmed at the prompt, so never leave it latched on.
+                set_assume_yes(False)
+                say("  Write mode: {}".format(
+                    cBG("ENABLED") if ctx.write_enabled else cBY("DISABLED")))
+
+            elif c == "13":
+                csv_path = ask("  CSV file path: ")
+                if csv_path:
+                    act_change_ticket(ctx.sessions, csv_path, ctx.exporter)
+                    offer_export(ctx.exporter)
+
+            elif c == "":
+                continue
+
+            else:
+                say("  Not a valid choice. ({})".format(cD("'m' for menu")))
+
+        except UserAbort:
+            say("  (backed out)")
+            continue
+        except NsxError as e:
+            err(str(e))
+        except Exception as e:  # noqa: BLE001 - menu must survive any action
+            err("unexpected: {}".format(e))
+        # No "press Enter to continue" + full-menu reprint here on purpose:
+        # that pattern is what pushed results off-screen.
+
+
+# ==========================================================================
+# cli.py  --  Command-line entry point.
+# ==========================================================================
+
+EPILOG = """
+first run:
+  nsx-toolkit                    guided setup, then the interactive menu
+  nsx-toolkit --init             re-run guided setup at any time
+
+inventory.json  (current directory, {data_dir}, or --inventory <path>):
+  {{"managers": [
+    {{"name": "gm", "role": "gm", "host": "gm.example.com", "port": 443,
+     "verify_ssl": false, "auth": "session",
+     "username_env": "NSX_GM_USER", "password_env": "NSX_GM_PASS"}}
+  ]}}
+
+taxonomy (optional; built-in default is used when absent):
+  taxonomy.json next to inventory.json, or --taxonomy <path>.
+  See examples/taxonomy.example.json.
+
+credentials:
+  Resolved from the environment, then the OS keyring, then a local file.
+  Prompted once and stored (keyring where available; on disk only if you
+  say yes). To change them:  nsx-toolkit --set-credentials
+
+bulk tagging CSV:  vm_name,scope,tag,action     (action = add | remove)
+
+examples:
+  nsx-toolkit --verify
+  nsx-toolkit --manager gm --groups --contains web-prod
+  nsx-toolkit --all-lm --vms-by-tag --scope env --tag prod
+  nsx-toolkit --dashboard --json
+  nsx-toolkit --bulk-tag changes.csv --dry-run
+  nsx-toolkit --bulk-tag changes.csv --enable-writes --yes
+  nsx-toolkit --all-lm --vm-tags cuc --out-csv results.csv
+""".format(data_dir=DATA_DIR)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="nsx-toolkit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="{} v{} -- {}\n\nRun with no arguments for the "
+                    "interactive menu.".format(TOOL_NAME, VERSION, TOOL_TAGLINE),
+        epilog=EPILOG)
+    p.add_argument("--version", action="version",
+                   version="{} v{} ({})".format(TOOL_NAME, VERSION, VERSION_DATE))
+
+    g = p.add_argument_group("configuration")
+    g.add_argument("--init", action="store_true",
+                   help="Run guided setup and exit.")
+    g.add_argument("--inventory", default=None, metavar="PATH")
+    g.add_argument("--taxonomy", default=None, metavar="PATH",
+                   help="Tag taxonomy file (JSON, or YAML with PyYAML).")
+    g.add_argument("--manager", default=None, metavar="NAME")
+    g.add_argument("--all-lm", action="store_true",
+                   help="Target every Local Manager.")
+    g.add_argument("--domain", default=DEFAULT_DOMAIN)
+    g.add_argument("--ca-bundle", default=None, metavar="PATH",
+                   help="CA bundle for TLS verification on all managers.")
+    g.add_argument("--set-credentials", action="store_true",
+                   help="Prompt for and overwrite stored credentials, then exit.")
+    g.add_argument("--store", choices=("auto", "keyring", "plaintext", "none"),
+                   default="auto",
+                   help="Where prompted credentials are saved (default: auto).")
+
+    a = p.add_argument_group("actions")
+    a.add_argument("--groups", action="store_true")
+    a.add_argument("--members", action="store_true",
+                   help="With --groups, also list VM members.")
+    a.add_argument("--contains", default=None, metavar="TEXT")
+    a.add_argument("--vm-tags", metavar="VM", default=None)
+    a.add_argument("--vms-by-tag", action="store_true")
+    a.add_argument("--scope", default=None)
+    a.add_argument("--tag", default=None)
+    a.add_argument("--verify", action="store_true")
+    a.add_argument("--dashboard", action="store_true",
+                   help="Taxonomy compliance posture.")
+    a.add_argument("--parity", nargs=2, metavar=("STATIC", "DYNAMIC"))
+    a.add_argument("--reverse-lookup", metavar="VM", default=None,
+                   help="VM -> groups -> DFW rules impact analysis. Group "
+                        "match is member-type agnostic; rules are scanned on "
+                        "GM + all LMs and deduped by rule path.")
+    a.add_argument("--bulk-tag", metavar="CSV", default=None)
+    a.add_argument("--change-ticket", metavar="CSV", default=None)
+    a.add_argument("--audit-log", action="store_true",
+                   help="Show recent audited writes.")
+    a.add_argument("--list-managers", action="store_true")
+
+    w = p.add_argument_group("writes")
+    w.add_argument("--dry-run", action="store_true",
+                   help="Preview only. Default for --bulk-tag.")
+    w.add_argument("--enable-writes", action="store_true")
+    w.add_argument("--yes", "-y", action="store_true",
+                   help="Skip confirmation prompts. Required to write "
+                        "non-interactively.")
+    w.add_argument("--force", action="store_true",
+                   help="Apply even if a VM's tags changed since the plan "
+                        "was computed.")
+
+    o = p.add_argument_group("output")
+    o.add_argument("--out-csv", metavar="PATH", default=None)
+    o.add_argument("--out-json", metavar="PATH", default=None)
+    o.add_argument("--json", action="store_true",
+                   help="Structured JSON on stdout. Implies non-interactive.")
+    o.add_argument("--no-color", action="store_true")
+    o.add_argument("--non-interactive", action="store_true",
+                   help="Never prompt; use defaults and fail rather than ask.")
+    o.add_argument("--debug", action="store_true",
+                   help="Log HTTP method, URL, status and timing to stderr.")
+    return p
+
+
+def banner(inv_path, mgr_count, audit_path, taxonomy, write_enabled):
+    say(cBC("=" * W))
+    say("  {} v{}    ({})".format(cB(TOOL_NAME), VERSION, VERSION_DATE))
+    say("  {}".format(cC(TOOL_TAGLINE)))
+    say(cD("-" * W))
+    say("  Inventory  : {}  ({} manager(s))".format(cC(inv_path), mgr_count))
+    say("  Taxonomy   : {}".format(taxonomy.source))
+    say("  Audit log  : {}".format(audit_path))
+    say("  Exports    : {}".format(DEFAULT_EXPORT_DIR))
+    mode = (cBG("READ-WRITE") if write_enabled
+            else cBY("READ-ONLY") + " (--enable-writes)")
+    say("  Mode       : {}".format(mode))
+    say("  Transport  : {}".format("requests" if have_requests() else "stdlib urllib"))
+    say("  Platform   : {} / Python {}".format(
+        platform.node(), platform.python_version()))
+    say(cBC("=" * W))
+
+
+def connect_all(managers, only=None, ca_bundle=None):
+    say("\n  {} ...".format(cB("Authenticating")))
+    sessions, failed = [], []
+    transport = make_transport()
+    for m in managers:
+        name = m.get("name", "?")
+        if only and name not in only:
+            continue
+        if ca_bundle:
+            m = dict(m)
+            m["ca_bundle"] = ca_bundle
+            m["verify_ssl"] = True
+        try:
+            user, pwd, src = credentials_for(m, allow_prompt=True)
+            sessions.append(Nsx(m, user, pwd, transport=transport))
+            say("    {:26s}  credentials {}".format(cC(name), cG(src)))
+        except UserAbort:
+            raise
+        except NsxError as e:
+            failed.append(name)
+            err(str(e))
+    if failed:
+        say("    ({} unavailable: {})".format(cBR(str(len(failed))),
+                                              ", ".join(failed)))
+    return sessions
+
+
+def _write_gate(what):
+    """A write from the CLI needs --yes, or an interactive confirmation."""
+    if assume_yes():
+        return True
+    if not is_interactive():
+        err("Refusing to {} without confirmation. Re-run with --yes "
+            "(or --dry-run to preview).".format(what))
+        return False
+    return confirm("  {} [y/N]: ".format(cB("Apply {} for real?".format(what))))
+
+
+def _emit_json(exporter, errors, rc):
+    payload = {"tool": TOOL_NAME, "version": VERSION,
+               "timestamp": utc_now_iso(), "exit_code": rc,
+               "results": exporter.json_payload()}
+    if errors:
+        payload["errors"] = errors
+    json.dump(payload, sys.stdout, indent=2, ensure_ascii=False)
+    print()
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if args.no_color:
+        set_color(False)
+    if args.json:
+        set_json_mode(True)
+    if args.non_interactive:
+        set_interactive(False)
+    if args.yes:
+        set_assume_yes(True)
+    if args.debug:
+        set_debug(True)
+    set_store_policy(args.store)
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    # --- inventory -------------------------------------------------------
+    inv_path = find_inventory(args.inventory, config_search_dirs())
+    if args.init:
+        return 0 if run_wizard(args.inventory or inv_path) else 1
+    if not inv_path:
+        inv_path = maybe_bootstrap(args.inventory, config_search_dirs())
+        if not inv_path:
+            return 2
+    try:
+        managers = load_inventory(inv_path)
+    except ConfigError as e:
+        err(str(e))
+        return 2
+
+    # --- taxonomy --------------------------------------------------------
+    try:
+        taxonomy = load_taxonomy(
+            args.taxonomy,
+            search_dirs=[os.path.dirname(os.path.abspath(inv_path))]
+            + config_search_dirs(),
+            names=DEFAULT_TAXONOMY_NAMES + ("taxonomy.json",))
+    except ConfigError as e:
+        err(str(e))
+        return 2
+
+    # --- manager selection ----------------------------------------------
+    only = None
+    if args.manager:
+        only = {args.manager}
+        if not any(m.get("name") == args.manager for m in managers):
+            err("'{}' is not in {}. Known: {}".format(
+                args.manager, inv_path,
+                ", ".join(m.get("name", "?") for m in managers)))
+            return 2
+    elif args.all_lm:
+        only = {m.get("name") for m in managers if m.get("role") == ROLE_LM}
+        if not only:
+            err('No managers with "role": "lm" in {}.'.format(inv_path))
+            return 2
+
+    if args.set_credentials:
+        return force_set_credentials(managers, only=only)
+
+    audit = AuditLog()
+    exporter = Exporter()
+    write_enabled = args.enable_writes
+
+    wants_cli = any([args.groups, args.vm_tags, args.vms_by_tag, args.verify,
+                     args.bulk_tag, args.dashboard, args.parity,
+                     args.change_ticket, args.reverse_lookup, args.audit_log,
+                     args.list_managers])
+
+    banner(inv_path, len(managers), audit.path, taxonomy, write_enabled)
+
+    try:
+        sessions = connect_all(managers, only=only, ca_bundle=args.ca_bundle)
+    except UserAbort:
+        err("Credentials required.")
+        return 2
+    if not sessions:
+        err("No manager could be authenticated.")
+        return 2
+
+    ctx = AppContext(sessions, audit, exporter, taxonomy,
+                     write_enabled=write_enabled, domain=args.domain)
+
+    if not wants_cli:
+        try:
+            return interactive(ctx)
+        except (KeyboardInterrupt, EOFError, UserAbort):
+            say("\n  Bye.")
+            return 0
+        finally:
+            ctx.close()
+
+    errors = []
+    rc = 0
+    try:
+        if args.list_managers:
+            section("Managers")
+            table(["Name", "Host", "Role", "Auth", "Verify"],
+                  [[s.name, s.host, s.role, s.auth_mode, str(s.verify)]
+                   for s in sessions])
+
+        if args.verify and not act_verify(sessions, args.domain):
+            rc = 1
+
+        if args.groups:
+            act_groups(sessions, args.domain, args.contains,
+                       show_members=args.members, exporter=exporter)
+
+        lms = ctx.lms()
+
+        if args.vm_tags:
+            if not lms:
+                err("--vm-tags needs a Local Manager.")
+                return 2
+            act_vm_tags(lms, args.vm_tags, exporter, taxonomy)
+
+        if args.vms_by_tag:
+            if not lms:
+                err("--vms-by-tag needs a Local Manager.")
+                return 2
+            if not args.scope and not args.tag:
+                err("--vms-by-tag needs --scope and/or --tag.")
+                return 2
+            act_vms_by_tag(lms, args.scope, args.tag, exporter)
+
+        if args.dashboard:
+            act_dashboard(sessions, exporter, taxonomy)
+
+        if args.parity:
+            act_parity(sessions, args.domain, args.parity[0], args.parity[1],
+                       exporter)
+
+        if args.reverse_lookup:
+            # Always the full session set -- GM + every LM. See the docstring
+            # on act_reverse_lookup.
+            act_reverse_lookup(sessions, args.reverse_lookup, args.domain,
+                               exporter)
+
+        if args.change_ticket:
+            act_change_ticket(sessions, args.change_ticket, exporter)
+
+        if args.audit_log:
+            act_audit_log(audit, sessions, write_enabled, exporter)
+
+        if args.bulk_tag:
+            if not lms:
+                err("--bulk-tag needs a Local Manager.")
+                return 2
+            # Dry run always happens first, then the real apply is gated.
+            act_bulk_tag(lms, args.bulk_tag, audit, write_enabled,
+                         dry_run=True, taxonomy=taxonomy)
+            if not args.dry_run:
+                if not write_enabled:
+                    say("\n  {} -- add --enable-writes to apply.".format(
+                        cBY("READ-ONLY")))
+                elif _write_gate("bulk tagging"):
+                    result = act_bulk_tag(lms, args.bulk_tag, audit,
+                                          write_enabled, dry_run=False,
+                                          taxonomy=taxonomy, force=args.force)
+                    if result["failed"]:
+                        rc = 1
+                else:
+                    say("  Cancelled -- nothing written.")
+
+        if args.out_csv and exporter.has_staged():
+            for path in exporter.to_csv(args.out_csv):
+                say("  Exported: {}".format(path))
+        if args.out_json and exporter.has_staged():
+            for path in exporter.to_json(args.out_json):
+                say("  Exported: {}".format(path))
+
+        if args.json:
+            _emit_json(exporter, errors, rc)
+        return rc
+
+    except UserAbort:
+        say("\n  Cancelled.")
+        return 130
+    except NsxError as e:
+        errors.append(str(e))
+        err(str(e))
+        if args.json:
+            _emit_json(exporter, errors, 1)
+        return 1
+    except KeyboardInterrupt:
+        say("\n  Cancelled.")
+        return 130
+    finally:
+        ctx.close()
+
+
+def entry():
+    sys.exit(main())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
