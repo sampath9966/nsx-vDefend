@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local operator state -- never belongs in the repo
+inventory.json
+taxonomy.json
+credentials.env
+*.log

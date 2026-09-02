@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsx-toolkit"
+version = "3.0.0"
+description = "NSX Zero Trust Segmentation Toolkit -- groups, tags and DFW analysis across GM and LMs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Systems Administration",
+]
+
+# Deliberately empty. The toolkit falls back to a stdlib urllib transport so it
+# runs on a jumpbox with no package access at all; 'requests' is used when it
+# happens to be present.
+dependencies = []
+
+[project.optional-dependencies]
+http = ["requests>=2.20"]
+keyring = ["keyring>=23"]
+yaml = ["pyyaml>=5"]
+dev = ["pytest>=7", "ruff>=0.5", "requests>=2.20"]
+
+[project.scripts]
+nsx-toolkit = "nsx_toolkit.cli:entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 90
+target-version = "py39"
+extend-exclude = ["nsx-toolkit.py"]  # generated; checked by --check instead
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4"]
+ignore = [
+    "UP032",  # .format() is used throughout for 3.9 compatibility and clarity
+    "UP008",
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
