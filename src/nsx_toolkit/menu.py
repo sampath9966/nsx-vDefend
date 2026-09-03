@@ -39,13 +39,16 @@ class AppContext:
     """Everything an action needs, assembled once in cli.main()."""
 
     def __init__(self, sessions, audit, exporter, taxonomy,
-                 write_enabled=False, domain=DEFAULT_DOMAIN):
+                 write_enabled=False, domain=DEFAULT_DOMAIN, managers=None):
         self.sessions = sessions
         self.audit = audit
         self.exporter = exporter
         self.taxonomy = taxonomy
         self.write_enabled = write_enabled
         self.domain = domain
+        # Inventory entries, for commands that act on configuration rather
+        # than on a live connection (login).
+        self.managers = managers or []
 
     def lms(self):
         return [s for s in self.sessions if s.role == ROLE_LM]

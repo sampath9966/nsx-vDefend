@@ -62,7 +62,7 @@ def test_verify_reaches_gm_and_both_lms(deployment):
         deployment[key].state.add_group("lg1")
         deployment[key].state.add_policy("lpol")
         deployment[key].state.add_vm("web1")
-    out = run(deployment, "--verify").stdout
+    out = run(deployment, "status").stdout
     for name in ("gm", "lm-london", "lm-frankfurt"):
         assert name in out
     assert "Failures detected" not in out
@@ -71,7 +71,7 @@ def test_verify_reaches_gm_and_both_lms(deployment):
 def test_dashboard_json_aggregates_across_both_lms(deployment):
     deployment["lm1"].state.add_vm("lon-web1", tags=[("env", "prod")])
     deployment["lm2"].state.add_vm("fra-web1", tags=[("env", "prod")])
-    payload = json.loads(run(deployment, "--dashboard", "--json").stdout)
+    payload = json.loads(run(deployment, "compliance", "--json").stdout)
     records = next(r for r in payload["results"]
                    if r["label"] == "dashboard")["records"]
     assert {r["vm_name"] for r in records} == {"lon-web1", "fra-web1"}
@@ -89,12 +89,12 @@ def test_full_bulk_workflow_dry_run_then_apply(deployment):
         "web-prod-01,env,dev,remove\n"
         "db-prod-01,tier,db,add\n", encoding="utf-8")
 
-    preview = run(deployment, "--bulk-tag", str(csv_path), "--dry-run").stdout
+    preview = run(deployment, "tag", "apply", str(csv_path), "--dry-run").stdout
     assert "DRY RUN" in preview
     assert "+ env=prod" in preview
     assert lm.state.vms[0]["tags"] == [{"scope": "env", "tag": "dev"}]
 
-    run(deployment, "--bulk-tag", str(csv_path), "--enable-writes", "--yes")
+    run(deployment, "tag", "apply", str(csv_path), "--enable-writes", "--yes")
     tags = {v["display_name"]: {t["tag"] for t in v["tags"]} for v in lm.state.vms}
     assert tags["web-prod-01"] == {"prod"}
     assert tags["db-prod-01"] == {"db"}
@@ -116,21 +116,11 @@ def test_reverse_lookup_dedupes_a_gm_rule_across_two_lms(deployment):
     vm = deployment["lm1"].state.add_vm("web1")
     deployment["lm1"].state.associate(vm, deployment["lm1"].state.groups[0])
 
-    payload = json.loads(run(deployment, "--reverse-lookup", "web1",
-                             "--json").stdout)
+    payload = json.loads(run(deployment, "impact", "web1", "--json").stdout)
     rows = next(r for r in payload["results"]
                 if r["label"] == "reverse_lookup")
     assert rows["count"] == 1, "a GM rule must not be reported once per LM"
     assert rows["records"][0]["manager"] == "gm"
-
-
-def test_two_actions_write_two_export_files(deployment):
-    deployment["lm1"].state.add_vm("web1", tags=[("env", "prod")])
-    deployment["lm1"].state.add_group("g1", "Group One")
-    target = deployment["tmp"] / "report.csv"
-    run(deployment, "--groups", "--dashboard", "--out-csv", str(target))
-    produced = sorted(p.name for p in deployment["tmp"].glob("report_*.csv"))
-    assert produced == ["report_dashboard.csv", "report_groups.csv"]
 
 
 def test_write_without_yes_is_refused(deployment):
@@ -139,14 +129,14 @@ def test_write_without_yes_is_refused(deployment):
     csv_path = deployment["tmp"] / "c.csv"
     csv_path.write_text("vm_name,scope,tag,action\nweb1,env,prod,add\n",
                         encoding="utf-8")
-    result = run(deployment, "--bulk-tag", str(csv_path), "--enable-writes")
+    result = run(deployment, "tag", "apply", str(csv_path), "--enable-writes")
     assert "Refusing to" in result.stderr
     assert lm.state.vms[0]["tags"] == [{"scope": "env", "tag": "dev"}]
 
 
 def test_debug_traces_requests_to_stderr_only(deployment):
     deployment["lm1"].state.add_vm("web1")
-    result = run(deployment, "--dashboard", "--json", "--debug")
+    result = run(deployment, "compliance", "--json", "--debug")
     json.loads(result.stdout)      # stdout stays a clean envelope
     assert "GET http://" in result.stderr
     assert "/api/v1/fabric/virtual-machines" in result.stderr
@@ -156,7 +146,7 @@ def test_retry_recovers_from_a_transient_failure(deployment):
     deployment["lm1"].state.add_vm("web1", tags=[("env", "prod")])
     deployment["lm2"].state.add_vm("web2", tags=[("env", "prod")])
     deployment["lm1"].state.fail_next("/api/v1/fabric/virtual-machines", times=2)
-    payload = json.loads(run(deployment, "--dashboard", "--json").stdout)
+    payload = json.loads(run(deployment, "compliance", "--json").stdout)
     records = next(r for r in payload["results"]
                    if r["label"] == "dashboard")["records"]
     assert len(records) == 2
@@ -192,23 +182,22 @@ def test_everything_works_with_no_third_party_packages(deployment, no_requests):
     lm.state.add_policy("pol1")
     lm.state.add_rule("pol1", "r1", source_groups=[group["path"]])
 
-    assert "stdlib urllib" in run(deployment, "--verify").stdout
+    assert "transport=urllib" in run(deployment, "status").stdout
 
-    payload = json.loads(run(deployment, "--dashboard", "--json").stdout)
+    payload = json.loads(run(deployment, "compliance", "--json").stdout)
     statuses = {r["vm_name"]: r["status"] for r in
                 next(x for x in payload["results"]
                      if x["label"] == "dashboard")["records"]}
     assert statuses == {"web1": "partial", "db1": "untagged"}
 
-    reverse = json.loads(run(deployment, "--reverse-lookup", "web1",
-                             "--json").stdout)
+    reverse = json.loads(run(deployment, "impact", "web1", "--json").stdout)
     assert next(x for x in reverse["results"]
                 if x["label"] == "reverse_lookup")["count"] == 1
 
     csv_path = deployment["tmp"] / "c.csv"
     csv_path.write_text("vm_name,scope,tag,action\ndb1,tier,db,add\n",
                         encoding="utf-8")
-    run(deployment, "--bulk-tag", str(csv_path), "--enable-writes", "--yes")
+    run(deployment, "tag", "apply", str(csv_path), "--enable-writes", "--yes")
     tags = {v["display_name"]: [t["tag"] for t in v["tags"]] for v in lm.state.vms}
     assert tags["db1"] == ["db"]
 
@@ -218,7 +207,7 @@ def test_change_plan_is_written_to_the_change_plans_directory(deployment):
     csv_path = deployment["tmp"] / "c.csv"
     csv_path.write_text("vm_name,scope,tag,action\nweb1,env,prod,add\n",
                         encoding="utf-8")
-    run(deployment, "--change-ticket", str(csv_path))
+    run(deployment, "tag", "ticket", str(csv_path))
     plans = list((deployment["tmp"] / "nsxtoolkit" / "change_plans").glob("*.txt"))
     assert len(plans) == 1
     body = plans[0].read_text(encoding="utf-8")
@@ -230,7 +219,7 @@ def test_change_plan_is_written_to_the_change_plans_directory(deployment):
 
 
 def test_list_managers_and_audit_log_run_cleanly(deployment):
-    out = run(deployment, "--list-managers").stdout
+    out = run(deployment, "managers").stdout
     for name in ("gm", "lm-london", "lm-frankfurt"):
         assert name in out
-    assert run(deployment, "--audit-log").returncode == 0
+    assert run(deployment, "audit", "list").returncode == 0

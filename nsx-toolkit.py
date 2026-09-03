@@ -48,8 +48,8 @@ import urllib.request
 # version.py  --  Tool identity. Single source of truth for name and version strings.
 # ==========================================================================
 
-VERSION = "3.0.0"
-VERSION_DATE = "2026-09-02"
+VERSION = "4.0.0"
+VERSION_DATE = "2026-09-03"
 TOOL_NAME = "NSX Toolkit"
 TOOL_TAGLINE = "Zero Trust Segmentation · Groups, Tags & DFW"
 
@@ -3118,13 +3118,16 @@ class AppContext:
     """Everything an action needs, assembled once in cli.main()."""
 
     def __init__(self, sessions, audit, exporter, taxonomy,
-                 write_enabled=False, domain=DEFAULT_DOMAIN):
+                 write_enabled=False, domain=DEFAULT_DOMAIN, managers=None):
         self.sessions = sessions
         self.audit = audit
         self.exporter = exporter
         self.taxonomy = taxonomy
         self.write_enabled = write_enabled
         self.domain = domain
+        # Inventory entries, for commands that act on configuration rather
+        # than on a live connection (login).
+        self.managers = managers or []
 
     def lms(self):
         return [s for s in self.sessions if s.role == ROLE_LM]
@@ -3361,116 +3364,998 @@ def interactive(ctx):
 
 
 # ==========================================================================
-# cli.py  --  Command-line entry point.
+# commands/__init__.py  --  The `nsxctl <noun> <verb>` command tree.
 # ==========================================================================
 
+PROG = "nsxctl"
+
+# Defaults live here rather than on the arguments, because the arguments use
+# SUPPRESS so that "not given" is distinguishable from "given the default".
+GLOBAL_DEFAULTS = {
+    "inventory": None,
+    "taxonomy": None,
+    "manager": None,
+    "all_lm": False,
+    "domain": DEFAULT_DOMAIN,
+    "ca_bundle": None,
+    "store": "auto",
+    "json": False,
+    "no_color": False,
+    "non_interactive": False,
+    "debug": False,
+    "yes": False,
+    "enable_writes": False,
+    "force": False,
+    "out_csv": None,
+    "out_json": None,
+    "out_html": None,
+}
+
 EPILOG = """
-first run:
-  nsx-toolkit                    guided setup, then the interactive menu
-  nsx-toolkit --init             re-run guided setup at any time
+getting started:
+  nsxctl init                       guided setup: managers, credentials, a check
+  nsxctl status                     can I reach and authenticate everywhere?
+  nsxctl                            interactive menu
 
-inventory.json  (current directory, {data_dir}, or --inventory <path>):
-  {{"managers": [
-    {{"name": "gm", "role": "gm", "host": "gm.example.com", "port": 443,
-     "verify_ssl": false, "auth": "session",
-     "username_env": "NSX_GM_USER", "password_env": "NSX_GM_PASS"}}
-  ]}}
+everyday:
+  nsxctl compliance                 tagging posture across every Local Manager
+  nsxctl tag find --scope env --tag prod
+  nsxctl impact web-prod-01         what breaks if I retag this VM
+  nsxctl group list --contains web
+  nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
 
-taxonomy (optional; built-in default is used when absent):
-  taxonomy.json next to inventory.json, or --taxonomy <path>.
-  See examples/taxonomy.example.json.
+Run `nsxctl <command> --help` for a command's options and examples.
+"""
 
-credentials:
-  Resolved from the environment, then the OS keyring, then a local file.
-  Prompted once and stored (keyring where available; on disk only if you
-  say yes). To change them:  nsx-toolkit --set-credentials
 
-bulk tagging CSV:  vm_name,scope,tag,action     (action = add | remove)
+def add_global_args(parser):
+    """Flags accepted before or after the subcommand."""
+    cfg = parser.add_argument_group("configuration")
+    cfg.add_argument("--inventory", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Inventory file (default: ./inventory.json, then "
+                          "~/.nsx_toolkit/inventory.json).")
+    cfg.add_argument("--taxonomy", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Tag taxonomy file (JSON, or YAML with PyYAML).")
+    cfg.add_argument("--manager", metavar="NAME", default=argparse.SUPPRESS,
+                     help="Target one manager by name.")
+    cfg.add_argument("--all-lm", action="store_true", default=argparse.SUPPRESS,
+                     help="Target every Local Manager.")
+    cfg.add_argument("--domain", metavar="NAME", default=argparse.SUPPRESS,
+                     help="NSX domain (default: {}).".format(DEFAULT_DOMAIN))
+    cfg.add_argument("--ca-bundle", metavar="PATH", default=argparse.SUPPRESS,
+                     help="CA bundle for TLS verification on all managers.")
+    cfg.add_argument("--store", choices=("auto", "keyring", "plaintext", "none"),
+                     default=argparse.SUPPRESS,
+                     help="Where prompted credentials are saved.")
 
-examples:
-  nsx-toolkit --verify
-  nsx-toolkit --manager gm --groups --contains web-prod
-  nsx-toolkit --all-lm --vms-by-tag --scope env --tag prod
-  nsx-toolkit --dashboard --json
-  nsx-toolkit --bulk-tag changes.csv --dry-run
-  nsx-toolkit --bulk-tag changes.csv --enable-writes --yes
-  nsx-toolkit --all-lm --vm-tags cuc --out-csv results.csv
-""".format(data_dir=DATA_DIR)
+    wr = parser.add_argument_group("writes")
+    wr.add_argument("--enable-writes", action="store_true",
+                    default=argparse.SUPPRESS,
+                    help="Permit changes. Without it everything is read-only.")
+    wr.add_argument("--yes", "-y", action="store_true", default=argparse.SUPPRESS,
+                    help="Skip confirmation prompts. Required to write "
+                         "non-interactively.")
+    wr.add_argument("--force", action="store_true", default=argparse.SUPPRESS,
+                    help="Apply even if state changed since the plan was built.")
+
+    out = parser.add_argument_group("output")
+    out.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                     help="Structured JSON on stdout. Implies "
+                          "--non-interactive.")
+    out.add_argument("--out-csv", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write results to CSV.")
+    out.add_argument("--out-json", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write results to JSON.")
+    out.add_argument("--out-html", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write a shareable HTML report where supported.")
+    out.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS,
+                     help="Disable colored output.")
+    out.add_argument("--non-interactive", action="store_true",
+                     default=argparse.SUPPRESS,
+                     help="Never prompt; fail rather than ask.")
+    out.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
+                     help="Log HTTP method, URL, status and timing to stderr.")
+    return parser
+
+
+def apply_global_defaults(args):
+    """Fill in globals neither the top level nor the subcommand supplied."""
+    for key, value in GLOBAL_DEFAULTS.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+    return args
 
 
 def build_parser():
-    p = argparse.ArgumentParser(
-        prog="nsx-toolkit",
+    pass
+    pass
+    pass
+    pass
+    pass
+    pass
+
+    global_parent = argparse.ArgumentParser(add_help=False)
+    add_global_args(global_parent)
+
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        parents=[global_parent],
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="{} v{} -- {}\n\nRun with no arguments for the "
-                    "interactive menu.".format(TOOL_NAME, VERSION, TOOL_TAGLINE),
+        description="{} v{} -- {}".format(TOOL_NAME, VERSION, TOOL_TAGLINE),
         epilog=EPILOG)
-    p.add_argument("--version", action="version",
-                   version="{} v{} ({})".format(TOOL_NAME, VERSION, VERSION_DATE))
+    parser.add_argument(
+        "--version", action="version",
+        version="{} v{} ({})".format(TOOL_NAME, VERSION, VERSION_DATE))
 
-    g = p.add_argument_group("configuration")
-    g.add_argument("--init", action="store_true",
-                   help="Run guided setup and exit.")
-    g.add_argument("--inventory", default=None, metavar="PATH")
-    g.add_argument("--taxonomy", default=None, metavar="PATH",
-                   help="Tag taxonomy file (JSON, or YAML with PyYAML).")
-    g.add_argument("--manager", default=None, metavar="NAME")
-    g.add_argument("--all-lm", action="store_true",
-                   help="Target every Local Manager.")
-    g.add_argument("--domain", default=DEFAULT_DOMAIN)
-    g.add_argument("--ca-bundle", default=None, metavar="PATH",
-                   help="CA bundle for TLS verification on all managers.")
-    g.add_argument("--set-credentials", action="store_true",
-                   help="Prompt for and overwrite stored credentials, then exit.")
-    g.add_argument("--store", choices=("auto", "keyring", "plaintext", "none"),
-                   default="auto",
-                   help="Where prompted credentials are saved (default: auto).")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    parents = [global_parent]
+    for register in (register_setup, register_group, register_tag,
+                     register_rule, register_analysis, register_shell):
+        register(sub, parents)
+    return parser
 
-    a = p.add_argument_group("actions")
-    a.add_argument("--groups", action="store_true")
-    a.add_argument("--members", action="store_true",
-                   help="With --groups, also list VM members.")
-    a.add_argument("--contains", default=None, metavar="TEXT")
-    a.add_argument("--vm-tags", metavar="VM", default=None)
-    a.add_argument("--vms-by-tag", action="store_true")
-    a.add_argument("--scope", default=None)
-    a.add_argument("--tag", default=None)
-    a.add_argument("--verify", action="store_true")
-    a.add_argument("--dashboard", action="store_true",
-                   help="Taxonomy compliance posture.")
-    a.add_argument("--parity", nargs=2, metavar=("STATIC", "DYNAMIC"))
-    a.add_argument("--reverse-lookup", metavar="VM", default=None,
-                   help="VM -> groups -> DFW rules impact analysis. Group "
-                        "match is member-type agnostic; rules are scanned on "
-                        "GM + all LMs and deduped by rule path.")
-    a.add_argument("--bulk-tag", metavar="CSV", default=None)
-    a.add_argument("--change-ticket", metavar="CSV", default=None)
-    a.add_argument("--audit-log", action="store_true",
-                   help="Show recent audited writes.")
-    a.add_argument("--list-managers", action="store_true")
 
-    w = p.add_argument_group("writes")
-    w.add_argument("--dry-run", action="store_true",
-                   help="Preview only. Default for --bulk-tag.")
-    w.add_argument("--enable-writes", action="store_true")
-    w.add_argument("--yes", "-y", action="store_true",
-                   help="Skip confirmation prompts. Required to write "
-                        "non-interactively.")
-    w.add_argument("--force", action="store_true",
-                   help="Apply even if a VM's tags changed since the plan "
-                        "was computed.")
+def add_command(sub, parents, name, help_text, description=None, epilog=None):
+    """Consistent subparser construction, so every command's help looks alike."""
+    return sub.add_parser(
+        name, parents=parents, help=help_text,
+        description=description or help_text,
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
 
-    o = p.add_argument_group("output")
-    o.add_argument("--out-csv", metavar="PATH", default=None)
-    o.add_argument("--out-json", metavar="PATH", default=None)
-    o.add_argument("--json", action="store_true",
-                   help="Structured JSON on stdout. Implies non-interactive.")
-    o.add_argument("--no-color", action="store_true")
-    o.add_argument("--non-interactive", action="store_true",
-                   help="Never prompt; use defaults and fail rather than ask.")
-    o.add_argument("--debug", action="store_true",
-                   help="Log HTTP method, URL, status and timing to stderr.")
+
+# ==========================================================================
+# commands/setup.py  --  Setup and introspection: init, status, managers, login, config.
+# ==========================================================================
+
+def register_setup(sub, parents):
+    p = add_command(
+        sub, parents, "init", "Guided first-run setup.",
+        epilog="Asks for each NSX manager, stores credentials, and proves\n"
+               "every one is reachable before finishing.")
+    p.set_defaults(func=cmd_init, needs_inventory=False, needs_sessions=False)
+
+    p = add_command(
+        sub, parents, "status",
+        "Check every manager is reachable and authenticated.",
+        epilog="examples:\n"
+               "  nsxctl status\n"
+               "  nsxctl status --manager gm --debug")
+    p.set_defaults(func=cmd_status)
+
+    p = add_command(sub, parents, "managers", "List the configured managers.")
+    p.set_defaults(func=cmd_managers)
+
+    p = add_command(
+        sub, parents, "login", "Store or replace credentials for a manager.",
+        epilog="examples:\n"
+               "  nsxctl login              all managers\n"
+               "  nsxctl login lm-london    just that one")
+    p.add_argument("name", nargs="?", help="Manager name (default: all).")
+    p.set_defaults(func=cmd_login, needs_sessions=False)
+
+    p = add_command(
+        sub, parents, "config", "Show or check the configuration in effect.")
+    csub = p.add_subparsers(dest="config_action", metavar="<action>")
+    c = csub.add_parser("show", parents=parents,
+                        help="Configuration currently in effect.")
+    c.set_defaults(func=cmd_config_show)
+    c = csub.add_parser("path", parents=parents,
+                        help="Where every file lives.")
+    c.set_defaults(func=cmd_config_path)
+    c = csub.add_parser("validate", parents=parents,
+                        help="Validate inventory and taxonomy; non-zero on error.")
+    c.set_defaults(func=cmd_config_validate)
+    p.set_defaults(func=cmd_config_show, config_action="show")
+    for c in csub.choices.values():
+        c.set_defaults(needs_inventory=False, needs_sessions=False)
+    p.set_defaults(needs_inventory=False, needs_sessions=False)
+
+
+def cmd_init(args, ctx):
+    return 0 if run_wizard(args.inventory) else 1
+
+
+def cmd_status(args, ctx):
+    return 0 if act_verify(ctx.sessions, args.domain) else 1
+
+
+def cmd_managers(args, ctx):
+    section("Managers")
+    table(["Name", "Host", "Role", "Auth", "Verify TLS"],
+          [[cC(s.name), s.host, ROLE_LABEL.get(s.role, "?"), s.auth_mode,
+            str(s.verify)] for s in ctx.sessions])
+    return 0
+
+
+def cmd_login(args, ctx):
+    only = {args.name} if args.name else None
+    if only and not any(m.get("name") in only for m in ctx.managers):
+        err("'{}' is not in the inventory. Known: {}".format(
+            args.name, ", ".join(m.get("name", "?") for m in ctx.managers)))
+        return 2
+    return force_set_credentials(ctx.managers, only=only)
+
+
+def _resolve(args):
+    inv = find_inventory(args.inventory, config_search_dirs())
+    tax = load_taxonomy(
+        args.taxonomy,
+        search_dirs=([os.path.dirname(os.path.abspath(inv))] if inv else [])
+        + config_search_dirs(),
+        names=("taxonomy.json", "taxonomy.yaml", "taxonomy.yml"))
+    return inv, tax
+
+
+def cmd_config_path(args, ctx):
+    inv, tax = _resolve(args)
+    section("Paths")
+    rows = [
+        ["inventory", inv or cD("(none found)")],
+        ["taxonomy", tax.source],
+        ["credentials", creds_file_path()],
+        ["audit log", DEFAULT_AUDIT_FILE],
+        ["exports", DEFAULT_EXPORT_DIR],
+        ["change plans", DEFAULT_TICKET_DIR],
+        ["snapshots", DEFAULT_SNAPSHOT_DIR],
+        ["data dir", DATA_DIR],
+    ]
+    table(["What", "Where"], rows)
+    say("")
+    say("  Searched for inventory.json in: {}".format(
+        cD(", ".join(config_search_dirs()))))
+    return 0
+
+
+def cmd_config_show(args, ctx):
+    inv, tax = _resolve(args)
+    section("Configuration in effect")
+    say("  Inventory : {}".format(cC(inv) if inv else cBR("none found")))
+    say("  Taxonomy  : {}".format(cC(tax.source)))
+    say("  Keyring   : {}".format(
+        cBG("available") if keyring_available() else cD("not available")))
+    if inv:
+        try:
+            managers = load_inventory(inv)
+        except ConfigError as e:
+            err(str(e))
+            return 1
+        say("\n  {}".format(cB("Managers")))
+        table(["Name", "Host", "Role", "Auth", "Verify TLS"],
+              [[m.get("name", "?"), m.get("host", "?"),
+                ROLE_LABEL.get(m.get("role"), "?"), m.get("auth", "session"),
+                str(m.get("verify_ssl", True))] for m in managers], indent=4)
+    say("\n  {}".format(cB("Tag taxonomy")))
+    rows = []
+    for scope in tax.all_scopes:
+        allowed = tax.values_for(scope)
+        rows.append([scope,
+                     "yes" if scope in tax.mandatory else "no",
+                     ", ".join(allowed) if allowed else cD("(any)")])
+    table(["Scope", "Required", "Allowed values"], rows, indent=4)
+    return 0
+
+
+def cmd_config_validate(args, ctx):
+    inv, _ = _resolve(args)
+    problems = 0
+    if not inv:
+        err("No inventory found. Run: nsxctl init")
+        return 2
+    try:
+        managers = load_inventory(inv)
+        ok_msg("inventory: {} manager(s) in {}".format(len(managers), inv))
+    except ConfigError as e:
+        err(str(e))
+        problems += 1
+    try:
+        tax = load_taxonomy(
+            args.taxonomy,
+            search_dirs=[os.path.dirname(os.path.abspath(inv))]
+            + config_search_dirs(),
+            names=("taxonomy.json", "taxonomy.yaml", "taxonomy.yml"))
+        ok_msg("taxonomy: {} required, {} optional scope(s) from {}".format(
+            len(tax.mandatory), len(tax.conditional), tax.source))
+    except ConfigError as e:
+        err(str(e))
+        problems += 1
+    hr()
+    if problems:
+        say("  {} problem(s).".format(cBR(str(problems))))
+        return 1
+    say("  {}".format(cBG("Configuration is valid.")))
+    return 0
+
+
+# ==========================================================================
+# commands/group.py  --  Group inspection: `nsxctl group list|show`.
+# ==========================================================================
+
+def register_group(sub, parents):
+    p = add_command(
+        sub, parents, "group", "Search and inspect security groups.")
+    gsub = p.add_subparsers(dest="group_action", metavar="<action>")
+
+    ls = gsub.add_parser(
+        "list", parents=parents, help="List groups and their criteria.",
+        description="List groups on the Global Manager and Local Managers, "
+                    "with their membership criteria.",
+        epilog="examples:\n"
+               "  nsxctl group list\n"
+               "  nsxctl group list --contains web-prod\n"
+               "  nsxctl group list --members --out-csv groups.csv")
+    ls.add_argument("--contains", metavar="TEXT",
+                    help="Only groups whose name or id contains TEXT.")
+    ls.add_argument("--members", action="store_true",
+                    help="Also resolve and list VM members.")
+    ls.set_defaults(func=cmd_group_list)
+
+    sh = gsub.add_parser(
+        "show", parents=parents, help="Show one group in full.",
+        description="Show a single group's criteria and members.",
+        epilog="example:\n  nsxctl group show web-prod")
+    sh.add_argument("name", help="Group name or id.")
+    sh.set_defaults(func=cmd_group_show)
+
+    p.set_defaults(func=_group_needs_action)
+
+
+def _group_needs_action(args, ctx):
+    pass
+    err("Specify what to do: nsxctl group list  |  nsxctl group show NAME")
+    return 2
+
+
+def _targets(ctx):
+    """Groups exist on GM and LMs alike, so sweep whatever is connected."""
+    return [s for s in ctx.sessions if s.role in (ROLE_GM, ROLE_LM)]
+
+
+def cmd_group_list(args, ctx):
+    act_groups(_targets(ctx), args.domain, args.contains,
+               show_members=args.members, exporter=ctx.exporter)
+    return 0
+
+
+def cmd_group_show(args, ctx):
+    act_groups(_targets(ctx), args.domain, args.name,
+               show_members=True, exporter=ctx.exporter)
+    return 0
+
+
+# ==========================================================================
+# commands/tag.py  --  Tag operations: `nsxctl tag list|find|edit|apply|ticket`.
+# ==========================================================================
+
+CSV_HELP = "CSV with columns: vm_name,scope,tag,action  (action = add | remove)"
+
+
+def register_tag(sub, parents):
+    p = add_command(sub, parents, "tag", "Read and change VM tags.")
+    tsub = p.add_subparsers(dest="tag_action", metavar="<action>")
+
+    ls = tsub.add_parser(
+        "list", parents=parents, help="Show every tag on a VM.",
+        description="Show all tags on matching VMs, validated against the "
+                    "configured taxonomy.",
+        epilog="example:\n  nsxctl tag list web-prod-01")
+    ls.add_argument("vm", help="VM name, or part of one.")
+    ls.set_defaults(func=cmd_tag_list)
+
+    fd = tsub.add_parser(
+        "find", parents=parents, help="Find every VM carrying a tag.",
+        description="Find VMs by tag scope, value, or both.",
+        epilog="examples:\n"
+               "  nsxctl tag find --scope env --tag prod\n"
+               "  nsxctl tag find --scope owner --out-csv owners.csv")
+    fd.add_argument("--scope", help="Tag scope (blank = any).")
+    fd.add_argument("--tag", help="Tag value (blank = any).")
+    fd.set_defaults(func=cmd_tag_find)
+
+    ed = tsub.add_parser(
+        "edit", parents=parents, help="Add or remove tags interactively.",
+        description="Interactive add/remove for one VM. Audit-logged and "
+                    "undoable.",
+        epilog="example:\n  nsxctl tag edit web-prod-01 --enable-writes")
+    ed.add_argument("vm", help="VM name, or part of one.")
+    ed.set_defaults(func=cmd_tag_edit)
+
+    ap = tsub.add_parser(
+        "apply", parents=parents, help="Apply bulk tag changes from a CSV.",
+        description="Bulk tag changes. Always previews first; writing needs "
+                    "--enable-writes and confirmation.\n\n" + CSV_HELP,
+        epilog="examples:\n"
+               "  nsxctl tag apply changes.csv                    preview only\n"
+               "  nsxctl tag apply changes.csv --enable-writes --yes")
+    ap.add_argument("csv", metavar="FILE", help=CSV_HELP)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Preview only, even with --enable-writes.")
+    ap.set_defaults(func=cmd_tag_apply)
+
+    tk = tsub.add_parser(
+        "ticket", parents=parents, help="Generate a change-plan document.",
+        description="Build a change plan from a CSV, validated against live "
+                    "NSX: current tags, proposed tags, and anything that "
+                    "cannot be resolved.\n\n" + CSV_HELP,
+        epilog="example:\n  nsxctl tag ticket changes.csv")
+    tk.add_argument("csv", metavar="FILE", help=CSV_HELP)
+    tk.set_defaults(func=cmd_tag_ticket)
+
+    p.set_defaults(func=_tag_needs_action)
+
+
+def _tag_needs_action(args, ctx):
+    err("Specify what to do: nsxctl tag list|find|edit|apply|ticket")
+    return 2
+
+
+def cmd_tag_list(args, ctx):
+    if not ctx.lms():
+        err("Tags are Local Manager objects; no Local Manager is connected.")
+        return 2
+    act_vm_tags(ctx.lms(), args.vm, ctx.exporter, ctx.taxonomy)
+    return 0
+
+
+def cmd_tag_find(args, ctx):
+    if not args.scope and not args.tag:
+        err("Give --scope, --tag, or both.")
+        return 2
+    if not ctx.lms():
+        err("Tags are Local Manager objects; no Local Manager is connected.")
+        return 2
+    act_vms_by_tag(ctx.lms(), args.scope, args.tag, ctx.exporter)
+    return 0
+
+
+def cmd_tag_edit(args, ctx):
+    if not ctx.lms():
+        err("Tags are Local Manager objects; no Local Manager is connected.")
+        return 2
+    act_manage_tags(ctx.lms(), args.vm, ctx.audit, ctx.write_enabled,
+                    ctx.taxonomy)
+    return 0
+
+
+def cmd_tag_apply(args, ctx):
+    if not ctx.lms():
+        err("Tags are Local Manager objects; no Local Manager is connected.")
+        return 2
+    # Preview always runs first, in every invocation path.
+    act_bulk_tag(ctx.lms(), args.csv, ctx.audit, ctx.write_enabled,
+                 dry_run=True, taxonomy=ctx.taxonomy)
+    if args.dry_run:
+        return 0
+    if not ctx.write_enabled:
+        say("\n  {} -- add --enable-writes to apply.".format(cBY("READ-ONLY")))
+        return 0
+    if not _tag_write_gate():
+        say("  Cancelled -- nothing written.")
+        return 0
+    result = act_bulk_tag(ctx.lms(), args.csv, ctx.audit, ctx.write_enabled,
+                          dry_run=False, taxonomy=ctx.taxonomy,
+                          force=args.force)
+    return 1 if result["failed"] else 0
+
+
+def _tag_write_gate():
+    """A write needs --yes, or an interactive confirmation. Never assumed."""
+    pass
+    if assume_yes():
+        return True
+    if not is_interactive():
+        err("Refusing to write without confirmation. Re-run with --yes "
+            "(or --dry-run to preview).")
+        return False
+    return confirm("  {} [y/N]: ".format(cB("Apply for real?")))
+
+
+def cmd_tag_ticket(args, ctx):
+    act_change_ticket(ctx.sessions, args.csv, ctx.exporter)
+    return 0
+
+
+# ==========================================================================
+# commands/rule.py  --  DFW rule commands.
+# ==========================================================================
+
+RULE_PENDING = ("Not implemented yet -- this lands in the next release.\n"
+           "The command is registered now so the surface does not change "
+           "under you later.")
+
+
+def register_rule(sub, parents):
+    p = add_command(
+        sub, parents, "rule", "Inspect distributed firewall rules.")
+    rsub = p.add_subparsers(dest="rule_action", metavar="<action>")
+
+    hy = rsub.add_parser(
+        "hygiene", parents=parents,
+        help="Report rule hygiene problems. (coming in the next release)",
+        description="Find any-any rules, overly broad applied-to scopes, "
+                    "rules referencing missing or inert groups, duplicates, "
+                    "rules shadowed by an any-any above them, disabled rules, "
+                    "and drop rules with logging off.")
+    hy.add_argument("--fail-on", choices=("critical", "high", "medium", "low"),
+                    help="Exit non-zero when findings at or above this "
+                         "severity exist.")
+    hy.set_defaults(func=cmd_rule_pending, pending="rule hygiene")
+
+    bl = rsub.add_parser(
+        "baseline", parents=parents,
+        help="Save or compare rule hit counts. (coming in the next release)",
+        description="NSX hit counters are cumulative since the last reset, so "
+                    "a single read cannot prove a rule is unused. Saving a "
+                    "baseline and comparing later gives zero-hits-between-two-"
+                    "timestamps, which is evidence you can attach to a "
+                    "deletion request.")
+    bl.add_argument("action", choices=("save", "compare"))
+    bl.add_argument("--baseline-file", metavar="PATH",
+                    help="Baseline to write, or to compare against.")
+    bl.set_defaults(func=cmd_rule_pending, pending="rule baseline")
+
+    p.set_defaults(func=_rule_needs_action)
+
+
+def _rule_needs_action(args, ctx):
+    err("Specify what to do: nsxctl rule hygiene  |  nsxctl rule baseline")
+    return 2
+
+
+def cmd_rule_pending(args, ctx):
+    err("{}: {}".format(args.pending, RULE_PENDING.splitlines()[0]))
+    say("  " + RULE_PENDING.splitlines()[1])
+    return 3
+
+
+# ==========================================================================
+# commands/analysis.py  --  Analysis commands: impact, parity, compliance, audit.
+# ==========================================================================
+
+def register_analysis(sub, parents):
+    p = add_command(
+        sub, parents, "impact",
+        "What breaks if I change this VM: VM -> groups -> DFW rules.",
+        description="Resolve every group a VM belongs to (any member type) "
+                    "and every DFW rule referencing those groups. Sweeps the "
+                    "Global Manager and all Local Managers, deduplicating "
+                    "GM-authored rules realized onto each LM.",
+        epilog="example:\n  nsxctl impact web-prod-01")
+    p.add_argument("vm", help="VM name, or part of one.")
+    p.set_defaults(func=cmd_impact)
+
+    p = add_command(
+        sub, parents, "parity",
+        "Compare a static group against its dynamic replacement.",
+        description="Which members the static group has that the dynamic one "
+                    "does not -- the real measure of migration progress. Both "
+                    "groups are resolved on the same manager.",
+        epilog="example:\n  nsxctl parity web-static web-dynamic")
+    p.add_argument("static", help="Static group name or id.")
+    p.add_argument("dynamic", help="Dynamic group name or id.")
+    p.set_defaults(func=cmd_parity)
+
+    p = add_command(
+        sub, parents, "compliance",
+        "Tagging posture across every Local Manager.",
+        description="Per-scope coverage and per-manager progress against the "
+                    "configured tag taxonomy.",
+        epilog="examples:\n"
+               "  nsxctl compliance\n"
+               "  nsxctl compliance --json\n"
+               "  nsxctl compliance --out-csv posture.csv")
+    p.set_defaults(func=cmd_compliance)
+
+    p = add_command(sub, parents, "audit", "Review and undo audited writes.")
+    asub = p.add_subparsers(dest="audit_action", metavar="<action>")
+    ls = asub.add_parser("list", parents=parents,
+                         help="Show recent audited writes.")
+    ls.add_argument("-n", "--limit", type=int, default=20,
+                    help="How many entries (default 20).")
+    ls.set_defaults(func=cmd_audit_list)
+    un = asub.add_parser("undo", parents=parents,
+                         help="Restore a VM's tags from an audit entry.")
+    un.add_argument("-n", "--limit", type=int, default=20,
+                    help="How many entries to choose from (default 20).")
+    un.set_defaults(func=cmd_audit_undo)
+    p.set_defaults(func=cmd_audit_list, audit_action="list", limit=20)
+
+
+def cmd_impact(args, ctx):
+    # Always the full session set -- see act_reverse_lookup's docstring for
+    # why a partial selection produces a wrong answer here.
+    act_reverse_lookup(ctx.sessions, args.vm, args.domain, ctx.exporter)
+    return 0
+
+
+def cmd_parity(args, ctx):
+    act_parity(ctx.sessions, args.domain, args.static, args.dynamic,
+               ctx.exporter)
+    return 0
+
+
+def cmd_compliance(args, ctx):
+    act_dashboard(ctx.sessions, ctx.exporter, ctx.taxonomy)
+    return 0
+
+
+def cmd_audit_list(args, ctx):
+    act_audit_log(ctx.audit, ctx.sessions, write_enabled=False,
+                  exporter=ctx.exporter, limit=args.limit)
+    return 0
+
+
+def cmd_audit_undo(args, ctx):
+    if not ctx.write_enabled:
+        err("Undo changes tags. Re-run with --enable-writes.")
+        return 2
+    act_audit_log(ctx.audit, ctx.sessions, write_enabled=True,
+                  exporter=ctx.exporter, limit=args.limit)
+    return 0
+
+
+# ==========================================================================
+# commands/shell.py  --  Shell integration: `nsxctl completion`, `nsxctl menu`, `nsxctl version`.
+# ==========================================================================
+
+SHELLS = ("bash", "zsh", "fish")
+
+
+def register_shell(sub, parents):
+    p = add_command(
+        sub, parents, "menu", "Open the interactive menu.",
+        description="The guided menu. Running nsxctl with no arguments does "
+                    "the same thing.")
+    p.set_defaults(func=cmd_menu)
+
+    p = add_command(
+        sub, parents, "completion", "Print a shell completion script.",
+        description="Generated from the command tree, so it always matches "
+                    "the commands this build actually has.",
+        epilog="install:\n"
+               "  bash   nsxctl completion bash > "
+               "/etc/bash_completion.d/nsxctl\n"
+               "  zsh    nsxctl completion zsh  > "
+               "\"${fpath[1]}/_nsxctl\"\n"
+               "  fish   nsxctl completion fish > "
+               "~/.config/fish/completions/nsxctl.fish")
+    p.add_argument("shell", choices=SHELLS)
+    p.set_defaults(func=cmd_completion, needs_inventory=False,
+                   needs_sessions=False)
+
+    p = add_command(sub, parents, "version", "Print the version and exit.")
+    p.set_defaults(func=cmd_version, needs_inventory=False,
+                   needs_sessions=False)
+
+
+def cmd_menu(args, ctx):
+    pass
+    return interactive(ctx)
+
+
+def cmd_version(args, ctx):
+    say("{} v{} ({})".format(TOOL_NAME, VERSION, VERSION_DATE))
+    return 0
+
+
+# === PARSER INTROSPECTION ===
+def _completion_options(parser):
+    out = []
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            continue
+        out.extend(s for s in action.option_strings if s.startswith("--"))
+    return sorted(set(out))
+
+
+def _completion_subparsers(parser):
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices
+    return {}
+
+
+def command_tree(parser):
+    """{command: {"options": [...], "subcommands": {name: [options]}}}"""
+    tree = {}
+    for name, cmd_parser in _completion_subparsers(parser).items():
+        entry = {"options": _completion_options(cmd_parser), "subcommands": {}}
+        for sub_name, sub_parser in _completion_subparsers(cmd_parser).items():
+            entry["subcommands"][sub_name] = _completion_options(sub_parser)
+        tree[name] = entry
+    return tree
+
+
+def _tree_and_globals():
+    pass
+    parser = build_parser()
+    return command_tree(parser), _completion_options(parser)
+
+
+# === EMITTERS ===
+def _completion_bash(tree, global_opts):
+    commands = " ".join(sorted(tree))
+    lines = [
+        "# {} completion for bash -- generated by `{} completion bash`".format(
+            PROG, PROG),
+        "_{}() {{".format(PROG),
+        '    local cur cmd sub i',
+        '    cur="${COMP_WORDS[COMP_CWORD]}"',
+        '    cmd=""; sub=""',
+        '    for ((i=1; i<COMP_CWORD; i++)); do',
+        '        case "${COMP_WORDS[i]}" in',
+        '            -*) continue ;;',
+        '            *)  if [ -z "$cmd" ]; then cmd="${COMP_WORDS[i]}";',
+        '                elif [ -z "$sub" ]; then sub="${COMP_WORDS[i]}"; fi ;;',
+        '        esac',
+        '    done',
+        '    local commands="{}"'.format(commands),
+        '    local globals="{}"'.format(" ".join(global_opts)),
+        '    if [ -z "$cmd" ]; then',
+        '        if [[ "$cur" == -* ]]; then',
+        '            COMPREPLY=( $(compgen -W "$globals" -- "$cur") )',
+        '        else',
+        '            COMPREPLY=( $(compgen -W "$commands" -- "$cur") )',
+        '        fi',
+        '        return',
+        '    fi',
+        '    local subs="" opts="$globals"',
+        '    case "$cmd" in',
+    ]
+    for name in sorted(tree):
+        entry = tree[name]
+        subs = " ".join(sorted(entry["subcommands"]))
+        opts = " ".join(sorted(set(entry["options"]) | set(global_opts)))
+        lines.append('        {}) subs="{}"; opts="{}" ;;'.format(
+            name, subs, opts))
+    lines.extend([
+        '    esac',
+        '    if [[ "$cur" == -* ]]; then',
+        '        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )',
+        '    elif [ -n "$subs" ] && [ -z "$sub" ]; then',
+        '        COMPREPLY=( $(compgen -W "$subs" -- "$cur") )',
+        '    else',
+        '        COMPREPLY=( $(compgen -f -- "$cur") )',
+        '    fi',
+        "}",
+        "complete -F _{} {}".format(PROG, PROG),
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def _completion_zsh(tree, global_opts):
+    lines = [
+        "#compdef {}".format(PROG),
+        "# generated by `{} completion zsh`".format(PROG),
+        "_{}() {{".format(PROG),
+        "    local -a commands",
+        "    commands=({})".format(
+            " ".join("'{}'".format(c) for c in sorted(tree))),
+        "    if (( CURRENT == 2 )); then",
+        "        _describe 'command' commands",
+        "        return",
+        "    fi",
+        "    case \"${words[2]}\" in",
+    ]
+    for name in sorted(tree):
+        subs = sorted(tree[name]["subcommands"])
+        if subs:
+            lines.append("        {})".format(name))
+            lines.append("            if (( CURRENT == 3 )); then")
+            lines.append("                _values 'action' {}".format(
+                " ".join("'{}'".format(s) for s in subs)))
+            lines.append("            else")
+            lines.append("                _files")
+            lines.append("            fi ;;")
+        else:
+            lines.append("        {}) _files ;;".format(name))
+    lines.extend([
+        "    esac",
+        "}",
+        "_{} \"$@\"".format(PROG),
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def _completion_fish(tree, global_opts):
+    lines = ["# generated by `{} completion fish`".format(PROG)]
+    has_cmd = "__fish_seen_subcommand_from"
+    lines.append("function __{}_no_command".format(PROG))
+    lines.append("    not {} {}".format(has_cmd, " ".join(sorted(tree))))
+    lines.append("end")
+    for name in sorted(tree):
+        lines.append(
+            "complete -c {} -n '__{}_no_command' -a '{}'".format(
+                PROG, PROG, name))
+        for sub in sorted(tree[name]["subcommands"]):
+            lines.append(
+                "complete -c {} -n '{} {}' -a '{}'".format(
+                    PROG, has_cmd, name, sub))
+    for opt in global_opts:
+        lines.append("complete -c {} -l '{}'".format(PROG, opt.lstrip("-")))
+    return "\n".join(lines) + "\n"
+
+
+COMPLETION_EMITTERS = {"bash": _completion_bash,
+                       "zsh": _completion_zsh,
+                       "fish": _completion_fish}
+
+
+def completion_script(shell):
+    tree, global_opts = _tree_and_globals()
+    return COMPLETION_EMITTERS[shell](tree, global_opts)
+
+
+def cmd_completion(args, ctx):
+    # print(), not say(): this is data piped into a file, so it must be
+    # emitted even when --json or a quiet mode is in effect.
+    print(completion_script(args.shell), end="")
+    return 0
+
+
+# ==========================================================================
+# legacy.py  --  Translation from the pre-4.0 flag interface to `nsxctl <noun> <verb>`.
+# ==========================================================================
+
+# old flag -> (subcommand words, how to consume its value)
+#   "flag"     : no value
+#   "value"    : one positional value
+#   "two"      : two positional values
+SIMPLE = {
+    "init": (["init"], "flag"),
+    "verify": (["status"], "flag"),
+    "list_managers": (["managers"], "flag"),
+    "dashboard": (["compliance"], "flag"),
+    "audit_log": (["audit", "list"], "flag"),
+    "vm_tags": (["tag", "list"], "value"),
+    "reverse_lookup": (["impact"], "value"),
+    "change_ticket": (["tag", "ticket"], "value"),
+    "parity": (["parity"], "two"),
+}
+
+# Presentation order, so a multi-action run is deterministic and matches the
+# order the old cli.py executed them in.
+ORDER = ["list_managers", "verify", "groups", "vm_tags", "vms_by_tag",
+         "dashboard", "parity", "reverse_lookup", "change_ticket",
+         "audit_log", "bulk_tag", "init", "set_credentials"]
+
+REPLACEMENT = {
+    "--init": "nsxctl init",
+    "--verify": "nsxctl status",
+    "--list-managers": "nsxctl managers",
+    "--set-credentials": "nsxctl login",
+    "--groups": "nsxctl group list",
+    "--vm-tags": "nsxctl tag list VM",
+    "--vms-by-tag": "nsxctl tag find --scope S --tag T",
+    "--bulk-tag": "nsxctl tag apply FILE",
+    "--change-ticket": "nsxctl tag ticket FILE",
+    "--reverse-lookup": "nsxctl impact VM",
+    "--parity": "nsxctl parity STATIC DYNAMIC",
+    "--dashboard": "nsxctl compliance",
+    "--audit-log": "nsxctl audit list",
+}
+
+
+def _legacy_parser():
+    """Recognises only the old action flags and the old action-scoped options.
+
+    Global flags are deliberately absent so `parse_known_args` hands them back
+    untouched, to be passed through to the new parser.
+    """
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--init", action="store_true")
+    p.add_argument("--verify", action="store_true")
+    p.add_argument("--list-managers", action="store_true")
+    p.add_argument("--set-credentials", action="store_true")
+    p.add_argument("--dashboard", action="store_true")
+    p.add_argument("--audit-log", action="store_true")
+    p.add_argument("--groups", action="store_true")
+    p.add_argument("--vms-by-tag", action="store_true")
+    p.add_argument("--vm-tags", default=None)
+    p.add_argument("--reverse-lookup", default=None)
+    p.add_argument("--bulk-tag", default=None)
+    p.add_argument("--change-ticket", default=None)
+    p.add_argument("--parity", nargs=2, default=None)
+    # Options that used to be global but now belong to a specific command.
+    p.add_argument("--contains", default=None)
+    p.add_argument("--members", action="store_true")
+    p.add_argument("--scope", default=None)
+    p.add_argument("--tag", default=None)
+    p.add_argument("--dry-run", action="store_true")
     return p
+
+
+LEGACY_FLAGS = frozenset(REPLACEMENT) | {
+    "--contains", "--members", "--scope", "--tag", "--dry-run"}
+
+
+def uses_legacy(argv):
+    """True when argv contains any pre-4.0 flag."""
+    for token in argv:
+        head = token.split("=", 1)[0]
+        if head in LEGACY_FLAGS:
+            return True
+    return False
+
+
+def translate_legacy_argv(argv):
+    """(list_of_new_argv, warnings). Raises nothing; unknown args pass through.
+
+    Returns ([], warnings) when a legacy flag was present but named no action
+    (for example `--scope` on its own) -- the caller reports that.
+    """
+    parser = _legacy_parser()
+    try:
+        known, passthrough = parser.parse_known_args(argv)
+    except SystemExit:
+        # Malformed legacy input: let the new parser produce the error.
+        return None, []
+
+    warnings = []
+    commands = []
+
+    def warn_for(flag):
+        replacement = REPLACEMENT.get(flag)
+        if replacement:
+            warnings.append(
+                "{} is deprecated and will be removed in 5.0. "
+                "use: {}".format(flag, replacement))
+
+    for key in ORDER:
+        value = getattr(known, key, None)
+        if key == "set_credentials":
+            if value:
+                warn_for("--set-credentials")
+                commands.append(["login"] + list(passthrough))
+            continue
+        if key == "groups":
+            if value:
+                warn_for("--groups")
+                extra = []
+                if known.contains:
+                    extra += ["--contains", known.contains]
+                if known.members:
+                    extra += ["--members"]
+                commands.append(["group", "list"] + extra + list(passthrough))
+            continue
+        if key == "vms_by_tag":
+            if value:
+                warn_for("--vms-by-tag")
+                extra = []
+                if known.scope:
+                    extra += ["--scope", known.scope]
+                if known.tag:
+                    extra += ["--tag", known.tag]
+                commands.append(["tag", "find"] + extra + list(passthrough))
+            continue
+        if key == "bulk_tag":
+            if value:
+                warn_for("--bulk-tag")
+                extra = ["--dry-run"] if known.dry_run else []
+                commands.append(["tag", "apply", value] + extra
+                                + list(passthrough))
+            continue
+        if key in SIMPLE:
+            words, kind = SIMPLE[key]
+            flag = "--" + key.replace("_", "-")
+            if kind == "flag" and value:
+                warn_for(flag)
+                commands.append(list(words) + list(passthrough))
+            elif kind == "value" and value:
+                warn_for(flag)
+                commands.append(list(words) + [value] + list(passthrough))
+            elif kind == "two" and value:
+                warn_for(flag)
+                commands.append(list(words) + list(value) + list(passthrough))
+
+    return commands, warnings
+
+
+# ==========================================================================
+# cli.py  --  Entry point: assemble configuration, connect, dispatch a subcommand.
+# ==========================================================================
+
+TAXONOMY_NAMES = ("taxonomy.json", "taxonomy.yaml", "taxonomy.yml")
 
 
 def banner(inv_path, mgr_count, audit_path, taxonomy, write_enabled):
@@ -3491,8 +4376,11 @@ def banner(inv_path, mgr_count, audit_path, taxonomy, write_enabled):
     say(cBC("=" * W))
 
 
-def connect_all(managers, only=None, ca_bundle=None):
-    say("\n  {} ...".format(cB("Authenticating")))
+def connect_all(managers, only=None, ca_bundle=None, quiet=True):
+    """Authenticate against each manager. Quiet by default: a one-shot command
+    should print its results, not a login transcript."""
+    if not quiet:
+        say("\n  {} ...".format(cB("Authenticating")))
     sessions, failed = [], []
     transport = make_transport()
     for m in managers:
@@ -3506,27 +4394,17 @@ def connect_all(managers, only=None, ca_bundle=None):
         try:
             user, pwd, src = credentials_for(m, allow_prompt=True)
             sessions.append(Nsx(m, user, pwd, transport=transport))
-            say("    {:26s}  credentials {}".format(cC(name), cG(src)))
+            if not quiet:
+                say("    {:26s}  credentials {}".format(cC(name), cG(src)))
         except UserAbort:
             raise
         except NsxError as e:
             failed.append(name)
             err(str(e))
     if failed:
-        say("    ({} unavailable: {})".format(cBR(str(len(failed))),
-                                              ", ".join(failed)))
+        say("    ({} unavailable: {})".format(
+            cBR(str(len(failed))), ", ".join(failed)))
     return sessions
-
-
-def _write_gate(what):
-    """A write from the CLI needs --yes, or an interactive confirmation."""
-    if assume_yes():
-        return True
-    if not is_interactive():
-        err("Refusing to {} without confirmation. Re-run with --yes "
-            "(or --dry-run to preview).".format(what))
-        return False
-    return confirm("  {} [y/N]: ".format(cB("Apply {} for real?".format(what))))
 
 
 def _emit_json(exporter, errors, rc):
@@ -3539,9 +4417,14 @@ def _emit_json(exporter, errors, rc):
     print()
 
 
-def main(argv=None):
-    args = build_parser().parse_args(argv)
+def _parse(parser, argv_list):
+    out = []
+    for argv in argv_list:
+        out.append(apply_global_defaults(parser.parse_args(argv)))
+    return out
 
+
+def _apply_modes(args):
     if args.no_color:
         set_color(False)
     if args.json:
@@ -3554,163 +4437,130 @@ def main(argv=None):
         set_debug(True)
     set_store_policy(args.store)
 
+
+def main(argv=None):
+    raw = list(sys.argv[1:] if argv is None else argv)
+
+    # --- pre-4.0 flags: translate, warn, continue -------------------------
+    legacy_warnings = []
+    argv_list = [raw]
+    if uses_legacy(raw):
+        translated, legacy_warnings = translate_legacy_argv(raw)
+        if translated:
+            argv_list = translated
+
+    parser = build_parser()
+    try:
+        parsed = _parse(parser, argv_list)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 2
+
+    first = parsed[0]
+    _apply_modes(first)
+    for warning in legacy_warnings:
+        print("warning: {}".format(warning), file=sys.stderr)
+
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # --- inventory -------------------------------------------------------
-    inv_path = find_inventory(args.inventory, config_search_dirs())
-    if args.init:
-        return 0 if run_wizard(args.inventory or inv_path) else 1
-    if not inv_path:
-        inv_path = maybe_bootstrap(args.inventory, config_search_dirs())
-        if not inv_path:
-            return 2
-    try:
-        managers = load_inventory(inv_path)
-    except ConfigError as e:
-        err(str(e))
+    menu_mode = getattr(first, "command", None) is None
+    if menu_mode and not is_interactive():
+        parser.print_help()
         return 2
 
-    # --- taxonomy --------------------------------------------------------
+    needs_inventory = menu_mode or any(
+        getattr(ns, "needs_inventory", True) for ns in parsed)
+    needs_sessions = menu_mode or any(
+        getattr(ns, "needs_sessions", True) for ns in parsed)
+
+    exporter = Exporter()
+    audit = AuditLog()
+    errors = []
+
+    # --- configuration ----------------------------------------------------
+    managers, inv_path, taxonomy = [], None, None
+    if needs_inventory:
+        inv_path = find_inventory(first.inventory, config_search_dirs())
+        if not inv_path:
+            inv_path = maybe_bootstrap(first.inventory, config_search_dirs())
+            if not inv_path:
+                return 2
+        try:
+            managers = load_inventory(inv_path)
+        except ConfigError as e:
+            err(str(e))
+            return 2
+
     try:
         taxonomy = load_taxonomy(
-            args.taxonomy,
-            search_dirs=[os.path.dirname(os.path.abspath(inv_path))]
-            + config_search_dirs(),
-            names=DEFAULT_TAXONOMY_NAMES + ("taxonomy.json",))
+            first.taxonomy,
+            search_dirs=([os.path.dirname(os.path.abspath(inv_path))]
+                         if inv_path else []) + config_search_dirs(),
+            names=TAXONOMY_NAMES)
     except ConfigError as e:
         err(str(e))
         return 2
 
-    # --- manager selection ----------------------------------------------
     only = None
-    if args.manager:
-        only = {args.manager}
-        if not any(m.get("name") == args.manager for m in managers):
+    if needs_inventory and first.manager:
+        only = {first.manager}
+        if not any(m.get("name") == first.manager for m in managers):
             err("'{}' is not in {}. Known: {}".format(
-                args.manager, inv_path,
+                first.manager, inv_path,
                 ", ".join(m.get("name", "?") for m in managers)))
             return 2
-    elif args.all_lm:
+    elif needs_inventory and first.all_lm:
         only = {m.get("name") for m in managers if m.get("role") == ROLE_LM}
         if not only:
             err('No managers with "role": "lm" in {}.'.format(inv_path))
             return 2
 
-    if args.set_credentials:
-        return force_set_credentials(managers, only=only)
-
-    audit = AuditLog()
-    exporter = Exporter()
-    write_enabled = args.enable_writes
-
-    wants_cli = any([args.groups, args.vm_tags, args.vms_by_tag, args.verify,
-                     args.bulk_tag, args.dashboard, args.parity,
-                     args.change_ticket, args.reverse_lookup, args.audit_log,
-                     args.list_managers])
-
-    banner(inv_path, len(managers), audit.path, taxonomy, write_enabled)
-
-    try:
-        sessions = connect_all(managers, only=only, ca_bundle=args.ca_bundle)
-    except UserAbort:
-        err("Credentials required.")
-        return 2
-    if not sessions:
-        err("No manager could be authenticated.")
-        return 2
+    # --- connect ----------------------------------------------------------
+    sessions = []
+    if needs_sessions:
+        if menu_mode:
+            banner(inv_path, len(managers), audit.path, taxonomy,
+                   first.enable_writes)
+        try:
+            sessions = connect_all(managers, only=only,
+                                   ca_bundle=first.ca_bundle,
+                                   quiet=not menu_mode)
+        except UserAbort:
+            err("Credentials required.")
+            return 2
+        if not sessions:
+            err("No manager could be authenticated.")
+            return 2
 
     ctx = AppContext(sessions, audit, exporter, taxonomy,
-                     write_enabled=write_enabled, domain=args.domain)
+                     write_enabled=first.enable_writes, domain=first.domain,
+                     managers=managers)
 
-    if not wants_cli:
-        try:
-            return interactive(ctx)
-        except (KeyboardInterrupt, EOFError, UserAbort):
-            say("\n  Bye.")
-            return 0
-        finally:
-            ctx.close()
-
-    errors = []
+    # --- dispatch ---------------------------------------------------------
     rc = 0
     try:
-        if args.list_managers:
-            section("Managers")
-            table(["Name", "Host", "Role", "Auth", "Verify"],
-                  [[s.name, s.host, s.role, s.auth_mode, str(s.verify)]
-                   for s in sessions])
+        if menu_mode:
+            try:
+                return interactive(ctx)
+            except (KeyboardInterrupt, EOFError, UserAbort):
+                say("\n  Bye.")
+                return 0
 
-        if args.verify and not act_verify(sessions, args.domain):
-            rc = 1
-
-        if args.groups:
-            act_groups(sessions, args.domain, args.contains,
-                       show_members=args.members, exporter=exporter)
-
-        lms = ctx.lms()
-
-        if args.vm_tags:
-            if not lms:
-                err("--vm-tags needs a Local Manager.")
+        for ns in parsed:
+            handler = getattr(ns, "func", None)
+            if handler is None:
+                parser.print_help()
                 return 2
-            act_vm_tags(lms, args.vm_tags, exporter, taxonomy)
+            result = handler(ns, ctx)
+            if result:
+                rc = result
 
-        if args.vms_by_tag:
-            if not lms:
-                err("--vms-by-tag needs a Local Manager.")
-                return 2
-            if not args.scope and not args.tag:
-                err("--vms-by-tag needs --scope and/or --tag.")
-                return 2
-            act_vms_by_tag(lms, args.scope, args.tag, exporter)
-
-        if args.dashboard:
-            act_dashboard(sessions, exporter, taxonomy)
-
-        if args.parity:
-            act_parity(sessions, args.domain, args.parity[0], args.parity[1],
-                       exporter)
-
-        if args.reverse_lookup:
-            # Always the full session set -- GM + every LM. See the docstring
-            # on act_reverse_lookup.
-            act_reverse_lookup(sessions, args.reverse_lookup, args.domain,
-                               exporter)
-
-        if args.change_ticket:
-            act_change_ticket(sessions, args.change_ticket, exporter)
-
-        if args.audit_log:
-            act_audit_log(audit, sessions, write_enabled, exporter)
-
-        if args.bulk_tag:
-            if not lms:
-                err("--bulk-tag needs a Local Manager.")
-                return 2
-            # Dry run always happens first, then the real apply is gated.
-            act_bulk_tag(lms, args.bulk_tag, audit, write_enabled,
-                         dry_run=True, taxonomy=taxonomy)
-            if not args.dry_run:
-                if not write_enabled:
-                    say("\n  {} -- add --enable-writes to apply.".format(
-                        cBY("READ-ONLY")))
-                elif _write_gate("bulk tagging"):
-                    result = act_bulk_tag(lms, args.bulk_tag, audit,
-                                          write_enabled, dry_run=False,
-                                          taxonomy=taxonomy, force=args.force)
-                    if result["failed"]:
-                        rc = 1
-                else:
-                    say("  Cancelled -- nothing written.")
-
-        if args.out_csv and exporter.has_staged():
-            for path in exporter.to_csv(args.out_csv):
+        if first.out_csv and exporter.has_staged():
+            for path in exporter.to_csv(first.out_csv):
                 say("  Exported: {}".format(path))
-        if args.out_json and exporter.has_staged():
-            for path in exporter.to_json(args.out_json):
+        if first.out_json and exporter.has_staged():
+            for path in exporter.to_json(first.out_json):
                 say("  Exported: {}".format(path))
-
-        if args.json:
+        if first.json:
             _emit_json(exporter, errors, rc)
         return rc
 
@@ -3720,7 +4570,7 @@ def main(argv=None):
     except NsxError as e:
         errors.append(str(e))
         err(str(e))
-        if args.json:
+        if first.json:
             _emit_json(exporter, errors, 1)
         return 1
     except KeyboardInterrupt:
