@@ -1834,6 +1834,15 @@ def policies_for(nsx, domain):
             return []
 
 
+def rule_sequence(record):
+    """A rule's evaluation position, as an int. NSX omits or stringifies it on
+    some versions, so this never raises."""
+    try:
+        return int(record.rule.get(F_SEQUENCE_NUMBER) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def ordered_sessions(sessions):
     """Global Managers first. The dedup below depends on this order."""
     gm = [s for s in sessions if s.role == ROLE_GM]
@@ -2040,6 +2049,511 @@ def hit_baseline_summary(results):
     for result in results:
         counts[result["status"]] = counts.get(result["status"], 0) + 1
     return counts
+
+
+# ==========================================================================
+# snapshot.py  --  Configuration snapshots: capture NSX config as a git-friendly tree.
+# ==========================================================================
+
+MANIFEST = "manifest.json"
+
+# Fields NSX changes on its own. Stripped from the compared body: leaving any
+# of them in makes every snapshot differ from the last one.
+VOLATILE_FIELDS = frozenset({
+    "_revision",
+    "_create_time",
+    "_create_user",
+    "_last_modified_time",
+    "_last_modified_user",
+    "_system_owned",
+    "_protection",
+    "realization_id",
+    "unique_id",
+    "parent_path",
+    "relative_path",
+    "marked_for_delete",
+    "overridden",
+    "origin_site_id",
+    "owner_id",
+    "remote_path",
+    "children",
+})
+# Deliberately NOT stripped: `resource_type`. It looks like metadata, but
+# inside a group's `expression` it is the discriminator that tells a Condition
+# from an IPAddressExpression. Strip it and two different criteria compare
+# equal.
+
+# Kept out of the comparison, but carried alongside it: this is the
+# "who changed it" evidence the drift report exists to surface.
+PROVENANCE_FIELDS = ("_last_modified_user", "_last_modified_time",
+                     "_create_user", "_revision")
+
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe(component):
+    """A path component safe on every filesystem, from an NSX id."""
+    cleaned = _SAFE_NAME.sub("_", str(component or "unknown"))
+    return cleaned[:120] or "unknown"
+
+
+def normalise_object(obj):
+    """(body, provenance). Body is what gets compared; provenance is context.
+
+    Recurses, because nested structures carry the same volatile fields.
+    """
+    provenance = {key: obj.get(key) for key in PROVENANCE_FIELDS
+                  if obj.get(key) is not None}
+    return _strip(obj), provenance
+
+
+def _strip(value):
+    if isinstance(value, dict):
+        return {k: _strip(v) for k, v in value.items()
+                if k not in VOLATILE_FIELDS}
+    if isinstance(value, list):
+        return [_strip(v) for v in value]
+    return value
+
+
+# === CAPTURE ===
+def capture_snapshot(sessions, domain, with_tags=False):
+    """Read the current configuration into an in-memory snapshot.
+
+    Uses the same deduplicated GM/LM traversal as reverse lookup and rule
+    hygiene, so a GM-authored rule realized onto eight Local Managers is
+    captured once, under the manager that owns it.
+    """
+    objects = {}
+    provenance = {}
+    counts = {"groups": 0, "policies": 0, "rules": 0, "tags": 0}
+
+    def record(kind, manager, path, obj, extra=None):
+        body, prov = normalise_object(obj)
+        if extra:
+            body.update(extra)
+        objects[path] = {"kind": kind, "manager": manager, "body": body}
+        if prov:
+            provenance[path] = prov
+        counts[kind] = counts.get(kind, 0) + 1
+
+    with Spinner("Reading groups"):
+        groups = group_inventory(sessions, domain)
+    for path, (nsx, group) in groups.items():
+        record("groups", nsx.name, path, group)
+
+    with Spinner("Reading policies and rules"):
+        records = sweep_rules(sessions, domain)
+
+    # Evaluation order lives on the policy rather than in rule filenames, so a
+    # reorder shows as one precise change instead of N deletes plus N adds.
+    by_policy = {}
+    for rec in records:
+        key = (rec.nsx.name, rec.policy.get(F_PATH, ""))
+        by_policy.setdefault(key, []).append(rec)
+
+    for (manager, policy_path), rules in by_policy.items():
+        ordered = sorted(rules, key=rule_sequence)
+        policy = ordered[0].policy
+        record("policies", manager, policy_path, policy,
+               extra={"order": [r.rule_id for r in ordered]})
+        for rec in ordered:
+            if rec.path:
+                record("rules", manager, rec.path, rec.rule)
+
+    if with_tags:
+        lms = [s for s in sessions if s.role == ROLE_LM]
+        fetched = parallel_run(lms, lambda s: s.all_vms(),
+                               label="Reading VM tags")
+        for nsx in lms:
+            vms = fetched.get(nsx.name)
+            if isinstance(vms, Exception):
+                continue
+            for vm in (vms or []):
+                ext = vm.get(F_EXTERNAL_ID)
+                if not ext:
+                    continue
+                path = "vm:{}".format(ext)
+                objects[path] = {
+                    "kind": "tags", "manager": nsx.name,
+                    "body": {"display_name": vm.get(F_DISPLAY_NAME, ""),
+                             "external_id": ext,
+                             "tags": sorted("{}={}".format(s, t)
+                                            for s, t in tags_of(vm))}}
+                counts["tags"] += 1
+
+    return {
+        "manifest": {
+            "taken": utc_now_iso(),
+            "tool_version": VERSION,
+            "domain": domain,
+            "managers": sorted(s.name for s in sessions),
+            "with_tags": bool(with_tags),
+            "counts": counts,
+        },
+        "objects": objects,
+        "provenance": provenance,
+    }
+
+
+# === STORAGE ===
+def _write_json(path, payload):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True, ensure_ascii=False)
+        f.write("\n")
+
+
+def _object_file(root, entry, path):
+    """Where one object's file lives in the tree."""
+    kind = entry["kind"]
+    manager = _safe(entry["manager"])
+    body = entry["body"]
+    if kind == "groups":
+        return os.path.join(root, "groups", manager,
+                            _safe(body.get(F_ID) or path) + ".json")
+    if kind == "policies":
+        return os.path.join(root, "policies", manager,
+                            _safe(body.get(F_ID) or path), "_policy.json")
+    if kind == "rules":
+        # .../security-policies/<pid>/rules/<rid>
+        parts = path.split("/security-policies/", 1)
+        policy_id = parts[1].split("/")[0] if len(parts) > 1 else "unknown"
+        return os.path.join(root, "policies", manager, _safe(policy_id),
+                            "rules", _safe(body.get(F_ID) or path) + ".json")
+    if kind == "tags":
+        return os.path.join(root, "tags", manager,
+                            _safe(body.get("external_id") or path) + ".json")
+    return os.path.join(root, "other", manager, _safe(path) + ".json")
+
+
+def default_snapshot_name(domain="default"):
+    return "{}_{}".format(_safe(domain), local_stamp())
+
+
+def save_snapshot(snapshot, name=None, root_dir=None):
+    """Write the tree. Returns its root directory."""
+    root_dir = root_dir or DEFAULT_SNAPSHOT_DIR
+    name = _safe(name or default_snapshot_name(
+        snapshot["manifest"].get("domain", "default")))
+    root = os.path.join(root_dir, name)
+
+    manifest = dict(snapshot["manifest"])
+    manifest["name"] = name
+    manifest["paths"] = {}
+
+    for path, entry in snapshot["objects"].items():
+        target = _object_file(root, entry, path)
+        # Only the config goes in the object file. Provenance rides in the
+        # manifest instead: _revision and _last_modified_time move when nothing
+        # real changed, and putting them here would make every `git diff` noisy
+        # -- the exact failure this whole design exists to avoid.
+        _write_json(target, entry["body"])
+        record = {"kind": entry["kind"], "manager": entry["manager"],
+                  "file": os.path.relpath(target, root).replace(os.sep, "/")}
+        prov = snapshot.get("provenance", {}).get(path)
+        if prov:
+            record["provenance"] = prov
+        manifest["paths"][path] = record
+
+    _write_json(os.path.join(root, MANIFEST), manifest)
+    return root
+
+
+def load_snapshot(root):
+    """Read a tree back into the same shape capture_snapshot produces."""
+    manifest_path = os.path.join(root, MANIFEST)
+    if not os.path.isfile(manifest_path):
+        raise NsxError(
+            "{} is not a snapshot (no {}).".format(root, MANIFEST))
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except ValueError as e:
+        raise NsxError("{} is corrupt: {}".format(manifest_path, e)) from e
+
+    objects, provenance = {}, {}
+    for path, meta in (manifest.get("paths") or {}).items():
+        target = os.path.join(root, meta["file"].replace("/", os.sep))
+        if not os.path.isfile(target):
+            raise NsxError(
+                "snapshot {} is incomplete: {} is missing".format(
+                    root, meta["file"]))
+        with open(target, encoding="utf-8") as f:
+            payload = json.load(f)
+        objects[path] = {"kind": meta["kind"], "manager": meta["manager"],
+                         "body": payload}
+        if meta.get("provenance"):
+            provenance[path] = meta["provenance"]
+    return {"manifest": manifest, "objects": objects, "provenance": provenance}
+
+
+def list_snapshots(root_dir=None):
+    """Every snapshot under root_dir, newest first."""
+    root_dir = root_dir or DEFAULT_SNAPSHOT_DIR
+    if not os.path.isdir(root_dir):
+        return []
+    found = []
+    for name in sorted(os.listdir(root_dir)):
+        candidate = os.path.join(root_dir, name)
+        manifest_path = os.path.join(candidate, MANIFEST)
+        if not os.path.isfile(manifest_path):
+            continue
+        try:
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (ValueError, OSError):
+            continue
+        found.append({"name": name, "root": candidate,
+                      "taken": manifest.get("taken", ""),
+                      "domain": manifest.get("domain", ""),
+                      "counts": manifest.get("counts", {}),
+                      "managers": manifest.get("managers", [])})
+    found.sort(key=lambda item: item["taken"], reverse=True)
+    return found
+
+
+def resolve_snapshot(name_or_path, root_dir=None):
+    """Accept a snapshot name or a directory path. Newest wins for None."""
+    root_dir = root_dir or DEFAULT_SNAPSHOT_DIR
+    if name_or_path:
+        if os.path.isdir(name_or_path):
+            return name_or_path
+        candidate = os.path.join(root_dir, _safe(name_or_path))
+        if os.path.isdir(candidate):
+            return candidate
+        raise NsxError("No snapshot named '{}' in {}".format(
+            name_or_path, root_dir))
+    existing = list_snapshots(root_dir)
+    if not existing:
+        raise NsxError(
+            "No snapshots yet in {}. Take one first: nsxctl snapshot "
+            "save".format(root_dir))
+    return existing[0]["root"]
+
+
+def describe_snapshot(snapshot):
+    manifest = snapshot["manifest"]
+    counts = manifest.get("counts", {})
+    say("  Taken    : {}".format(manifest.get("taken", "?")))
+    say("  Domain   : {}".format(manifest.get("domain", "?")))
+    say("  Managers : {}".format(", ".join(manifest.get("managers", []))))
+    say("  Objects  : {}".format(", ".join(
+        "{} {}".format(v, k) for k, v in sorted(counts.items()) if v)))
+
+
+# ==========================================================================
+# diff.py  --  Comparing two configuration snapshots.
+# ==========================================================================
+
+# Membership matters; order does not.
+SET_LIKE_FIELDS = frozenset({
+    "source_groups", "destination_groups", "services", "scope", "profiles",
+})
+
+# The only fields whose change cannot alter what traffic is permitted.
+COSMETIC_FIELDS = frozenset({"display_name", "description", "notes"})
+
+DRIFT_LEVELS = ("security", "cosmetic")
+
+DRIFT_HEADERS = ["status", "impact", "kind", "manager", "object", "field",
+                 "before", "after", "changed_by", "changed_at"]
+
+
+class FieldChange:
+    __slots__ = ("field", "before", "after", "kind")
+
+    def __init__(self, field, before, after, kind="changed"):
+        self.field = field
+        self.before = before
+        self.after = after
+        self.kind = kind
+
+    @property
+    def impact(self):
+        """security or cosmetic, decided by the outermost field name."""
+        root = self.field.split(".", 1)[0].split("[", 1)[0]
+        return "cosmetic" if root in COSMETIC_FIELDS else "security"
+
+    def __repr__(self):
+        return "FieldChange({!r}, {!r} -> {!r})".format(
+            self.field, self.before, self.after)
+
+
+class ObjectChange:
+    __slots__ = ("status", "path", "kind", "manager", "name", "fields",
+                 "provenance")
+
+    def __init__(self, status, path, kind, manager, name, fields=(),
+                 provenance=None):
+        self.status = status          # added | removed | modified
+        self.path = path
+        self.kind = kind
+        self.manager = manager
+        self.name = name
+        self.fields = list(fields)
+        self.provenance = provenance or {}
+
+    @property
+    def impact(self):
+        """An added or removed object is always security-relevant: it changes
+        what rules exist. A modified one inherits the worst of its fields."""
+        if self.status in ("added", "removed"):
+            return "security"
+        return ("security" if any(f.impact == "security" for f in self.fields)
+                else "cosmetic")
+
+    @property
+    def changed_by(self):
+        return self.provenance.get("_last_modified_user", "")
+
+    @property
+    def changed_at(self):
+        return self.provenance.get("_last_modified_time", "")
+
+
+def _fmt(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    if isinstance(value, dict):
+        return "; ".join("{}={}".format(k, value[k]) for k in sorted(value))
+    return str(value)
+
+
+def _diff_set(field, before, after):
+    """Membership comparison: report what joined and what left."""
+    a, b = set(map(str, before)), set(map(str, after))
+    if a == b:
+        return []
+    changes = []
+    added, removed = sorted(b - a), sorted(a - b)
+    if added:
+        changes.append(FieldChange(field, None, added, "added"))
+    if removed:
+        changes.append(FieldChange(field, removed, None, "removed"))
+    return changes
+
+
+def _diff_sequence(field, before, after):
+    """Order-sensitive comparison, recursing into nested objects."""
+    changes = []
+    for index in range(max(len(before), len(after))):
+        item_field = "{}[{}]".format(field, index)
+        if index >= len(before):
+            changes.append(FieldChange(item_field, None, after[index], "added"))
+        elif index >= len(after):
+            changes.append(FieldChange(item_field, before[index], None,
+                                       "removed"))
+        else:
+            changes.extend(_diff_value(item_field, None, before[index],
+                                       after[index]))
+    return changes
+
+
+def _diff_value(field, key, before, after):
+    if isinstance(before, dict) and isinstance(after, dict):
+        return diff_objects(before, after, prefix=field)
+    if isinstance(before, list) and isinstance(after, list):
+        if key in SET_LIKE_FIELDS:
+            return _diff_set(field, before, after)
+        return _diff_sequence(field, before, after)
+    if before != after:
+        return [FieldChange(field, before, after, "changed")]
+    return []
+
+
+def diff_objects(before, after, prefix=""):
+    """Field-level changes between two objects, recursing into nesting."""
+    changes = []
+    for key in sorted(set(before) | set(after)):
+        field = "{}.{}".format(prefix, key) if prefix else key
+        if key not in before:
+            changes.append(FieldChange(field, None, after[key], "added"))
+        elif key not in after:
+            changes.append(FieldChange(field, before[key], None, "removed"))
+        else:
+            changes.extend(_diff_value(field, key, before[key], after[key]))
+    return changes
+
+
+def diff_snapshots(before, after):
+    """Every object that differs between two snapshots.
+
+    Unchanged objects are omitted: the caller gets counts from
+    summarise_diff() and does not need a row per identical rule.
+    """
+    old_objects = before.get("objects") or {}
+    new_objects = after.get("objects") or {}
+    new_provenance = after.get("provenance") or {}
+    old_provenance = before.get("provenance") or {}
+
+    changes = []
+    for path in sorted(set(old_objects) | set(new_objects)):
+        old = old_objects.get(path)
+        new = new_objects.get(path)
+        entry = new or old
+        name = (entry["body"].get(F_DISPLAY_NAME)
+                or entry["body"].get("id") or path)
+
+        if old is None:
+            changes.append(ObjectChange(
+                "added", path, entry["kind"], entry["manager"], name,
+                provenance=new_provenance.get(path)))
+        elif new is None:
+            changes.append(ObjectChange(
+                "removed", path, entry["kind"], entry["manager"], name,
+                provenance=old_provenance.get(path)))
+        else:
+            fields = diff_objects(old["body"], new["body"])
+            if fields:
+                changes.append(ObjectChange(
+                    "modified", path, entry["kind"], entry["manager"], name,
+                    fields=fields, provenance=new_provenance.get(path)))
+
+    # Security-relevant first, then by kind and name: the reader should meet
+    # the dangerous change before the renamed policy.
+    changes.sort(key=lambda c: (c.impact != "security", c.status, c.kind,
+                                str(c.name)))
+    return changes
+
+
+def summarise_diff(changes):
+    counts = {"added": 0, "removed": 0, "modified": 0,
+              "security": 0, "cosmetic": 0}
+    for change in changes:
+        counts[change.status] = counts.get(change.status, 0) + 1
+        counts[change.impact] = counts.get(change.impact, 0) + 1
+    return counts
+
+
+def diff_rows(changes):
+    """Export rows: one per changed field, one per added/removed object."""
+    rows = []
+    for change in changes:
+        if not change.fields:
+            rows.append([change.status, change.impact, change.kind,
+                         change.manager, change.name, "", "", "",
+                         change.changed_by, str(change.changed_at)])
+            continue
+        for field in change.fields:
+            rows.append([change.status, field.impact, change.kind,
+                         change.manager, change.name, field.field,
+                         _fmt(field.before), _fmt(field.after),
+                         change.changed_by, str(change.changed_at)])
+    return rows
+
+
+def at_impact(changes, level):
+    """Changes at or above an impact level, for --fail-on-drift."""
+    if level == "any":
+        return list(changes)
+    if level == "security":
+        return [c for c in changes if c.impact == "security"]
+    return []
 
 
 # ==========================================================================
@@ -3392,13 +3906,6 @@ def matches_everything(rule):
             and not rule.get(F_DISABLED))
 
 
-def _sequence(record):
-    try:
-        return int(record.rule.get(F_SEQUENCE_NUMBER) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def vm_resolvable(group):
     """Whether a group's criteria can be measured through the VM member API.
 
@@ -3514,7 +4021,7 @@ class HygieneContext:
             key = (record.nsx.name, record.policy_id)
             self._by_policy.setdefault(key, []).append(record)
         for key in self._by_policy:
-            self._by_policy[key].sort(key=_sequence)
+            self._by_policy[key].sort(key=rule_sequence)
 
     def earlier_siblings(self, record):
         """Rules ahead of this one in the same policy, in evaluation order."""
@@ -3763,6 +4270,62 @@ def at_or_above(findings, threshold):
         return []
     limit = SEVERITIES.index(threshold)
     return [f for f in findings if SEVERITIES.index(f.severity) <= limit]
+
+
+# ==========================================================================
+# actions/drift.py  --  Drift from the interactive menu.
+# ==========================================================================
+
+MENU_CHANGE_LIMIT = 25
+
+
+def act_drift_menu(ctx):
+    """Compare the newest snapshot against live NSX."""
+    section("CONFIGURATION DRIFT")
+    existing = list_snapshots()
+    if not existing:
+        say("  No snapshots yet.")
+        say("  Take one first: {}".format(cC("nsxctl snapshot save")))
+        return
+    newest = existing[0]
+    say("  Snapshot : {}  ({})".format(cC(newest["name"]), newest["taken"]))
+    say("  Against  : {}".format(cC("live NSX")))
+    try:
+        before = load_snapshot(newest["root"])
+        after = capture_snapshot(
+            ctx.sessions, ctx.domain,
+            with_tags=bool(before["manifest"].get("with_tags")))
+    except NsxError as e:
+        err(str(e))
+        return
+
+    changes = diff_snapshots(before, after)
+    ctx.exporter.stage("drift", DRIFT_HEADERS, diff_rows(changes))
+    hr()
+    if not changes:
+        say("  {} configuration matches the snapshot exactly.".format(
+            cBG("No drift:")))
+        return
+
+    counts = summarise_diff(changes)
+    table(["Change", "Count"],
+          [[k, str(counts[k])] for k in
+           ("added", "removed", "modified", "security", "cosmetic")
+           if counts.get(k)], indent=4)
+    for change in changes[:MENU_CHANGE_LIMIT]:
+        colour = cBR if change.impact == "security" else cD
+        who = " {}".format(cD("by " + change.changed_by)) \
+            if change.changed_by else ""
+        say("\n  {} {} {}{}".format(
+            cBY(change.status.upper()), cB(str(change.name)),
+            colour("[{}]".format(change.impact)), who))
+        for field in change.fields[:8]:
+            say("      {}: {} -> {}".format(
+                cC(field.field), cD(str(field.before)), field.after))
+    if len(changes) > MENU_CHANGE_LIMIT:
+        say("\n  {}".format(cD("... +{} more (full set in export)".format(
+            len(changes) - MENU_CHANGE_LIMIT))))
+    hr()
 
 
 # ==========================================================================
@@ -4015,6 +4578,7 @@ def menu_text(mode_str):
     8.  Parity validation (static vs dynamic)
     9.  Compliance dashboard
    15.  DFW rule hygiene                       {hyg}
+   16.  Drift since last snapshot              {dft}
 
   {ops}
   {d}
@@ -4032,7 +4596,8 @@ def menu_text(mode_str):
            bulk=cB("BULK & ANALYSIS"), ops=cB("OPERATIONS"),
            audit=cD("(audit logged)"), dry=cD("(dry-run first)"),
            rl=cD("(any member type, deduped)"),
-           hyg=cD("(any-any, shadowed, unused, broken refs)"))
+           hyg=cD("(any-any, shadowed, unused, broken refs)"),
+           dft=cD("(what changed, and who changed it)"))
 
 
 def select_managers(sessions, allow_roles, allow_all=False, label=""):
@@ -4180,6 +4745,10 @@ def interactive(ctx):
 
             elif c == "15":
                 act_hygiene(ctx.sessions, ctx.domain, ctx.exporter)
+                offer_export(ctx.exporter)
+
+            elif c == "16":
+                act_drift_menu(ctx)
                 offer_export(ctx.exporter)
 
             elif c == "10":
@@ -4334,6 +4903,7 @@ def build_parser():
     pass
     pass
     pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -4351,7 +4921,8 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     parents = [global_parent]
     for register in (register_setup, register_group, register_tag,
-                     register_rule, register_analysis, register_shell):
+                     register_rule, register_analysis, register_snapshot,
+                     register_shell):
         register(sub, parents)
     return parser
 
@@ -5011,6 +5582,257 @@ def cmd_audit_undo(args, ctx):
     act_audit_log(ctx.audit, ctx.sessions, write_enabled=True,
                   exporter=ctx.exporter, limit=args.limit)
     return 0
+
+
+# ==========================================================================
+# commands/snapshot.py  --  Snapshot and drift: `nsxctl snapshot ...` and `nsxctl drift`.
+# ==========================================================================
+
+CONSOLE_CHANGE_LIMIT = 40
+IMPACT_COLOUR = {"security": cBR, "cosmetic": cD}
+STATUS_COLOUR = {"added": cBG, "removed": cBR, "modified": cBY}
+# "policies".rstrip("s") gives "policie"; spell the singulars out.
+KIND_LABEL = {"groups": "group", "policies": "policy", "rules": "rule",
+              "tags": "tags"}
+
+
+def register_snapshot(sub, parents):
+    p = add_command(
+        sub, parents, "snapshot",
+        "Capture and compare NSX configuration.",
+        description="Snapshots are written as a directory of one JSON file "
+                    "per object, with volatile fields stripped -- so `git "
+                    "diff` on the tree shows real configuration changes and "
+                    "nothing else.")
+    ssub = p.add_subparsers(dest="snapshot_action", metavar="<action>")
+
+    save = ssub.add_parser(
+        "save", parents=parents, help="Capture the current configuration.",
+        description="Read groups, policies and rules across every connected "
+                    "manager and write them as a snapshot.",
+        epilog="examples:\n"
+               "  nsxctl snapshot save\n"
+               "  nsxctl snapshot save approved-2026-Q1\n"
+               "  nsxctl snapshot save --with-tags")
+    save.add_argument("name", nargs="?",
+                      help="Snapshot name (default: domain plus timestamp).")
+    save.add_argument("--with-tags", action="store_true",
+                      help="Also capture VM tags. Off by default because "
+                           "retagging is routine churn that would bury a "
+                           "real rule change.")
+    save.add_argument("--snapshot-dir", metavar="DIR",
+                      help="Where snapshots live (default: {}).".format(
+                          DEFAULT_SNAPSHOT_DIR))
+    save.set_defaults(func=cmd_snapshot_save)
+
+    ls = ssub.add_parser("list", parents=parents,
+                         help="List the snapshots taken so far.")
+    ls.add_argument("--snapshot-dir", metavar="DIR")
+    ls.set_defaults(func=cmd_snapshot_list, needs_inventory=False,
+                    needs_sessions=False)
+
+    show = ssub.add_parser("show", parents=parents,
+                           help="Show one snapshot's manifest.")
+    show.add_argument("name")
+    show.add_argument("--snapshot-dir", metavar="DIR")
+    show.set_defaults(func=cmd_snapshot_show, needs_inventory=False,
+                      needs_sessions=False)
+
+    diff = ssub.add_parser(
+        "diff", parents=parents, help="Compare two snapshots.",
+        description="Compare two stored snapshots. Neither needs a live NSX.",
+        epilog="example:\n  nsxctl snapshot diff approved current")
+    diff.add_argument("before")
+    diff.add_argument("after")
+    diff.add_argument("--snapshot-dir", metavar="DIR")
+    diff.add_argument("--fail-on-drift", choices=("security", "any"),
+                      metavar="LEVEL",
+                      help="Exit 1 when changes at this level exist "
+                           "(security | any).")
+    diff.set_defaults(func=cmd_snapshot_diff, needs_inventory=False,
+                      needs_sessions=False)
+
+    p.set_defaults(func=_snapshot_needs_action)
+
+    d = add_command(
+        sub, parents, "drift",
+        "Has anything changed since the last snapshot?",
+        description="Compare a snapshot against live NSX. With no name, uses "
+                    "the most recent snapshot.\n\n"
+                    "Changes are classified security or cosmetic, so a "
+                    "scheduled check can stay quiet about a renamed policy "
+                    "and be loud about a new any-any rule.",
+        epilog="examples:\n"
+               "  nsxctl drift\n"
+               "  nsxctl drift approved-2026-Q1\n"
+               "  nsxctl drift --fail-on-drift security   # for cron\n"
+               "  nsxctl drift --out-html drift.html")
+    d.add_argument("name", nargs="?",
+                   help="Snapshot to compare against (default: newest).")
+    d.add_argument("--snapshot-dir", metavar="DIR")
+    d.add_argument("--fail-on-drift", choices=("security", "any"),
+                   metavar="LEVEL",
+                   help="Exit 1 when changes at this level exist "
+                        "(security | any).")
+    d.set_defaults(func=cmd_drift)
+
+
+def _snapshot_needs_action(args, ctx):
+    err("Specify what to do: nsxctl snapshot save|list|show|diff")
+    return 2
+
+
+def _snapshot_dir(args):
+    return getattr(args, "snapshot_dir", None) or DEFAULT_SNAPSHOT_DIR
+
+
+# === save / list / show ===
+def cmd_snapshot_save(args, ctx):
+    section("CAPTURE CONFIGURATION SNAPSHOT")
+    snapshot = capture_snapshot(ctx.sessions, args.domain,
+                                with_tags=args.with_tags)
+    root = save_snapshot(snapshot, args.name, root_dir=_snapshot_dir(args))
+    describe_snapshot(snapshot)
+    ok_msg("Snapshot: {}".format(root))
+    say("\n  {} check for changes later with:".format(cD("next:")))
+    say("    {}".format(cC("nsxctl drift")))
+    return 0
+
+
+def cmd_snapshot_list(args, ctx):
+    found = list_snapshots(_snapshot_dir(args))
+    section("SNAPSHOTS")
+    if not found:
+        say("  None yet in {}.".format(_snapshot_dir(args)))
+        say("  Take one with: {}".format(cC("nsxctl snapshot save")))
+        return 0
+    table(["Name", "Taken", "Domain", "Objects"],
+          [[cC(item["name"]), item["taken"], item["domain"],
+            ", ".join("{} {}".format(v, k)
+                      for k, v in sorted(item["counts"].items()) if v)]
+           for item in found])
+    return 0
+
+
+def cmd_snapshot_show(args, ctx):
+    root = resolve_snapshot(args.name, _snapshot_dir(args))
+    snapshot = load_snapshot(root)
+    section("SNAPSHOT {}".format(snapshot["manifest"].get("name", args.name)))
+    say("  Root     : {}".format(root))
+    describe_snapshot(snapshot)
+    return 0
+
+
+# === diff / drift ===
+def cmd_snapshot_diff(args, ctx):
+    directory = _snapshot_dir(args)
+    before = load_snapshot(resolve_snapshot(args.before, directory))
+    after = load_snapshot(resolve_snapshot(args.after, directory))
+    section("SNAPSHOT DIFF")
+    say("  Before : {}  ({})".format(args.before,
+                                     before["manifest"].get("taken", "?")))
+    say("  After  : {}  ({})".format(args.after,
+                                     after["manifest"].get("taken", "?")))
+    return _report(args, ctx, before, after)
+
+
+def cmd_drift(args, ctx):
+    directory = _snapshot_dir(args)
+    root = resolve_snapshot(args.name, directory)
+    before = load_snapshot(root)
+    section("CONFIGURATION DRIFT")
+    say("  Snapshot : {}  ({})".format(
+        os.path.basename(root), before["manifest"].get("taken", "?")))
+    say("  Against  : {}".format(cC("live NSX")))
+    # The "after" side is captured in memory rather than written, so a drift
+    # check never leaves a snapshot behind as a side effect.
+    after = capture_snapshot(
+        ctx.sessions, args.domain,
+        with_tags=bool(before["manifest"].get("with_tags")))
+    return _report(args, ctx, before, after)
+
+
+def _report(args, ctx, before, after):
+    changes = diff_snapshots(before, after)
+    counts = summarise_diff(changes)
+    ctx.exporter.stage("drift", DRIFT_HEADERS, diff_rows(changes))
+    hr()
+
+    if not changes:
+        say("  {} configuration matches the snapshot exactly.".format(
+            cBG("No drift:")))
+        return 0
+
+    table(["Change", "Count"],
+          [[STATUS_COLOUR.get(k, cD)(k), str(counts[k])]
+           for k in ("added", "removed", "modified") if counts.get(k)]
+          + [[IMPACT_COLOUR.get(k, cD)(k), str(counts[k])]
+             for k in ("security", "cosmetic") if counts.get(k)], indent=4)
+
+    for change in changes[:CONSOLE_CHANGE_LIMIT]:
+        who = ""
+        if change.changed_by:
+            who = "   {}".format(cD("by {}".format(change.changed_by)))
+        say("\n  {} {} {} {}{}".format(
+            STATUS_COLOUR.get(change.status, cD)(change.status.upper()),
+            cD(KIND_LABEL.get(change.kind, change.kind)), cB(str(change.name)),
+            IMPACT_COLOUR.get(change.impact, cD)("[{}]".format(change.impact)),
+            who))
+        for field in change.fields[:12]:
+            if field.kind == "added":
+                say("      {} {}".format(cG("+"), _line(field.field,
+                                                        field.after)))
+            elif field.kind == "removed":
+                say("      {} {}".format(cBR("-"), _line(field.field,
+                                                         field.before)))
+            else:
+                say("      {}: {} -> {}".format(
+                    cC(field.field), cD(_short(field.before)),
+                    _short(field.after)))
+        if len(change.fields) > 12:
+            say("      {}".format(cD("... +{} more field(s)".format(
+                len(change.fields) - 12))))
+    if len(changes) > CONSOLE_CHANGE_LIMIT:
+        say("\n  {}".format(cD("... +{} more object(s) (full set in "
+                               "export)".format(
+                                   len(changes) - CONSOLE_CHANGE_LIMIT))))
+
+    if args.out_html:
+        path = write_report(
+            args.out_html, "Configuration Drift",
+            "{} object(s) changed".format(len(changes)),
+            notes=[
+                "Volatile fields (revision, timestamps, realization ids) are "
+                "stripped before comparison, so everything listed here is a "
+                "real configuration change.",
+                "security means the change can alter what traffic is "
+                "permitted. cosmetic means only a name, description or note "
+                "changed.",
+            ],
+            tiles=[(k, counts.get(k, 0))
+                   for k in ("added", "removed", "modified", "security")],
+            sections=[("Changes", DRIFT_HEADERS, diff_rows(changes))])
+        ok_msg("HTML report: {}".format(path))
+
+    hr()
+    if args.fail_on_drift:
+        blocking = at_impact(changes, args.fail_on_drift)
+        if blocking:
+            say("  {} {} change(s) at level '{}'.".format(
+                cBR("DRIFT:"), len(blocking), args.fail_on_drift))
+            return 1
+        say("  {} no changes at level '{}'.".format(
+            cBG("PASS:"), args.fail_on_drift))
+    return 0
+
+
+def _short(value, limit=60):
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _line(field, value):
+    return "{}: {}".format(field, _short(value))
 
 
 # ==========================================================================

@@ -42,6 +42,11 @@ nsxctl tag edit VM                      interactive add/remove
 nsxctl tag apply FILE.csv               bulk change (dry run by default)
 nsxctl tag ticket FILE.csv              change-plan document, validated against live NSX
 
+nsxctl snapshot save [NAME]             capture the current configuration
+nsxctl snapshot list | show NAME
+nsxctl snapshot diff BEFORE AFTER       compare two snapshots
+nsxctl drift [NAME]                     what changed since the snapshot, and who
+
 nsxctl impact VM                        what breaks if I change this VM
 nsxctl parity STATIC DYNAMIC            static vs dynamic group migration progress
 nsxctl compliance                       tagging posture across every Local Manager
@@ -94,6 +99,64 @@ says why. Two things this report deliberately will not claim:
 Shadow detection does no port or CIDR arithmetic, so it cannot produce a false
 "unreachable". It only flags what is provable: an exact-duplicate match key,
 or a rule sitting below one that matches everything.
+
+### Config snapshots and drift
+
+```bash
+nsxctl snapshot save approved     # capture groups, policies and rules
+# ... a week, and someone edits a rule in the UI ...
+nsxctl drift                      # what changed, and who changed it
+```
+
+```
+MODIFIED rule https [security]   by dave
+    + destination_groups: ['ANY']
+    - destination_groups: ['/infra/domains/default/groups/g-web']
+MODIFIED policy Perimeter (edited) [cosmetic]   by dave
+    display_name: Perimeter -> Perimeter (edited)
+```
+
+Changes are classified **security** (can alter what traffic is permitted) or
+**cosmetic** (only a name, description or note), so a scheduled check stays
+quiet about a rename and is loud about a new any-any rule:
+
+```bash
+nsxctl drift --fail-on-drift security     # exit 1 only on real changes
+nsxctl snapshot diff approved current --out-html drift.html
+```
+
+`nsxctl snapshot diff` needs no live NSX — it compares two stored snapshots.
+
+**The tree is config-as-code.** One JSON file per object, sorted keys, volatile
+fields stripped, so ordinary tools work on it:
+
+```
+approved/
+  manifest.json
+  groups/lm-london/g-web.json
+  policies/lm-london/p1/_policy.json
+  policies/lm-london/p1/rules/https.json
+```
+
+```bash
+git diff --no-index snapshots/approved snapshots/current
+```
+
+Two details that make this work rather than merely look like it works:
+
+- **Volatile fields never reach the object files.** `_revision`,
+  `_last_modified_time`, `realization_id` and friends change when nothing real
+  changed; left in, every diff would be noise. They ride in the manifest
+  instead, which is where `--out-html` and the console get *who changed it*.
+- **`source_groups` compares as a set; `expression` compares in order.**
+  Membership is what matters for the first, but group criteria are
+  `Condition AND Condition` — reordering them changes which workloads match.
+  Anything unrecognised is compared in order and treated as security-relevant,
+  because a false "changed" costs a second look and a missed one costs an
+  incident.
+
+VM tags are excluded unless you pass `--with-tags`: retagging is routine churn
+that would bury a real rule change.
 
 ### Proving a rule is unused
 
@@ -327,6 +390,7 @@ src/nsx_toolkit/
   taxonomy.py config.py creds.py            configuration
   http.py                                   transport, retry, auth, VM index
   audit.py export.py render.py              cross-cutting services
+  policy.py snapshot.py diff.py             traversal, capture, comparison
   actions/                                  one module per operation
   commands/                                 the nsxctl command tree
   legacy.py                                 pre-4.0 flag translation

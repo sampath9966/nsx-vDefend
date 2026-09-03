@@ -56,10 +56,12 @@ class FakeState:
     def add_group(self, gid, display_name=None, origin="LM", expression=None,
                   members=()):
         prefix = "/global-infra" if origin == "GM" else "/infra"
+        path = "{}/domains/default/groups/{}".format(prefix, gid)
         group = {"id": gid,
                  "display_name": display_name or gid,
-                 "path": "{}/domains/default/groups/{}".format(prefix, gid),
+                 "path": path,
                  "expression": expression or []}
+        group.update(_meta(path))
         self.groups.append(group)
         self.group_members[gid] = list(members)
         return group
@@ -74,9 +76,11 @@ class FakeState:
 
     def add_policy(self, pid, display_name=None, origin="LM"):
         prefix = "/global-infra" if origin == "GM" else "/infra"
+        path = "{}/domains/default/security-policies/{}".format(prefix, pid)
         pol = {"id": pid,
                "display_name": display_name or pid,
-               "path": "{}/domains/default/security-policies/{}".format(prefix, pid)}
+               "path": path}
+        pol.update(_meta(path))
         self.policies.append(pol)
         self.rules.setdefault(pid, [])
         return pol
@@ -101,8 +105,37 @@ class FakeState:
                 "direction": direction,
                 "sequence_number": (sequence_number if sequence_number
                                     is not None else (len(existing) + 1) * 10)}
+        rule.update(_meta(rule["path"]))
         existing.append(rule)
         return rule
+
+    def touch(self, kind, oid, user="someone-else", pid=None, **changes):
+        """Mutate an object the way a person editing in the NSX UI would.
+
+        Applies the changes, bumps _revision and updates the modified
+        timestamp and user -- so drift has something real to detect, and the
+        report has someone real to attribute it to.
+        """
+        target = None
+        if kind == "group":
+            target = next((g for g in self.groups if g["id"] == oid), None)
+        elif kind == "policy":
+            target = next((p for p in self.policies if p["id"] == oid), None)
+        elif kind == "rule":
+            for policy_id, rules in self.rules.items():
+                if pid and policy_id != pid:
+                    continue
+                target = next((r for r in rules if r["id"] == oid), None)
+                if target:
+                    break
+        if target is None:
+            raise KeyError("no such {}: {}".format(kind, oid))
+        target.update(changes)
+        target["_revision"] = target.get("_revision", 0) + 1
+        target["_last_modified_time"] = target.get(
+            "_last_modified_time", 1700000000000) + 60000
+        target["_last_modified_user"] = user
+        return target
 
     def set_hit_count(self, pid, rid, hits, last_update=1700000000000):
         """Drive the hit-count and baseline checks."""
@@ -116,6 +149,38 @@ class FakeState:
 
     def count(self, fragment):
         return sum(1 for entry in self.request_log if fragment in entry)
+
+
+_META_COUNTER = [0]
+
+
+def _meta(path, user="admin", revision=0, created=1700000000000,
+          modified=1700000000000):
+    """Realization and audit fields NSX attaches to every policy object.
+
+    These change on every write -- and some on every read -- so the snapshot
+    normaliser must strip them. They exist in the fake precisely so that
+    stripping is tested rather than assumed.
+    """
+    _META_COUNTER[0] += 1
+    unique = "{:08x}-0000-0000-0000-{:012x}".format(
+        _META_COUNTER[0], _META_COUNTER[0])
+    parent = path.rsplit("/", 1)[0] if "/" in path else ""
+    return {
+        "_revision": revision,
+        "_create_time": created,
+        "_create_user": user,
+        "_last_modified_time": modified,
+        "_last_modified_user": user,
+        "_system_owned": False,
+        "_protection": "NOT_PROTECTED",
+        "realization_id": unique,
+        "unique_id": unique,
+        "parent_path": parent,
+        "relative_path": path.rsplit("/", 1)[-1],
+        "marked_for_delete": False,
+        "overridden": False,
+    }
 
 
 def _page(items, query):
