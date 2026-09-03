@@ -37,6 +37,7 @@ MODULES = [
     "audit.py",
     "export.py",
     "render.py",
+    "policy.py",
     "actions/groups.py",
     "actions/verify.py",
     "actions/dashboard.py",

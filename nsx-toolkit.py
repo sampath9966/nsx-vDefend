@@ -1712,6 +1712,152 @@ def criteria_summary(expr, parts=3):
 
 
 # ==========================================================================
+# policy.py  --  Shared security-policy and rule traversal.
+# ==========================================================================
+
+class RuleRecord:
+    """One DFW rule, with the manager and policy it was read from."""
+
+    __slots__ = ("nsx", "policy", "rule", "origin")
+
+    def __init__(self, nsx, policy, rule, origin):
+        self.nsx = nsx
+        self.policy = policy
+        self.rule = rule
+        self.origin = origin
+
+    @property
+    def policy_id(self):
+        return self.policy.get(F_ID, "?")
+
+    @property
+    def policy_name(self):
+        return self.policy.get(F_DISPLAY_NAME, self.policy_id)
+
+    @property
+    def rule_id(self):
+        return self.rule.get(F_ID, "?")
+
+    @property
+    def rule_name(self):
+        return self.rule.get(F_DISPLAY_NAME, self.rule_id)
+
+    @property
+    def path(self):
+        return self.rule.get(F_PATH, "")
+
+    def group_refs(self):
+        """Every group path this rule mentions, in any position."""
+        return set(self.rule.get(F_SOURCE_GROUPS, [])
+                   + self.rule.get(F_DEST_GROUPS, [])
+                   + self.rule.get(F_SCOPE, []))
+
+    def directions_for(self, group_paths):
+        """Which positions of the rule reference the given groups."""
+        dirs = []
+        if set(self.rule.get(F_SOURCE_GROUPS, [])) & group_paths:
+            dirs.append("source")
+        if set(self.rule.get(F_DEST_GROUPS, [])) & group_paths:
+            dirs.append("dest")
+        if set(self.rule.get(F_SCOPE, [])) & group_paths:
+            dirs.append("applied_to")
+        return dirs
+
+
+def fetch_rules_for(nsx, domain, policies):
+    """Rules for every policy on one manager, fetched concurrently.
+
+    Serially this was an N+1: one round trip per policy per manager, so eight
+    LMs with 200 policies each meant 1,600 sequential requests.
+    """
+    if not policies:
+        return []
+    results = parallel_run(
+        policies,
+        lambda pol: nsx.get_all(p_sec_rules(nsx.base(domain), domain,
+                                            pol.get(F_ID, "?"))),
+        label="Rules on {}".format(nsx.name),
+        key=lambda pol: pol.get(F_ID, "?"))
+    out = []
+    for pol in policies:
+        rules = results.get(pol.get(F_ID, "?"))
+        if isinstance(rules, Exception):
+            continue
+        for rule in (rules or []):
+            out.append((pol, rule))
+    return out
+
+
+def policies_for(nsx, domain):
+    """Security policies on one manager, or [] when it cannot be reached."""
+    try:
+        base = nsx.base(domain)
+    except NsxError:
+        return []
+    with Spinner("Policies on {}".format(nsx.name)):
+        try:
+            return nsx.get_all(p_sec_policies(base, domain))
+        except NsxError:
+            return []
+
+
+def ordered_sessions(sessions):
+    """Global Managers first. The dedup below depends on this order."""
+    gm = [s for s in sessions if s.role == ROLE_GM]
+    lm = [s for s in sessions if s.role == ROLE_LM]
+    return gm, lm
+
+
+def sweep_rules(sessions, domain):
+    """Every DFW rule across every manager, deduplicated by rule path.
+
+    A rule with no path is never deduplicated -- we cannot prove two such
+    rules are the same object, and silently dropping one would under-report.
+    """
+    gm_sessions, lm_sessions = ordered_sessions(sessions)
+    seen_paths = set()
+    records = []
+    for nsx in gm_sessions + lm_sessions:
+        policies = policies_for(nsx, domain)
+        for policy, rule in fetch_rules_for(nsx, domain, policies):
+            path = rule.get(F_PATH, "")
+            if path:
+                if path in seen_paths:
+                    continue
+                seen_paths.add(path)
+            if nsx.role == ROLE_GM:
+                origin = "GM"
+            else:
+                origin = origin_of_path(path)
+                if origin == "GM" and not gm_sessions:
+                    origin = "GM (via LM)"
+            records.append(RuleRecord(nsx, policy, rule, origin))
+    return records
+
+
+def group_inventory(sessions, domain):
+    """{group path: (nsx, group)} across every manager, GM first.
+
+    Used to tell "this rule references a group that does not exist" apart from
+    "this rule references a group that exists but is empty" -- two findings
+    with very different meanings.
+    """
+    gm_sessions, lm_sessions = ordered_sessions(sessions)
+    by_path = {}
+    for nsx in gm_sessions + lm_sessions:
+        try:
+            base = nsx.base(domain)
+            groups = nsx.get_all(p_groups(base, domain))
+        except NsxError:
+            continue
+        for group in groups:
+            path = group.get(F_PATH, "")
+            if path and path not in by_path:
+                by_path[path] = (nsx, group)
+    return by_path
+
+
+# ==========================================================================
 # actions/groups.py  --  Group search: criteria, and optionally VM members.
 # ==========================================================================
 
@@ -2384,30 +2530,6 @@ def _collect_associations(nsx, domain, ext_id):
                        params={PARAM_VM_EXTERNAL_ID: ext_id})
 
 
-def _fetch_rules(nsx, domain, policies):
-    """Rules for every policy on one manager, fetched concurrently.
-
-    Serially this was an N+1: one round trip per policy per manager, so eight
-    LMs with 200 policies each meant 1,600 sequential requests.
-    """
-    if not policies:
-        return []
-    results = parallel_run(
-        policies,
-        lambda pol: nsx.get_all(p_sec_rules(nsx.base(domain), domain,
-                                            pol.get(F_ID, "?"))),
-        label="Rules on {}".format(nsx.name),
-        key=lambda pol: pol.get(F_ID, "?"))
-    out = []
-    for pol in policies:
-        rules = results.get(pol.get(F_ID, "?"))
-        if isinstance(rules, Exception):
-            continue
-        for rule in (rules or []):
-            out.append((pol, rule))
-    return out
-
-
 def act_reverse_lookup(all_sessions, needle, domain, exporter):
     """VM -> groups -> DFW rules impact analysis.
 
@@ -2511,58 +2633,27 @@ def act_reverse_lookup(all_sessions, needle, domain, exporter):
     section("DFW Rules Referencing These Groups")
     say("  Scanning {} GM + {} LM ({}) ...".format(
         len(gm_sessions), len(lm_sessions), cD("deduped by rule path")))
-    seen_rule_paths, hit_count = set(), 0
-    for nsx in gm_sessions + lm_sessions:
-        try:
-            base = nsx.base(domain)
-        except NsxError:
+    hit_count = 0
+    for record in sweep_rules(all_sessions, domain):
+        hits = record.group_refs() & group_paths
+        if not hits:
             continue
-        with Spinner("Policies on {}".format(nsx.name)):
-            try:
-                policies = nsx.get_all(p_sec_policies(base, domain))
-            except NsxError:
-                continue
-        for pol, rule in _fetch_rules(nsx, domain, policies):
-            pid = pol.get(F_ID, "?")
-            rpath = rule.get(F_PATH, "")
-            refs = set(rule.get(F_SOURCE_GROUPS, [])
-                       + rule.get(F_DEST_GROUPS, [])
-                       + rule.get(F_SCOPE, []))
-            hits = refs & group_paths
-            if not hits:
-                continue
-            if rpath:
-                if rpath in seen_rule_paths:
-                    continue   # already reported via GM (or an earlier LM)
-                seen_rule_paths.add(rpath)
-            hit_count += 1
-            dirs = []
-            if set(rule.get(F_SOURCE_GROUPS, [])) & group_paths:
-                dirs.append("source")
-            if set(rule.get(F_DEST_GROUPS, [])) & group_paths:
-                dirs.append("dest")
-            if set(rule.get(F_SCOPE, [])) & group_paths:
-                dirs.append("applied_to")
-            act = rule.get(F_ACTION_FIELD, "?")
-            colour = cG if act == "ALLOW" else cR
-            role_lbl = ROLE_LABEL.get(nsx.role, "?")
-            if nsx.role == ROLE_GM:
-                rule_origin = "GM"
-            else:
-                rule_origin = origin_of_path(rpath)
-                if rule_origin == "GM" and not gm_sessions:
-                    rule_origin = "GM (via LM)"
-            say("    [{} / {} / {}]  {} / {}   {}   {}".format(
-                cC(nsx.name), cD(role_lbl), cD(rule_origin),
-                cB(pol.get(F_DISPLAY_NAME, pid)), rule.get(F_DISPLAY_NAME, "?"),
-                colour(act), cC(", ".join(dirs))))
-            for gpath in hits:
-                gi = group_id_from_path(gpath)
-                _, _, gorigin = matched.get(gi, (None, None, "?"))
-                rows.append([vname, nsx.name, role_lbl, gi,
-                             group_lookup.get(gi, gi), gorigin, pid,
-                             rule.get(F_ID, "?"), rule_origin, act,
-                             ", ".join(dirs)])
+        hit_count += 1
+        dirs = record.directions_for(group_paths)
+        act = record.rule.get(F_ACTION_FIELD, "?")
+        colour = cG if act == "ALLOW" else cR
+        role_lbl = ROLE_LABEL.get(record.nsx.role, "?")
+        say("    [{} / {} / {}]  {} / {}   {}   {}".format(
+            cC(record.nsx.name), cD(role_lbl), cD(record.origin),
+            cB(record.policy_name), record.rule_name,
+            colour(act), cC(", ".join(dirs))))
+        for gpath in hits:
+            gi = group_id_from_path(gpath)
+            _, _, gorigin = matched.get(gi, (None, None, "?"))
+            rows.append([vname, record.nsx.name, role_lbl, gi,
+                         group_lookup.get(gi, gi), gorigin, record.policy_id,
+                         record.rule_id, record.origin, act,
+                         ", ".join(dirs)])
     if hit_count == 0:
         say("  {} reference these groups on any manager.".format(cG("No DFW rules")))
     hr()
