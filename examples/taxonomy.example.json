@@ -1,0 +1,20 @@
+{
+  "_comment": "Tag taxonomy. Save as taxonomy.json next to inventory.json, or pass --taxonomy <path>. Values shown here are the built-in default; replace them with your own scheme.",
+
+  "format": "^[a-z0-9][a-z0-9\\-]*$",
+  "allow_unknown_scopes": false,
+
+  "scopes": {
+    "tenant":      { "required": true },
+    "app":         { "required": true },
+    "env":         { "required": true, "values": ["prod", "uat", "dev", "staging", "dr"] },
+    "tier":        { "required": true, "values": ["web", "app", "db", "mgmt", "dmz"] },
+    "site":        { "required": true },
+    "server":      { "required": true },
+
+    "owner":       { "required": false },
+    "criticality": { "required": false, "values": ["critical", "high", "medium", "low"] },
+    "data-class":  { "required": false },
+    "managed-by":  { "required": false }
+  }
+}
