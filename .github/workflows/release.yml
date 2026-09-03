@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify before releasing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+      - run: ruff check src tests tools
+      - name: Generated single file must match the package
+        run: python tools/build_single_file.py --check
+
+  binaries:
+    name: ${{ matrix.os }} binary
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: nsxctl-linux-x86_64
+          - os: macos-latest
+            asset: nsxctl-macos-arm64
+          - os: windows-latest
+            asset: nsxctl-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyinstaller requests
+      # Built from the amalgamated single file: it has no intra-package
+      # imports, so there is no hidden-import guesswork for PyInstaller.
+      - name: Build
+        run: pyinstaller --onefile --name nsxctl nsx-toolkit.py
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then bin=dist/nsxctl.exe; else bin=dist/nsxctl; fi
+          "$bin" version
+          "$bin" --help > /dev/null
+          "$bin" completion bash > /dev/null
+      - name: Name the asset
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mv dist/nsxctl.exe "dist/${{ matrix.asset }}"
+          else
+            mv dist/nsxctl "dist/${{ matrix.asset }}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
+  distributions:
+    name: sdist + wheel
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [binaries, distributions]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted Publishing: an OIDC token, so there is no long-lived API token
+      # sitting in repository secrets.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: Attach binaries to the release
+    needs: [binaries, distributions]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Collect assets
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name 'nsxctl-*' -o -name '*.whl' -o -name '*.tar.gz' \) \
+            -exec cp {} release/ \;
+          cp nsx-toolkit.py release/nsx-toolkit.py
+          ls -la release/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```bash
+            pipx install nsxctl        # recommended
+            pip install --user nsxctl
+            ```
+
+            Or download a standalone binary below — no Python needed.
+
+            Or grab `nsx-toolkit.py` and run it directly; it needs no
+            installation and no third-party packages.

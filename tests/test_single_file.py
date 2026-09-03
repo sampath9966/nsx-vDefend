@@ -49,14 +49,28 @@ def test_single_file_runs_standalone():
     assert "NSX Toolkit" in result.stdout
 
 
-def test_single_file_help_lists_the_key_flags():
+def test_single_file_help_lists_the_commands():
     result = subprocess.run(
         [sys.executable, SINGLE, "--help"],
         capture_output=True, text=True, cwd=ROOT)
     assert result.returncode == 0
-    for flag in ("--init", "--dashboard", "--bulk-tag", "--taxonomy",
-                 "--reverse-lookup", "--yes", "--debug"):
+    for command in ("init", "status", "group", "tag", "rule", "impact",
+                    "parity", "compliance", "audit", "completion"):
+        assert command in result.stdout
+    for flag in ("--taxonomy", "--yes", "--debug", "--json"):
         assert flag in result.stdout
+
+
+def test_every_command_has_its_own_help():
+    """`nsxctl <command> --help` must work for all of them, not just the root."""
+    for command in ("init", "status", "managers", "login", "config", "group",
+                    "tag", "rule", "impact", "parity", "compliance", "audit",
+                    "menu", "completion", "version"):
+        result = subprocess.run(
+            [sys.executable, SINGLE, command, "--help"],
+            capture_output=True, text=True, cwd=ROOT)
+        assert result.returncode == 0, "{}: {}".format(command, result.stderr)
+        assert "usage: nsxctl {}".format(command) in result.stdout
 
 
 def test_first_run_without_an_inventory_gives_guidance_not_a_bare_error(tmp_path):

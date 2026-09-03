@@ -41,12 +41,13 @@ jobs:
       - name: The single file must run with nothing installed
         run: |
           python -c "import requests" && exit 1 || echo "requests absent, as intended"
-          python nsx-toolkit.py --version
+          python nsx-toolkit.py version
           python nsx-toolkit.py --help > /dev/null
+          python nsx-toolkit.py completion bash > /dev/null
       - name: First run must guide, not crash
         run: |
           set +e
-          out=$(cd "$(mktemp -d)" && HOME=$PWD python "$GITHUB_WORKSPACE/nsx-toolkit.py" --dashboard --non-interactive 2>&1)
+          out=$(cd "$(mktemp -d)" && HOME=$PWD python "$GITHUB_WORKSPACE/nsx-toolkit.py" compliance --non-interactive 2>&1)
           code=$?
           set -e
           echo "$out"

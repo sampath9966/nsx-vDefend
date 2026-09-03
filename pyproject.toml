@@ -3,16 +3,23 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nsx-toolkit"
-version = "3.0.0"
-description = "NSX Zero Trust Segmentation Toolkit -- groups, tags and DFW analysis across GM and LMs"
+name = "nsxctl"
+version = "4.0.0"
+description = "NSX groups, tags and distributed firewall from the command line, across a Global Manager and every Local Manager"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
+keywords = ["nsx", "vmware", "firewall", "dfw", "segmentation", "networking"]
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Networking",
     "Topic :: System :: Systems Administration",
 ]
@@ -28,7 +35,13 @@ keyring = ["keyring>=23"]
 yaml = ["pyyaml>=5"]
 dev = ["pytest>=7", "ruff>=0.5", "requests>=2.20"]
 
+[project.urls]
+Homepage = "https://github.com/sampath9966/nsx-vDefend"
+Issues = "https://github.com/sampath9966/nsx-vDefend/issues"
+
 [project.scripts]
+nsxctl = "nsx_toolkit.cli:entry"
+# Continuity alias for anyone who installed the 3.x package.
 nsx-toolkit = "nsx_toolkit.cli:entry"
 
 [tool.setuptools.packages.find]

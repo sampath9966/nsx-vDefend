@@ -48,6 +48,14 @@ MODULES = [
     "actions/audit_view.py",
     "wizard.py",
     "menu.py",
+    "commands/__init__.py",
+    "commands/setup.py",
+    "commands/group.py",
+    "commands/tag.py",
+    "commands/rule.py",
+    "commands/analysis.py",
+    "commands/shell.py",
+    "legacy.py",
     "cli.py",
 ]
 
@@ -110,6 +118,31 @@ def split_module(path):
             continue
         span = range(node.lineno, node.end_lineno + 1)
         if isinstance(node, ast.ImportFrom) and node.level:
+            # `from . import mod` binds a MODULE object. Stripping it leaves
+            # `mod.thing` as a NameError in the single file. The same syntax
+            # importing a name out of __init__.py is fine, so only reject the
+            # form whose target is actually one of our modules.
+            for alias in node.names:
+                if alias.asname:
+                    raise SystemExit(
+                        "{}:{}: `import {} as {}` cannot be amalgamated -- "
+                        "the alias does not exist once modules share one "
+                        "namespace.\n"
+                        "Rename the function at its definition instead, and "
+                        "import it unaliased.".format(
+                            os.path.relpath(path, PKG), node.lineno,
+                            alias.name, alias.asname))
+            if not node.module:
+                for alias in node.names:
+                    if alias.name in module_basenames():
+                        raise SystemExit(
+                            "{}:{}: `from . import {}` cannot be amalgamated "
+                            "-- it binds a module object, and the single file "
+                            "has no modules.\n"
+                            "Import the names instead: "
+                            "`from .{} import <name>`".format(
+                                os.path.relpath(path, PKG), node.lineno,
+                                alias.name, alias.name))
             for ln in span:
                 drop.add(ln)
             if node.col_offset:
@@ -141,6 +174,11 @@ def module_title(path):
     with open(path, encoding="utf-8") as f:
         doc = ast.get_docstring(ast.parse(f.read())) or ""
     return doc.strip().splitlines()[0] if doc.strip() else ""
+
+
+def module_basenames():
+    """Module names that `from . import X` could be targeting."""
+    return {os.path.splitext(os.path.basename(rel))[0] for rel in MODULES}
 
 
 def top_level_names(path):
