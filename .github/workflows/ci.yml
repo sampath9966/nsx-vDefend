@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Test
+        run: pytest -q
+
+  no-requests:
+    name: stdlib transport only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install without requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+          pip install -e .
+      - name: The single file must run with nothing installed
+        run: |
+          python -c "import requests" && exit 1 || echo "requests absent, as intended"
+          python nsx-toolkit.py version
+          python nsx-toolkit.py --help > /dev/null
+          python nsx-toolkit.py completion bash > /dev/null
+      - name: First run must guide, not crash
+        run: |
+          set +e
+          out=$(cd "$(mktemp -d)" && HOME=$PWD python "$GITHUB_WORKSPACE/nsx-toolkit.py" compliance --non-interactive 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          test "$code" = "2"
+          echo "$out" | grep -q "inventory.json"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check src tests tools
+
+  single-file:
+    name: generated file is in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python tools/build_single_file.py --check

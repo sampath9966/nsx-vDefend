@@ -1,0 +1,15 @@
+vm_name,scope,tag,action
+web-prod-01,tenant,acme,add
+web-prod-01,app,storefront,add
+web-prod-01,env,prod,add
+web-prod-01,tier,web,add
+web-prod-01,site,london,add
+web-prod-01,server,web-prod-01,add
+web-prod-01,env,dev,remove
+db-prod-01,tenant,acme,add
+db-prod-01,app,storefront,add
+db-prod-01,env,prod,add
+db-prod-01,tier,db,add
+db-prod-01,site,london,add
+db-prod-01,server,db-prod-01,add
+db-prod-01,criticality,critical,add

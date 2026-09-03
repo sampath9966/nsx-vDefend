@@ -1,0 +1,35 @@
+{
+  "managers": [
+    {
+      "name": "gm",
+      "role": "gm",
+      "host": "gm.nsx.example.com",
+      "port": 443,
+      "verify_ssl": false,
+      "auth": "session",
+      "username_env": "NSX_GM_USER",
+      "password_env": "NSX_GM_PASS"
+    },
+    {
+      "name": "lm-london",
+      "role": "lm",
+      "host": "lm-lon.nsx.example.com",
+      "port": 443,
+      "verify_ssl": true,
+      "ca_bundle": "/etc/pki/tls/certs/corp-ca.pem",
+      "auth": "session",
+      "timeout": 30,
+      "username_env": "NSX_LM_LONDON_USER",
+      "password_env": "NSX_LM_LONDON_PASS"
+    },
+    {
+      "name": "lm-frankfurt",
+      "role": "lm",
+      "host": "lm-fra.nsx.example.com",
+      "verify_ssl": false,
+      "auth": "session",
+      "username_env": "NSX_LM_FRANKFURT_USER",
+      "password_env": "NSX_LM_FRANKFURT_PASS"
+    }
+  ]
+}
