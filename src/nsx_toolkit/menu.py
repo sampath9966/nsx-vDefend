@@ -10,6 +10,7 @@ from .actions.audit_view import act_audit_log
 from .actions.bulk import act_bulk_tag
 from .actions.change_ticket import act_change_ticket
 from .actions.dashboard import act_dashboard
+from .actions.drift import act_drift_menu
 from .actions.groups import act_groups
 from .actions.hygiene import act_hygiene
 from .actions.parity import act_parity
@@ -82,6 +83,7 @@ def menu_text(mode_str):
     8.  Parity validation (static vs dynamic)
     9.  Compliance dashboard
    15.  DFW rule hygiene                       {hyg}
+   16.  Drift since last snapshot              {dft}
 
   {ops}
   {d}
@@ -99,7 +101,8 @@ def menu_text(mode_str):
            bulk=cB("BULK & ANALYSIS"), ops=cB("OPERATIONS"),
            audit=cD("(audit logged)"), dry=cD("(dry-run first)"),
            rl=cD("(any member type, deduped)"),
-           hyg=cD("(any-any, shadowed, unused, broken refs)"))
+           hyg=cD("(any-any, shadowed, unused, broken refs)"),
+           dft=cD("(what changed, and who changed it)"))
 
 
 def select_managers(sessions, allow_roles, allow_all=False, label=""):
@@ -247,6 +250,10 @@ def interactive(ctx):
 
             elif c == "15":
                 act_hygiene(ctx.sessions, ctx.domain, ctx.exporter)
+                offer_export(ctx.exporter)
+
+            elif c == "16":
+                act_drift_menu(ctx)
                 offer_export(ctx.exporter)
 
             elif c == "10":

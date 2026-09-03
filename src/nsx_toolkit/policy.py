@@ -20,6 +20,7 @@ from .api import (
     F_ID,
     F_PATH,
     F_SCOPE,
+    F_SEQUENCE_NUMBER,
     F_SOURCE_GROUPS,
     ROLE_GM,
     ROLE_LM,
@@ -116,6 +117,15 @@ def policies_for(nsx, domain):
             return nsx.get_all(p_sec_policies(base, domain))
         except NsxError:
             return []
+
+
+def rule_sequence(record):
+    """A rule's evaluation position, as an int. NSX omits or stringifies it on
+    some versions, so this never raises."""
+    try:
+        return int(record.rule.get(F_SEQUENCE_NUMBER) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def ordered_sessions(sessions):

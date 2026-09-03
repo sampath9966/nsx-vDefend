@@ -122,6 +122,7 @@ def build_parser():
     from .rule import register_rule
     from .setup import register_setup
     from .shell import register_shell
+    from .snapshot import register_snapshot
     from .tag import register_tag
 
     global_parent = argparse.ArgumentParser(add_help=False)
@@ -140,7 +141,8 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     parents = [global_parent]
     for register in (register_setup, register_group, register_tag,
-                     register_rule, register_analysis, register_shell):
+                     register_rule, register_analysis, register_snapshot,
+                     register_shell):
         register(sub, parents)
     return parser
 

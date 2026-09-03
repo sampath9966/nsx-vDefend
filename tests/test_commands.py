@@ -368,3 +368,169 @@ def test_rule_baseline_save_reports_when_statistics_are_unsupported(env,
     fakes[0].state.stats_unsupported = True
     assert cli.main(["--inventory", inv, "rule", "baseline", "save"]) == 1
     assert "did not serve rule statistics" in capsys.readouterr().err
+
+
+# --- snapshot and drift ---------------------------------------------------
+def _snapshot_estate(fake):
+    group = fake.state.add_group("g-web", "Web", expression=[
+        {"resource_type": "Condition", "member_type": "VirtualMachine",
+         "key": "Tag", "operator": "EQUALS", "value": "env|prod"}])
+    fake.state.group_members["g-web"] = [{"display_name": "web1", "id": "1"}]
+    fake.state.add_policy("p1", "Perimeter")
+    fake.state.add_rule("p1", "https", source_groups=[group["path"]],
+                        destination_groups=[group["path"]],
+                        scope=[group["path"]], sequence_number=10)
+    return group
+
+
+def test_snapshot_save_then_list_then_show(env, tmp_path, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+
+    assert cli.main(["--inventory", inv, "snapshot", "save", "approved",
+                     "--snapshot-dir", snaps]) == 0
+    assert "approved" in capsys.readouterr().out
+
+    assert cli.main(["--inventory", inv, "snapshot", "list",
+                     "--snapshot-dir", snaps]) == 0
+    assert "approved" in capsys.readouterr().out
+
+    assert cli.main(["--inventory", inv, "snapshot", "show", "approved",
+                     "--snapshot-dir", snaps]) == 0
+    out = capsys.readouterr().out
+    assert "1 groups" in out and "1 rules" in out
+
+
+def test_drift_is_clean_when_nothing_changed(env, tmp_path, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+    cli.main(["--inventory", inv, "snapshot", "save", "approved",
+              "--snapshot-dir", snaps])
+    capsys.readouterr()
+    assert cli.main(["--inventory", inv, "drift",
+                     "--snapshot-dir", snaps]) == 0
+    assert "No drift" in capsys.readouterr().out
+
+
+def test_drift_survives_a_revision_bump_with_no_real_change(env, tmp_path,
+                                                            capsys):
+    """The end-to-end version of the load-bearing snapshot test."""
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+    cli.main(["--inventory", inv, "snapshot", "save", "approved",
+              "--snapshot-dir", snaps])
+    capsys.readouterr()
+    fakes[0].state.touch("rule", "https", pid="p1")     # metadata only
+    assert cli.main(["--inventory", inv, "drift",
+                     "--snapshot-dir", snaps]) == 0
+    assert "No drift" in capsys.readouterr().out
+
+
+def test_drift_names_the_change_and_who_made_it(env, tmp_path, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+    cli.main(["--inventory", inv, "snapshot", "save", "approved",
+              "--snapshot-dir", snaps])
+    capsys.readouterr()
+
+    fakes[0].state.touch("rule", "https", pid="p1", user="dave",
+                         destination_groups=["ANY"])
+    assert cli.main(["--inventory", inv, "drift", "--snapshot-dir", snaps,
+                     "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    rows = next(r for r in payload["results"] if r["label"] == "drift")
+    record = rows["records"][0]
+    assert record["status"] == "modified"
+    assert record["impact"] == "security"
+    assert record["field"] == "destination_groups"
+    assert record["changed_by"] == "dave"
+
+
+def test_drift_fail_on_gates_the_exit_code(env, tmp_path, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+    cli.main(["--inventory", inv, "snapshot", "save", "approved",
+              "--snapshot-dir", snaps])
+    capsys.readouterr()
+
+    # A rename is cosmetic: loud at 'any', quiet at 'security'.
+    fakes[0].state.touch("policy", "p1", display_name="Perimeter (edited)")
+    assert cli.main(["--inventory", inv, "drift", "--snapshot-dir", snaps,
+                     "--fail-on-drift", "security"]) == 0
+    assert "PASS" in capsys.readouterr().out
+    assert cli.main(["--inventory", inv, "drift", "--snapshot-dir", snaps,
+                     "--fail-on-drift", "any"]) == 1
+    assert "DRIFT" in capsys.readouterr().out
+
+
+def test_snapshot_diff_compares_two_stored_snapshots(env, tmp_path, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+    cli.main(["--inventory", inv, "snapshot", "save", "before",
+              "--snapshot-dir", snaps])
+    fakes[0].state.touch("rule", "https", pid="p1", user="erin",
+                         action="DROP")
+    cli.main(["--inventory", inv, "snapshot", "save", "after",
+              "--snapshot-dir", snaps])
+    capsys.readouterr()
+
+    assert cli.main(["--inventory", inv, "snapshot", "diff", "before",
+                     "after", "--snapshot-dir", snaps, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    rows = next(r for r in payload["results"] if r["label"] == "drift")
+    assert rows["records"][0]["field"] == "action"
+    assert rows["records"][0]["after"] == "DROP"
+
+
+def test_snapshot_diff_needs_no_live_nsx(env, tmp_path, capsys):
+    """Comparing two stored snapshots must work when NSX is unreachable."""
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+    cli.main(["--inventory", inv, "snapshot", "save", "a",
+              "--snapshot-dir", snaps])
+    cli.main(["--inventory", inv, "snapshot", "save", "b",
+              "--snapshot-dir", snaps])
+    capsys.readouterr()
+    for fake in fakes:
+        fake.stop()                       # NSX is now gone
+    assert cli.main(["--inventory", inv, "snapshot", "diff", "a", "b",
+                     "--snapshot-dir", snaps]) == 0
+    assert "No drift" in capsys.readouterr().out
+
+
+def test_drift_writes_a_self_contained_html_report(env, tmp_path, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _snapshot_estate(fakes[0])
+    snaps = str(tmp_path / "snaps")
+    cli.main(["--inventory", inv, "snapshot", "save", "approved",
+              "--snapshot-dir", snaps])
+    capsys.readouterr()
+    fakes[0].state.touch("rule", "https", pid="p1", user="dave",
+                         action="DROP")
+    target = tmp_path / "drift.html"
+    assert cli.main(["--inventory", inv, "drift", "--snapshot-dir", snaps,
+                     "--out-html", str(target)]) == 0
+    capsys.readouterr()
+    body = target.read_text(encoding="utf-8")
+    assert "dave" in body and "action" in body
+    assert "https://" not in body.replace("initial-scale=1", "")
+
+
+def test_drift_with_no_snapshots_says_how_to_take_one(env, tmp_path, capsys):
+    inv, _ = env(("lm", "lm1"))
+    assert cli.main(["--inventory", inv, "drift",
+                     "--snapshot-dir", str(tmp_path / "empty")]) == 1
+    assert "snapshot save" in capsys.readouterr().err
+
+
+def test_bare_snapshot_explains_what_to_do_next(env, capsys):
+    inv, _ = env(("lm", "lm1"))
+    assert cli.main(["--inventory", inv, "snapshot"]) == 2
+    assert "nsxctl snapshot save" in capsys.readouterr().err

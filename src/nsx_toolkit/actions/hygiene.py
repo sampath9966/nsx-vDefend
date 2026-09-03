@@ -38,7 +38,6 @@ from ..api import (
     F_RESULTS,
     F_RULE_PATH,
     F_SCOPE,
-    F_SEQUENCE_NUMBER,
     F_SERVICES,
     F_STATISTICS,
     RT,
@@ -65,7 +64,7 @@ from ..output import (
     section,
     table,
 )
-from ..policy import group_inventory, sweep_rules
+from ..policy import group_inventory, rule_sequence, sweep_rules
 
 HYGIENE_CONSOLE_LIMIT = 40
 
@@ -131,13 +130,6 @@ def matches_everything(rule):
             and _is_any(_listed(rule, F_SCOPE))
             and rule.get(F_ACTION_FIELD) in TERMINAL_ACTIONS
             and not rule.get(F_DISABLED))
-
-
-def _sequence(record):
-    try:
-        return int(record.rule.get(F_SEQUENCE_NUMBER) or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def vm_resolvable(group):
@@ -255,7 +247,7 @@ class HygieneContext:
             key = (record.nsx.name, record.policy_id)
             self._by_policy.setdefault(key, []).append(record)
         for key in self._by_policy:
-            self._by_policy[key].sort(key=_sequence)
+            self._by_policy[key].sort(key=rule_sequence)
 
     def earlier_siblings(self, record):
         """Rules ahead of this one in the same policy, in evaluation order."""
