@@ -56,6 +56,61 @@ nsxctl version
 Global flags work on either side of the subcommand — `nsxctl --json compliance`
 and `nsxctl compliance --json` are the same thing.
 
+### Rule hygiene
+
+```bash
+nsxctl rule hygiene                          # the "is my policy sane" report
+nsxctl rule hygiene --out-html hygiene.html  # a file you can email
+nsxctl rule hygiene --fail-on critical       # for a pipeline or cron
+```
+
+Twelve checks across three categories:
+
+| Finding | Severity | Basis |
+|---|---|---|
+| `any_any_allow` | critical | source and destination both ANY with ALLOW |
+| `missing_group` | critical | references a group that does not exist |
+| `any_any_other` | high | source and destination both ANY, non-ALLOW |
+| `broad_applied_to` | high | applied-to is ANY — enforced everywhere |
+| `shadowed_by_any_any` | high | unreachable: an any-any rule sits above it |
+| `unused_since_baseline` | high | zero hits *between two baseline reads* |
+| `no_criteria_group` | medium | referenced group has no criteria — rule is inert |
+| `drop_not_logged` | medium | DROP/REJECT with logging off |
+| `duplicate_rule` | medium | identical match criteria to an earlier rule |
+| `unused_rule` | medium *(soft)* | counter reads zero |
+| `disabled_rule` | low | dead configuration |
+| `empty_group` | low *(soft)* | group resolves to 0 VM members |
+
+**Findings marked soft are indications, not proof**, and the detail column
+says why. Two things this report deliberately will not claim:
+
+- **A zero hit count does not mean a rule is unused.** NSX counters are
+  cumulative since the last reset — a reboot or a rule edit zeroes them. Use
+  a baseline (below) for a claim you can defend.
+- **Groups matched on VIF, IP-set, segment or segment-port criteria are never
+  reported as empty.** The VM member API returns nothing for them, so a naive
+  count would flag live groups as dead. They report as *not measurable*.
+
+Shadow detection does no port or CIDR arithmetic, so it cannot produce a false
+"unreachable". It only flags what is provable: an exact-duplicate match key,
+or a rule sitting below one that matches everything.
+
+### Proving a rule is unused
+
+```bash
+nsxctl rule baseline save --baseline-file monday.json
+# ... a week of production traffic later ...
+nsxctl rule baseline compare --baseline-file monday.json
+```
+
+A counter that did not move between the two reads genuinely saw no matching
+traffic in that window — evidence you can attach to a deletion request.
+
+If the second read is *lower* than the first, the counter was reset and the
+window proves nothing. That reports as `counter_reset`, never as unused;
+claiming no traffic when the evidence was wiped is how a live firewall rule
+gets deleted.
+
 ### The three you'll actually use daily
 
 ```bash
@@ -67,6 +122,9 @@ nsxctl impact web-prod-01
 
 # Which VMs are tagged env=prod?
 nsxctl tag find --scope env --tag prod --out-csv prod.csv
+
+# What is wrong with my firewall policy?
+nsxctl rule hygiene
 ```
 
 `--debug` logs every HTTP method, URL, status and timing to stderr. It is the
