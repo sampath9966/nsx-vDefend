@@ -201,15 +201,6 @@ def test_bare_noun_explains_what_to_do_next(env, capsys):
     assert "nsxctl group list" in capsys.readouterr().err
 
 
-def test_rule_commands_are_registered_but_not_yet_implemented(env, capsys):
-    """The surface is stable from day one, so it cannot shift under people
-    when hygiene lands."""
-    inv, _ = env(("lm", "lm1"))
-    assert cli.main(["--inventory", inv, "rule", "hygiene"]) == 3
-    combined = capsys.readouterr()
-    assert "not implemented yet" in (combined.out + combined.err).lower()
-
-
 def test_tag_apply_previews_without_writing(env, tmp_path, capsys):
     inv, fakes = env(("lm", "lm1"))
     fakes[0].state.add_vm("web1", tags=[("env", "dev")])
@@ -246,3 +237,134 @@ def test_no_arguments_without_a_terminal_prints_help(tmp_path, monkeypatch,
     output.set_interactive(False)
     assert cli.main([]) == 2
     assert "usage: nsxctl" in capsys.readouterr().out
+
+
+# --- rule hygiene and baseline ------------------------------------------
+def _hygiene_estate(fake):
+    group = fake.state.add_group("g-web", "Web", expression=[
+        {"resource_type": "Condition", "member_type": "VirtualMachine",
+         "key": "Tag", "operator": "EQUALS", "value": "env|prod"}])
+    fake.state.group_members["g-web"] = [{"display_name": "web1", "id": "1"}]
+    fake.state.add_policy("p1", "Perimeter")
+    fake.state.add_rule("p1", "allow-any", action="ALLOW", sequence_number=10)
+    fake.state.add_policy("p2", "App")
+    fake.state.add_rule("p2", "https", source_groups=[group["path"]],
+                        destination_groups=[group["path"]],
+                        scope=[group["path"]],
+                        services=["/infra/services/HTTPS"],
+                        sequence_number=10)
+    return group
+
+
+def test_rule_hygiene_reports_findings_as_json(env, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _hygiene_estate(fakes[0])
+    assert cli.main(["--inventory", inv, "rule", "hygiene", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    result = next(r for r in payload["results"]
+                  if r["label"] == "rule_hygiene")
+    checks = {r["check"] for r in result["records"]}
+    assert "any_any_allow" in checks
+
+
+def test_rule_hygiene_fail_on_gates_the_exit_code(env, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _hygiene_estate(fakes[0])
+    # An any-any ALLOW exists, so critical fails.
+    assert cli.main(["--inventory", inv, "rule", "hygiene",
+                     "--fail-on", "critical"]) == 1
+    capsys.readouterr()
+
+
+def test_rule_hygiene_fail_on_passes_on_a_clean_estate(env, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    group = fakes[0].state.add_group("g-web", "Web", expression=[
+        {"resource_type": "Condition", "member_type": "VirtualMachine",
+         "key": "Tag", "operator": "EQUALS", "value": "env|prod"}])
+    fakes[0].state.group_members["g-web"] = [{"display_name": "w", "id": "1"}]
+    fakes[0].state.add_policy("p1", "App")
+    fakes[0].state.add_rule("p1", "ok", source_groups=[group["path"]],
+                            destination_groups=[group["path"]],
+                            scope=[group["path"]],
+                            services=["/infra/services/HTTPS"])
+    assert cli.main(["--inventory", inv, "rule", "hygiene",
+                     "--fail-on", "low"]) == 0
+    assert "PASS" in capsys.readouterr().out
+
+
+def test_rule_hygiene_writes_a_self_contained_html_report(env, tmp_path,
+                                                          capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _hygiene_estate(fakes[0])
+    target = tmp_path / "hygiene.html"
+    assert cli.main(["--inventory", inv, "rule", "hygiene",
+                     "--out-html", str(target)]) == 0
+    capsys.readouterr()
+    body = target.read_text(encoding="utf-8")
+    assert "any_any_allow" in body
+    assert 'https://' not in body.replace("initial-scale=1", "")
+
+
+def test_rule_baseline_save_then_compare_finds_the_idle_rule(env, tmp_path,
+                                                             capsys):
+    inv, fakes = env(("lm", "lm1"))
+    group = _hygiene_estate(fakes[0])
+    fakes[0].state.add_rule("p2", "quiet", source_groups=[group["path"]],
+                            destination_groups=[group["path"]],
+                            scope=[group["path"]],
+                            services=["/infra/services/SSH"],
+                            sequence_number=20)
+    fakes[0].state.set_hit_count("p2", "https", 100)
+    fakes[0].state.set_hit_count("p2", "quiet", 7)
+
+    baseline = tmp_path / "b.json"
+    assert cli.main(["--inventory", inv, "rule", "baseline", "save",
+                     "--baseline-file", str(baseline)]) == 0
+    capsys.readouterr()
+
+    # 'https' takes traffic; 'quiet' does not.
+    fakes[0].state.set_hit_count("p2", "https", 250)
+
+    assert cli.main(["--inventory", inv, "rule", "baseline", "compare",
+                     "--baseline-file", str(baseline), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    result = next(r for r in payload["results"]
+                  if r["label"] == "hit_baseline")
+    by_rule = {r["rule"]: r["status"] for r in result["records"]}
+    assert by_rule["quiet"] == "unused_since_baseline"
+    assert by_rule["https"] == "active"
+
+
+def test_rule_baseline_compare_flags_a_counter_reset(env, tmp_path, capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _hygiene_estate(fakes[0])
+    fakes[0].state.set_hit_count("p2", "https", 900)
+    baseline = tmp_path / "b.json"
+    cli.main(["--inventory", inv, "rule", "baseline", "save",
+              "--baseline-file", str(baseline)])
+    capsys.readouterr()
+
+    fakes[0].state.set_hit_count("p2", "https", 4)   # rebooted
+    assert cli.main(["--inventory", inv, "rule", "baseline", "compare",
+                     "--baseline-file", str(baseline), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    result = next(r for r in payload["results"]
+                  if r["label"] == "hit_baseline")
+    by_rule = {r["rule"]: r["status"] for r in result["records"]}
+    assert by_rule["https"] == "counter_reset"
+
+
+def test_rule_baseline_compare_requires_a_file(env, capsys):
+    inv, _ = env(("lm", "lm1"))
+    assert cli.main(["--inventory", inv, "rule", "baseline",
+                     "compare"]) == 2
+    assert "--baseline-file" in capsys.readouterr().err
+
+
+def test_rule_baseline_save_reports_when_statistics_are_unsupported(env,
+                                                                    capsys):
+    inv, fakes = env(("lm", "lm1"))
+    _hygiene_estate(fakes[0])
+    fakes[0].state.stats_unsupported = True
+    assert cli.main(["--inventory", inv, "rule", "baseline", "save"]) == 1
+    assert "did not serve rule statistics" in capsys.readouterr().err

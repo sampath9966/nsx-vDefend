@@ -29,6 +29,7 @@ import base64
 import csv
 import datetime
 import getpass
+import html
 import json
 import os
 import platform
@@ -434,6 +435,14 @@ PATH_GROUPS = "/domains/{domain}/groups"
 PATH_GROUP_MEMBERS = "/domains/{domain}/groups/{gid}/members/virtual-machines"
 PATH_SEC_POLICIES = "/domains/{domain}/security-policies"
 PATH_SEC_RULES = "/domains/{domain}/security-policies/{pid}/rules"
+
+# Rule hit counters. The per-POLICY form returns statistics for every rule in
+# one call; the per-RULE form is the fallback for versions that do not serve
+# it. Reaching for the per-rule form first would reintroduce the N+1 that the
+# concurrent policy fetch removed.
+PATH_POLICY_STATS = "/domains/{domain}/security-policies/{pid}/statistics"
+PATH_RULE_STATS = (
+    "/domains/{domain}/security-policies/{pid}/rules/{rid}/statistics")
 PATH_DOMAINS = "/domains"
 
 # Reverse lookup: groups a VM belongs to, regardless of the group's member
@@ -466,6 +475,18 @@ F_SOURCE_GROUPS, F_DEST_GROUPS = "source_groups", "destination_groups"
 F_SCOPE, F_ACTION_FIELD = "scope", "action"
 F_SEQUENCE_NUMBER, F_CATEGORY = "sequence_number", "category"
 F_RULES = "rules"
+F_SERVICES, F_PROFILES = "services", "profiles"
+F_DISABLED, F_LOGGED = "disabled", "logged"
+F_DIRECTION, F_IP_PROTOCOL = "direction", "ip_protocol"
+
+# Statistics. NSX nests them as results[].statistics[], each entry carrying a
+# rule_path -- the parser tolerates a flat shape too, because this is the part
+# of the contract that varies most between versions.
+F_STATISTICS = "statistics"
+F_HIT_COUNT, F_BYTE_COUNT, F_PACKET_COUNT = (
+    "hit_count", "byte_count", "packet_count")
+F_LAST_UPDATE = "last_update_timestamp"
+F_RULE_PATH = "rule_path"
 F_TARGET_ID = "target_id"
 F_TARGET_DISPLAY_NAME = "target_display_name"
 F_TARGET_TYPE = "target_type"
@@ -483,6 +504,10 @@ F_CONJ_OP, F_KEY, F_OPERATOR, F_VALUE = (
 F_MEMBER_TYPE, F_EXPRESSIONS = "member_type", "expressions"
 F_IP_ADDRESSES, F_PATHS, F_EXTERNAL_IDS = "ip_addresses", "paths", "external_ids"
 KEY_TAG, TAG_SCOPE_SEPARATOR = "Tag", "|"
+
+# NSX's wildcard in source_groups / destination_groups / scope. A rule whose
+# source and destination are both ANY matches everything.
+ANY = "ANY"
 
 # --- Roles and domains -----------------------------------------------------
 DEFAULT_DOMAIN = "default"
@@ -522,6 +547,14 @@ def p_sec_rules(base, domain, pid):
 
 def p_vm_group_assoc(base):
     return base + PATH_VM_GROUP_ASSOC
+
+
+def p_policy_stats(base, domain, pid):
+    return base + PATH_POLICY_STATS.format(domain=domain, pid=pid)
+
+
+def p_rule_stats(base, domain, pid, rid):
+    return base + PATH_RULE_STATS.format(domain=domain, pid=pid, rid=rid)
 
 
 def p_domains(base):
@@ -1858,6 +1891,294 @@ def group_inventory(sessions, domain):
 
 
 # ==========================================================================
+# baseline.py  --  Rule hit-count baselines.
+# ==========================================================================
+
+BASELINE_HEADERS = ["status", "manager", "policy", "rule", "hits_then",
+                    "hits_now", "delta", "detail"]
+
+# Outcomes, worst-news-first for reporting.
+STATUS_ORDER = ("counter_reset", "unused_since_baseline", "active",
+                "added", "removed", "unknown")
+
+
+def default_baseline_path(domain="default"):
+    return os.path.join(
+        DEFAULT_SNAPSHOT_DIR,
+        "hit-baseline_{}_{}.json".format(domain, local_stamp()))
+
+
+def build_hit_baseline(records, stats, domain="default"):
+    """A serialisable snapshot of every rule's counter."""
+    rules = {}
+    for record in records:
+        path = record.path
+        if not path:
+            continue
+        entry = stats.get(path) or {}
+        hits = entry.get(F_HIT_COUNT)
+        rules[path] = {
+            "manager": record.nsx.name,
+            "policy": record.policy_name,
+            "rule": record.rule_name,
+            "hit_count": hits,
+            "last_update": entry.get(F_LAST_UPDATE),
+        }
+    return {"taken": utc_now_iso(), "tool_version": VERSION,
+            "domain": domain, "rule_count": len(rules), "rules": rules}
+
+
+def save_hit_baseline(snapshot, path=None, domain="default"):
+    path = path or default_baseline_path(domain)
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    return path
+
+
+def load_hit_baseline(path):
+    if not os.path.isfile(path):
+        raise NsxError("Baseline not found: {}".format(path))
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except ValueError as e:
+        raise NsxError("Baseline is not valid JSON ({}): {}".format(
+            path, e)) from e
+    if not isinstance(data, dict) or "rules" not in data:
+        raise NsxError(
+            "{} does not look like a hit baseline (no 'rules').".format(path))
+    return data
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def compare_hit_baselines(before, after):
+    """Per-rule comparison of two snapshots.
+
+    Returns a list of dicts with a `status` from STATUS_ORDER. Rules present
+    in only one snapshot are reported as added/removed rather than dropped --
+    a rule that disappeared between reads is information, not noise.
+    """
+    old_rules = before.get("rules") or {}
+    new_rules = after.get("rules") or {}
+    results = []
+
+    for path in sorted(set(old_rules) | set(new_rules)):
+        old = old_rules.get(path)
+        new = new_rules.get(path)
+        meta = new or old or {}
+        base = {"path": path,
+                "manager": meta.get("manager", ""),
+                "policy": meta.get("policy", ""),
+                "rule": meta.get("rule", ""),
+                "hits_then": None, "hits_now": None, "delta": None}
+
+        if old is None:
+            base.update(status="added",
+                        hits_now=_as_int(new.get("hit_count")),
+                        detail="rule did not exist when the baseline "
+                               "was taken")
+            results.append(base)
+            continue
+        if new is None:
+            base.update(status="removed",
+                        hits_then=_as_int(old.get("hit_count")),
+                        detail="rule existed in the baseline but not now")
+            results.append(base)
+            continue
+
+        then = _as_int(old.get("hit_count"))
+        now = _as_int(new.get("hit_count"))
+        base["hits_then"], base["hits_now"] = then, now
+        if then is None or now is None:
+            base.update(status="unknown",
+                        detail="hit counters unavailable in one or both reads")
+            results.append(base)
+            continue
+
+        delta = now - then
+        base["delta"] = delta
+        if delta < 0:
+            base.update(
+                status="counter_reset",
+                detail="counter went backwards ({} -> {}) -- it was reset, so "
+                       "this window proves nothing".format(then, now))
+        elif delta == 0:
+            base.update(
+                status="unused_since_baseline",
+                detail="no traffic matched between {} and {}".format(
+                    before.get("taken", "?"), after.get("taken", "?")))
+        else:
+            base.update(status="active",
+                        detail="{} hit(s) in the window".format(delta))
+        results.append(base)
+
+    results.sort(key=lambda r: (STATUS_ORDER.index(r["status"]),
+                                r["policy"], r["rule"]))
+    return results
+
+
+def hit_baseline_rows(results):
+    return [[r["status"], r["manager"], r["policy"], r["rule"],
+             "" if r["hits_then"] is None else str(r["hits_then"]),
+             "" if r["hits_now"] is None else str(r["hits_now"]),
+             "" if r["delta"] is None else str(r["delta"]),
+             r["detail"]] for r in results]
+
+
+def hit_baseline_summary(results):
+    counts = {}
+    for result in results:
+        counts[result["status"]] = counts.get(result["status"], 0) + 1
+    return counts
+
+
+# ==========================================================================
+# report.py  --  Self-contained HTML reports.
+# ==========================================================================
+
+STYLE = """
+:root {
+  --ink: #1a1d21; --muted: #5b6570; --rule: #dfe3e8; --bg: #ffffff;
+  --panel: #f6f8fa; --critical: #b3261e; --high: #a5590a;
+  --medium: #7a6100; --low: #57606a; --ok: #1a7f37;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 32px; background: var(--bg); color: var(--ink);
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  Helvetica, Arial, sans-serif; }
+.wrap { max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 15px; margin: 32px 0 10px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--muted); }
+.meta { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+.meta code { background: var(--panel); padding: 1px 5px; border-radius: 3px; }
+.notes { background: var(--panel); border-left: 3px solid var(--rule);
+  padding: 12px 16px; margin: 0 0 24px; border-radius: 0 4px 4px 0; }
+.notes p { margin: 0 0 6px; } .notes p:last-child { margin: 0; }
+.tiles { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
+.tile { border: 1px solid var(--rule); border-radius: 6px; padding: 12px 18px;
+  min-width: 120px; }
+.tile .n { font-size: 24px; font-weight: 600; line-height: 1.1; }
+.tile .k { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--muted); margin-top: 2px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--rule);
+  vertical-align: top; }
+th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--muted); border-bottom: 2px solid var(--rule); white-space: nowrap; }
+tbody tr:nth-child(even) { background: var(--panel); }
+td.mono, th.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; }
+.sev { font-weight: 600; text-transform: uppercase; font-size: 11px;
+  letter-spacing: 0.05em; white-space: nowrap; }
+.sev-critical { color: var(--critical); } .sev-high { color: var(--high); }
+.sev-medium { color: var(--medium); } .sev-low { color: var(--low); }
+.soft { color: var(--muted); font-size: 11px; }
+.empty { color: var(--ok); font-weight: 600; }
+footer { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--rule);
+  color: var(--muted); font-size: 12px; }
+@media print {
+  body { padding: 0; font-size: 11px; }
+  .tile { break-inside: avoid; } tr { break-inside: avoid; }
+}
+"""
+
+SEVERITY_CLASSES = ("critical", "high", "medium", "low")
+
+
+def _esc(value):
+    return html.escape("" if value is None else str(value))
+
+
+def _cell(column, value):
+    text = _esc(value)
+    if column == "severity" and value in SEVERITY_CLASSES:
+        return '<td class="sev sev-{}">{}</td>'.format(value, text)
+    if column == "confidence" and value == "soft":
+        return '<td class="soft">soft</td>'
+    if column in ("rule", "policy", "path", "manager"):
+        return '<td class="mono">{}</td>'.format(text)
+    return "<td>{}</td>".format(text)
+
+
+def _table(headers, rows):
+    if not rows:
+        return '<p class="empty">Nothing to report.</p>'
+    out = ['<div class="scroll"><table><thead><tr>']
+    out.extend("<th>{}</th>".format(_esc(h.replace("_", " "))) for h in headers)
+    out.append("</tr></thead><tbody>")
+    for row in rows:
+        out.append("<tr>")
+        for i, header in enumerate(headers):
+            out.append(_cell(header, row[i] if i < len(row) else ""))
+        out.append("</tr>")
+    out.append("</tbody></table></div>")
+    return "".join(out)
+
+
+def _tiles(counts):
+    if not counts:
+        return ""
+    out = ['<div class="tiles">']
+    for key, value in counts:
+        out.append('<div class="tile"><div class="n">{}</div>'
+                   '<div class="k">{}</div></div>'.format(
+                       _esc(value), _esc(key)))
+    out.append("</div>")
+    return "".join(out)
+
+
+def write_report(path, title, subtitle="", notes=(), tiles=(), sections=()):
+    """Write a standalone HTML report.
+
+    sections: iterable of (heading, headers, rows).
+    tiles:    iterable of (label, value) summary counters.
+    notes:    iterable of caveat strings shown before the data.
+    """
+    body = ['<div class="wrap">',
+            "<h1>{}</h1>".format(_esc(title))]
+    if subtitle:
+        body.append('<div class="meta">{}</div>'.format(subtitle))
+    if notes:
+        body.append('<div class="notes">')
+        body.extend("<p>{}</p>".format(_esc(n)) for n in notes)
+        body.append("</div>")
+    body.append(_tiles(list(tiles)))
+    for heading, headers, rows in sections:
+        body.append("<h2>{}</h2>".format(_esc(heading)))
+        body.append(_table(headers, rows))
+    body.append(
+        "<footer>Generated by {} v{} &middot; {}</footer>".format(
+            _esc(TOOL_NAME), _esc(VERSION), _esc(utc_now_stamp())))
+    body.append("</div>")
+
+    document = (
+        "<!doctype html>\n<html lang=\"en\"><head>"
+        "<meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>{}</title><style>{}</style></head><body>{}</body></html>\n"
+    ).format(_esc(title), STYLE, "".join(body))
+
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(document)
+    return path
+
+
+# ==========================================================================
 # actions/groups.py  --  Group search: criteria, and optionally VM members.
 # ==========================================================================
 
@@ -3002,6 +3323,449 @@ def act_audit_log(audit, sessions, write_enabled, exporter=None, limit=20):
 
 
 # ==========================================================================
+# actions/hygiene.py  --  DFW rule hygiene: the "is my policy sane" report.
+# ==========================================================================
+
+HYGIENE_CONSOLE_LIMIT = 40
+
+SEVERITIES = ("critical", "high", "medium", "low")
+
+HYGIENE_HEADERS = ["severity", "check", "confidence", "manager", "origin",
+                   "policy", "rule", "action", "detail"]
+
+TERMINAL_ACTIONS = ("ALLOW", "DROP", "REJECT")
+DENY_ACTIONS = ("DROP", "REJECT")
+
+
+class Finding:
+    __slots__ = ("check", "severity", "confidence", "record", "detail")
+
+    def __init__(self, check, severity, record, detail, confidence="provable"):
+        self.check = check
+        self.severity = severity
+        self.record = record
+        self.detail = detail
+        self.confidence = confidence
+
+    def row(self):
+        rule = self.record.rule
+        return [self.severity, self.check, self.confidence,
+                self.record.nsx.name, self.record.origin,
+                self.record.policy_name, self.record.rule_name,
+                rule.get(F_ACTION_FIELD, "?"), self.detail]
+
+
+# === RULE SHAPE HELPERS ===
+def _listed(rule, field):
+    return [v for v in (rule.get(field) or []) if v]
+
+
+def _is_any(values):
+    """NSX writes the wildcard as ["ANY"]; an empty list means the same."""
+    return not values or list(values) == [ANY]
+
+
+def match_key(rule):
+    """What makes two rules equivalent, without expanding services.
+
+    Service definitions are compared as opaque paths on purpose: expanding
+    them into port ranges is where a shadow analysis starts producing false
+    "unreachable" claims.
+    """
+    return (
+        tuple(sorted(_listed(rule, "source_groups"))),
+        tuple(sorted(_listed(rule, "destination_groups"))),
+        tuple(sorted(_listed(rule, F_SERVICES))),
+        tuple(sorted(_listed(rule, F_SCOPE))),
+        rule.get(F_ACTION_FIELD, ""),
+        rule.get(F_DIRECTION, ""),
+    )
+
+
+def matches_everything(rule):
+    """True when this rule matches all traffic in its policy."""
+    return (_is_any(_listed(rule, "source_groups"))
+            and _is_any(_listed(rule, "destination_groups"))
+            and _is_any(_listed(rule, F_SERVICES))
+            and _is_any(_listed(rule, F_SCOPE))
+            and rule.get(F_ACTION_FIELD) in TERMINAL_ACTIONS
+            and not rule.get(F_DISABLED))
+
+
+def _sequence(record):
+    try:
+        return int(record.rule.get(F_SEQUENCE_NUMBER) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def vm_resolvable(group):
+    """Whether a group's criteria can be measured through the VM member API.
+
+    Conservative by design: anything we cannot positively identify as
+    VM-resolvable is reported as not measurable rather than guessed at.
+    """
+    expression = group.get(F_EXPRESSION) or []
+    if not expression:
+        return False
+    for item in expression:
+        kind = item.get(RT)
+        if kind == RT_CONJUNCTION:
+            continue
+        if kind == RT_EXTERNALID:
+            continue
+        if kind == RT_CONDITION:
+            if item.get(F_MEMBER_TYPE) == "VirtualMachine":
+                continue
+            return False
+        if kind == RT_NESTED:
+            if vm_resolvable({F_EXPRESSION: item.get(F_EXPRESSIONS, [])}):
+                continue
+            return False
+        return False
+    return True
+
+
+# === STATISTICS ===
+def _parse_stats(payload):
+    """{rule_path: counters} from NSX's results[].statistics[] shape.
+
+    Tolerates a flat results[] too: statistics is the part of the contract
+    that varies most between versions, so the parser is permissive and the
+    caller degrades rather than failing.
+    """
+    out = {}
+    for result in (payload.get(F_RESULTS) or []):
+        entries = result.get(F_STATISTICS)
+        if entries is None:
+            entries = [result] if result.get(F_RULE_PATH) else []
+        for entry in entries:
+            path = entry.get(F_RULE_PATH)
+            if path:
+                out[path] = entry
+    return out
+
+
+def fetch_hit_counts(records, domain):
+    """({rule_path: counters}, supported).
+
+    One call per policy, not per rule -- the per-rule endpoint would
+    reintroduce the N+1 that the concurrent policy fetch removed. When the
+    endpoint is absent the hit checks report unknown and every other check
+    still runs.
+    """
+    targets = {}
+    for record in records:
+        targets[(record.nsx.name, record.policy_id)] = (record.nsx,
+                                                        record.policy_id)
+    if not targets:
+        return {}, True
+
+    def fetch(item):
+        nsx, pid = item
+        return nsx.get(p_policy_stats(nsx.base(domain), domain, pid))
+
+    results = parallel_run(list(targets.values()), fetch,
+                           label="Rule statistics",
+                           key=lambda item: (item[0].name, item[1]))
+    stats, failures = {}, 0
+    for value in results.values():
+        if isinstance(value, Exception):
+            failures += 1
+            debug("statistics unavailable: {}".format(value))
+            continue
+        stats.update(_parse_stats(value))
+    supported = failures < len(targets)
+    return stats, supported
+
+
+def group_member_counts(groups, domain):
+    """{group path: count or None} -- None means not measurable, not empty."""
+    measurable = {path: (nsx, group) for path, (nsx, group) in groups.items()
+                  if vm_resolvable(group)}
+    counts = dict.fromkeys(groups)
+    if not measurable:
+        return counts
+
+    def fetch(item):
+        path, (nsx, group) = item
+        members = nsx.get_all(p_group_members(nsx.base(domain), domain,
+                                              group.get(F_ID, "?")))
+        return len(members)
+
+    results = parallel_run(list(measurable.items()), fetch,
+                           label="Group members",
+                           key=lambda item: item[0])
+    for path, value in results.items():
+        counts[path] = None if isinstance(value, Exception) else value
+    return counts
+
+
+# === CONTEXT ===
+class HygieneContext:
+    def __init__(self, records, groups, stats, stats_supported, member_counts):
+        self.records = records
+        self.groups = groups
+        self.stats = stats
+        self.stats_supported = stats_supported
+        self.member_counts = member_counts
+        self._by_policy = {}
+        for record in records:
+            key = (record.nsx.name, record.policy_id)
+            self._by_policy.setdefault(key, []).append(record)
+        for key in self._by_policy:
+            self._by_policy[key].sort(key=_sequence)
+
+    def earlier_siblings(self, record):
+        """Rules ahead of this one in the same policy, in evaluation order."""
+        key = (record.nsx.name, record.policy_id)
+        siblings = self._by_policy.get(key, [])
+        out = []
+        for other in siblings:
+            if other is record:
+                break
+            out.append(other)
+        return out
+
+    def hits_for(self, record):
+        entry = self.stats.get(record.path)
+        if entry is None:
+            return None
+        try:
+            return int(entry.get(F_HIT_COUNT))
+        except (TypeError, ValueError):
+            return None
+
+
+# === CHECKS ===
+def check_any_any(record, ctx):
+    rule = record.rule
+    if not (_is_any(_listed(rule, "source_groups"))
+            and _is_any(_listed(rule, "destination_groups"))):
+        return []
+    if rule.get(F_DISABLED):
+        return []
+    action = rule.get(F_ACTION_FIELD, "?")
+    if action == "ALLOW":
+        return [Finding("any_any_allow", "critical", record,
+                        "source and destination are both ANY with ALLOW -- "
+                        "permits all traffic in scope")]
+    return [Finding("any_any_other", "high", record,
+                    "source and destination are both ANY (action {})".format(
+                        action))]
+
+
+def check_broad_applied_to(record, ctx):
+    rule = record.rule
+    if rule.get(F_DISABLED):
+        return []
+    if _is_any(_listed(rule, F_SCOPE)):
+        return [Finding("broad_applied_to", "high", record,
+                        "applied-to is ANY -- enforced on every workload, "
+                        "not a scoped set")]
+    return []
+
+
+def check_group_references(record, ctx):
+    findings = []
+    for ref in sorted(record.group_refs()):
+        if ref == ANY:
+            continue
+        entry = ctx.groups.get(ref)
+        if entry is None:
+            findings.append(Finding(
+                "missing_group", "critical", record,
+                "references a group that does not exist: {}".format(ref)))
+            continue
+        _, group = entry
+        name = group.get(F_DISPLAY_NAME, ref)
+        if not (group.get(F_EXPRESSION) or []):
+            findings.append(Finding(
+                "no_criteria_group", "medium", record,
+                "group '{}' has no membership criteria -- the rule is "
+                "inert".format(name)))
+            continue
+        count = ctx.member_counts.get(ref)
+        if count == 0:
+            findings.append(Finding(
+                "empty_group", "low", record,
+                "group '{}' currently resolves to 0 VM members".format(name),
+                confidence="soft"))
+    return findings
+
+
+def check_disabled(record, ctx):
+    if record.rule.get(F_DISABLED):
+        return [Finding("disabled_rule", "low", record,
+                        "disabled -- dead configuration carried in the "
+                        "policy")]
+    return []
+
+
+def check_deny_not_logged(record, ctx):
+    rule = record.rule
+    if rule.get(F_DISABLED):
+        return []
+    if rule.get(F_ACTION_FIELD) in DENY_ACTIONS and not rule.get(F_LOGGED):
+        return [Finding("drop_not_logged", "medium", record,
+                        "{} with logging off -- drops leave no forensic "
+                        "trail".format(rule.get(F_ACTION_FIELD)))]
+    return []
+
+
+def check_duplicate(record, ctx):
+    key = match_key(record.rule)
+    for other in ctx.earlier_siblings(record):
+        if match_key(other.rule) == key:
+            return [Finding("duplicate_rule", "medium", record,
+                            "identical match criteria to earlier rule "
+                            "'{}' in the same policy".format(other.rule_name))]
+    return []
+
+
+def check_shadowed(record, ctx):
+    """Only flags what is provable without port or CIDR arithmetic."""
+    if record.rule.get(F_DISABLED):
+        return []
+    for other in ctx.earlier_siblings(record):
+        if matches_everything(other.rule):
+            return [Finding(
+                "shadowed_by_any_any", "high", record,
+                "unreachable: earlier rule '{}' in this policy matches all "
+                "traffic with {}".format(
+                    other.rule_name, other.rule.get(F_ACTION_FIELD)))]
+    return []
+
+
+def check_unused(record, ctx):
+    if not ctx.stats_supported or record.rule.get(F_DISABLED):
+        return []
+    hits = ctx.hits_for(record)
+    if hits is None or hits > 0:
+        return []
+    entry = ctx.stats.get(record.path) or {}
+    stamp = entry.get(F_LAST_UPDATE)
+    when = " (counters last updated {})".format(stamp) if stamp else ""
+    return [Finding(
+        "unused_rule", "medium", record,
+        "no hits since counters were last reset{} -- NOT proof the rule is "
+        "unused; use `nsxctl rule baseline` for that".format(when),
+        confidence="soft")]
+
+
+CHECKS = (
+    check_any_any,
+    check_broad_applied_to,
+    check_group_references,
+    check_disabled,
+    check_deny_not_logged,
+    check_duplicate,
+    check_shadowed,
+    check_unused,
+)
+
+
+def evaluate(ctx):
+    findings = []
+    for record in ctx.records:
+        for check in CHECKS:
+            findings.extend(check(record, ctx) or [])
+    findings.sort(key=lambda f: (SEVERITIES.index(f.severity), f.check,
+                                 f.record.policy_name, f.record.rule_name))
+    return findings
+
+
+def build_context(sessions, domain, with_members=True):
+    records = sweep_rules(sessions, domain)
+    groups = group_inventory(sessions, domain)
+    stats, supported = fetch_hit_counts(records, domain)
+    referenced = {ref for record in records for ref in record.group_refs()
+                  if ref != ANY and ref in groups}
+    member_counts = {}
+    if with_members and referenced:
+        member_counts = group_member_counts(
+            {path: groups[path] for path in referenced}, domain)
+    return HygieneContext(records, groups, stats, supported, member_counts)
+
+
+# === ACTION ===
+def act_hygiene(sessions, domain, exporter, with_members=True):
+    """Returns (findings, worst_severity_or_None)."""
+    section("DFW RULE HYGIENE")
+    ctx = build_context(sessions, domain, with_members=with_members)
+    say("  {} rule(s) across {} manager(s), {} group(s) referenced".format(
+        cC(str(len(ctx.records))), len(sessions), len(ctx.groups)))
+    if not ctx.stats_supported:
+        say("  {} hit counters unavailable on this NSX -- unused-rule checks "
+            "skipped.".format(cBY("note:")))
+    not_measurable = sum(1 for v in ctx.member_counts.values() if v is None)
+    if not_measurable:
+        say("  {} {} referenced group(s) are not VM-resolvable, so their "
+            "member counts are {} -- never reported as empty.".format(
+                cD("note:"), not_measurable, cD("not measurable")))
+    hr()
+
+    findings = evaluate(ctx)
+    rows = [f.row() for f in findings]
+    exporter.stage("rule_hygiene", HYGIENE_HEADERS, rows)
+
+    if not findings:
+        say("  {} no hygiene problems found.".format(cBG("Clean:")))
+        return findings, None
+
+    counts = {}
+    for finding in findings:
+        counts[finding.severity] = counts.get(finding.severity, 0) + 1
+    say("  {}".format(cB("Summary")))
+    table(["Severity", "Findings"],
+          [[_colour(sev)(sev), str(counts[sev])]
+           for sev in SEVERITIES if sev in counts], indent=4)
+
+    for severity in SEVERITIES:
+        group = [f for f in findings if f.severity == severity]
+        if not group:
+            continue
+        say("\n  {} ({})".format(_colour(severity)(severity.upper()),
+                                 len(group)))
+        hr()
+        for finding in group[:HYGIENE_CONSOLE_LIMIT]:
+            soft = "  {}".format(cD("[soft]")) if finding.confidence == "soft" \
+                else ""
+            say("    {} / {}   {}{}".format(
+                cB(finding.record.policy_name), finding.record.rule_name,
+                cD(finding.check), soft))
+            say("      {}".format(finding.detail))
+        more_note(HYGIENE_CONSOLE_LIMIT, len(group))
+
+    hr()
+    worst = next(s for s in SEVERITIES if s in counts)
+    say("  {} finding(s); worst severity {}.".format(
+        cC(str(len(findings))), _colour(worst)(worst)))
+    return findings, worst
+
+
+def _colour(severity):
+    return {"critical": cBR, "high": cBY, "medium": cY, "low": cD}.get(
+        severity, cD)
+
+
+def worst_severity(findings):
+    present = {f.severity for f in findings}
+    for severity in SEVERITIES:
+        if severity in present:
+            return severity
+    return None
+
+
+def at_or_above(findings, threshold):
+    """Findings at or above a severity, for --fail-on."""
+    if threshold not in SEVERITIES:
+        return []
+    limit = SEVERITIES.index(threshold)
+    return [f for f in findings if SEVERITIES.index(f.severity) <= limit]
+
+
+# ==========================================================================
 # wizard.py  --  First-run setup.
 # ==========================================================================
 
@@ -3250,6 +4014,7 @@ def menu_text(mode_str):
     7.  Reverse lookup: VM -> groups -> rules  {rl}
     8.  Parity validation (static vs dynamic)
     9.  Compliance dashboard
+   15.  DFW rule hygiene                       {hyg}
 
   {ops}
   {d}
@@ -3266,7 +4031,8 @@ def menu_text(mode_str):
            tags=cB("TAGS"), tsub=cD("(Local Managers only)"),
            bulk=cB("BULK & ANALYSIS"), ops=cB("OPERATIONS"),
            audit=cD("(audit logged)"), dry=cD("(dry-run first)"),
-           rl=cD("(any member type, deduped)"))
+           rl=cD("(any member type, deduped)"),
+           hyg=cD("(any-any, shadowed, unused, broken refs)"))
 
 
 def select_managers(sessions, allow_roles, allow_all=False, label=""):
@@ -3410,6 +4176,10 @@ def interactive(ctx):
 
             elif c == "9":
                 act_dashboard(ctx.sessions, ctx.exporter, ctx.taxonomy)
+                offer_export(ctx.exporter)
+
+            elif c == "15":
+                act_hygiene(ctx.sessions, ctx.domain, ctx.exporter)
                 offer_export(ctx.exporter)
 
             elif c == "10":
@@ -3947,13 +4717,8 @@ def cmd_tag_ticket(args, ctx):
 
 
 # ==========================================================================
-# commands/rule.py  --  DFW rule commands.
+# commands/rule.py  --  DFW rule commands: `nsxctl rule hygiene|baseline`.
 # ==========================================================================
-
-RULE_PENDING = ("Not implemented yet -- this lands in the next release.\n"
-           "The command is registered now so the surface does not change "
-           "under you later.")
-
 
 def register_rule(sub, parents):
     p = add_command(
@@ -3961,29 +4726,46 @@ def register_rule(sub, parents):
     rsub = p.add_subparsers(dest="rule_action", metavar="<action>")
 
     hy = rsub.add_parser(
-        "hygiene", parents=parents,
-        help="Report rule hygiene problems. (coming in the next release)",
+        "hygiene", parents=parents, help="Report rule hygiene problems.",
         description="Find any-any rules, overly broad applied-to scopes, "
                     "rules referencing missing or inert groups, duplicates, "
                     "rules shadowed by an any-any above them, disabled rules, "
-                    "and drop rules with logging off.")
-    hy.add_argument("--fail-on", choices=("critical", "high", "medium", "low"),
-                    help="Exit non-zero when findings at or above this "
-                         "severity exist.")
-    hy.set_defaults(func=cmd_rule_pending, pending="rule hygiene")
+                    "and drop rules with logging off.\n\n"
+                    "Findings marked 'soft' are indications, not proof, and "
+                    "say why in the detail column.",
+        epilog="examples:\n"
+               "  nsxctl rule hygiene\n"
+               "  nsxctl rule hygiene --json\n"
+               "  nsxctl rule hygiene --out-html hygiene.html\n"
+               "  nsxctl rule hygiene --fail-on critical    # for CI")
+    hy.add_argument("--fail-on", choices=SEVERITIES, metavar="LEVEL",
+                    help="Exit 1 when findings at or above LEVEL exist "
+                         "({}).".format(" | ".join(SEVERITIES)))
+    hy.add_argument("--skip-member-counts", action="store_true",
+                    help="Do not resolve group members. Faster on large "
+                         "estates; drops the empty-group check.")
+    hy.set_defaults(func=cmd_rule_hygiene)
 
     bl = rsub.add_parser(
         "baseline", parents=parents,
-        help="Save or compare rule hit counts. (coming in the next release)",
+        help="Save or compare rule hit counts.",
         description="NSX hit counters are cumulative since the last reset, so "
-                    "a single read cannot prove a rule is unused. Saving a "
-                    "baseline and comparing later gives zero-hits-between-two-"
-                    "timestamps, which is evidence you can attach to a "
-                    "deletion request.")
+                    "a single read cannot prove a rule is unused. Save a "
+                    "baseline, wait, then compare: a counter that did not "
+                    "move between the two reads genuinely saw no traffic in "
+                    "that window.\n\n"
+                    "If the second read is lower than the first, the counter "
+                    "was reset and the window proves nothing -- that is "
+                    "reported as counter_reset, never as unused.",
+        epilog="examples:\n"
+               "  nsxctl rule baseline save\n"
+               "  nsxctl rule baseline save --baseline-file monday.json\n"
+               "  nsxctl rule baseline compare --baseline-file monday.json")
     bl.add_argument("action", choices=("save", "compare"))
     bl.add_argument("--baseline-file", metavar="PATH",
-                    help="Baseline to write, or to compare against.")
-    bl.set_defaults(func=cmd_rule_pending, pending="rule baseline")
+                    help="Baseline to write, or to compare against "
+                         "(required for compare).")
+    bl.set_defaults(func=cmd_rule_baseline)
 
     p.set_defaults(func=_rule_needs_action)
 
@@ -3993,10 +4775,156 @@ def _rule_needs_action(args, ctx):
     return 2
 
 
-def cmd_rule_pending(args, ctx):
-    err("{}: {}".format(args.pending, RULE_PENDING.splitlines()[0]))
-    say("  " + RULE_PENDING.splitlines()[1])
-    return 3
+# === hygiene ===
+def cmd_rule_hygiene(args, ctx):
+    findings, worst = act_hygiene(
+        ctx.sessions, args.domain, ctx.exporter,
+        with_members=not args.skip_member_counts)
+
+    if args.out_html:
+        counts = {}
+        for finding in findings:
+            counts[finding.severity] = counts.get(finding.severity, 0) + 1
+        path = write_report(
+            args.out_html,
+            "DFW Rule Hygiene",
+            "domain <code>{}</code> &middot; {} manager(s)".format(
+                args.domain, len(ctx.sessions)),
+            notes=[
+                "Findings marked 'soft' are indications, not proof -- the "
+                "detail column says why.",
+                "Hit counters are cumulative since the last reset, so a zero "
+                "count is not evidence a rule is unused. Use "
+                "`nsxctl rule baseline` for that.",
+                "Group member counts are resolved only for groups whose "
+                "criteria is VM-resolvable; others are never reported as "
+                "empty.",
+            ],
+            tiles=[(sev, counts.get(sev, 0)) for sev in SEVERITIES],
+            sections=[("Findings", HYGIENE_HEADERS,
+                       [f.row() for f in findings])])
+        ok_msg("HTML report: {}".format(path))
+
+    if args.fail_on:
+        blocking = at_or_above(findings, args.fail_on)
+        if blocking:
+            say("\n  {} {} finding(s) at or above {}.".format(
+                cBR("FAIL:"), len(blocking), args.fail_on))
+            return 1
+        say("\n  {} nothing at or above {}.".format(cBG("PASS:"),
+                                                    args.fail_on))
+    return 0
+
+
+# === baseline ===
+def _current_snapshot(ctx, domain):
+    records = sweep_rules(ctx.sessions, domain)
+    stats, supported = fetch_hit_counts(records, domain)
+    if not supported:
+        raise NsxError(
+            "This NSX did not serve rule statistics, so hit counts cannot be "
+            "baselined. Run with --debug to see the request that failed.")
+    return build_hit_baseline(records, stats, domain=domain), records
+
+
+def cmd_rule_baseline(args, ctx):
+    if args.action == "save":
+        return _baseline_save(args, ctx)
+    return _baseline_compare(args, ctx)
+
+
+def _baseline_save(args, ctx):
+    section("SAVE HIT-COUNT BASELINE")
+    snapshot, _ = _current_snapshot(ctx, args.domain)
+    path = save_hit_baseline(snapshot, args.baseline_file,
+                             domain=args.domain)
+    measured = sum(1 for r in snapshot["rules"].values()
+                   if r.get("hit_count") is not None)
+    say("  Rules recorded : {}".format(cC(str(snapshot["rule_count"]))))
+    say("  With counters  : {}".format(cC(str(measured))))
+    say("  Taken          : {}".format(snapshot["taken"]))
+    ok_msg("Baseline: {}".format(path))
+    say("\n  {} compare against it later with:".format(cD("next:")))
+    say("    {}".format(cC(
+        "nsxctl rule baseline compare --baseline-file {}".format(path))))
+    return 0
+
+
+def _baseline_compare(args, ctx):
+    if not args.baseline_file:
+        err("compare needs --baseline-file PATH (from `rule baseline save`).")
+        return 2
+    before = load_hit_baseline(args.baseline_file)
+    section("COMPARE AGAINST HIT-COUNT BASELINE")
+    after, _ = _current_snapshot(ctx, args.domain)
+
+    results = compare_hit_baselines(before, after)
+    counts = hit_baseline_summary(results)
+    ctx.exporter.stage("hit_baseline", BASELINE_HEADERS, hit_baseline_rows(results))
+
+    say("  Baseline taken : {}".format(before.get("taken", "?")))
+    say("  Compared at    : {}".format(after.get("taken", "?")))
+    hr()
+
+    unused = [r for r in results if r["status"] == "unused_since_baseline"]
+    reset = [r for r in results if r["status"] == "counter_reset"]
+
+    table(["Status", "Rules"],
+          [[_status_colour(status)(status), str(counts[status])]
+           for status in sorted(counts, key=lambda s: -counts[s])], indent=4)
+
+    if reset:
+        say("\n  {} {} rule(s) had their counters reset between the two "
+            "reads.".format(cBY("WARNING:"), len(reset)))
+        say("  {}".format(cD(
+            "For those the window proves nothing -- take a fresh baseline.")))
+        for result in reset[:10]:
+            say("    {} / {}   {} -> {}".format(
+                result["policy"], result["rule"],
+                result["hits_then"], result["hits_now"]))
+
+    if unused:
+        say("\n  {} saw no traffic between the two reads:".format(
+            cB("{} rule(s)".format(len(unused)))))
+        for result in unused[:40]:
+            say("    {} / {}   [{}]".format(
+                result["policy"], result["rule"], cD(result["manager"])))
+        if len(unused) > 40:
+            say("    {}".format(cD(
+                "... +{} more (full set in export)".format(len(unused) - 40))))
+        say("\n  {} this IS evidence for the window shown above. It is not "
+            "evidence".format(cD("note:")))
+        say("  {}".format(cD(
+            "about any traffic outside it -- a monthly pattern needs a "
+            "monthly window.")))
+    else:
+        say("\n  {} every rule with counters saw traffic in this "
+            "window.".format(cBG("None idle:")))
+
+    if args.out_html:
+        path = write_report(
+            args.out_html, "Rule Hit Baseline Comparison",
+            "baseline <code>{}</code> &rarr; now".format(
+                before.get("taken", "?")),
+            notes=[
+                "unused_since_baseline means the counter did not move between "
+                "the two reads. That is evidence for this window only.",
+                "counter_reset means the counter went backwards, so it was "
+                "reset and this window proves nothing.",
+            ],
+            tiles=[(status, counts[status]) for status in sorted(counts)],
+            sections=[("Per-rule comparison", BASELINE_HEADERS,
+                       hit_baseline_rows(results))])
+        ok_msg("HTML report: {}".format(path))
+
+    if not is_json_mode():
+        hr()
+    return 0
+
+
+def _status_colour(status):
+    return {"counter_reset": cBY, "unused_since_baseline": cB,
+            "active": cBG, "added": cD, "removed": cD}.get(status, cD)
 
 
 # ==========================================================================

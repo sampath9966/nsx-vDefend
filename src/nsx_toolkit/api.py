@@ -20,6 +20,14 @@ PATH_GROUPS = "/domains/{domain}/groups"
 PATH_GROUP_MEMBERS = "/domains/{domain}/groups/{gid}/members/virtual-machines"
 PATH_SEC_POLICIES = "/domains/{domain}/security-policies"
 PATH_SEC_RULES = "/domains/{domain}/security-policies/{pid}/rules"
+
+# Rule hit counters. The per-POLICY form returns statistics for every rule in
+# one call; the per-RULE form is the fallback for versions that do not serve
+# it. Reaching for the per-rule form first would reintroduce the N+1 that the
+# concurrent policy fetch removed.
+PATH_POLICY_STATS = "/domains/{domain}/security-policies/{pid}/statistics"
+PATH_RULE_STATS = (
+    "/domains/{domain}/security-policies/{pid}/rules/{rid}/statistics")
 PATH_DOMAINS = "/domains"
 
 # Reverse lookup: groups a VM belongs to, regardless of the group's member
@@ -52,6 +60,18 @@ F_SOURCE_GROUPS, F_DEST_GROUPS = "source_groups", "destination_groups"
 F_SCOPE, F_ACTION_FIELD = "scope", "action"
 F_SEQUENCE_NUMBER, F_CATEGORY = "sequence_number", "category"
 F_RULES = "rules"
+F_SERVICES, F_PROFILES = "services", "profiles"
+F_DISABLED, F_LOGGED = "disabled", "logged"
+F_DIRECTION, F_IP_PROTOCOL = "direction", "ip_protocol"
+
+# Statistics. NSX nests them as results[].statistics[], each entry carrying a
+# rule_path -- the parser tolerates a flat shape too, because this is the part
+# of the contract that varies most between versions.
+F_STATISTICS = "statistics"
+F_HIT_COUNT, F_BYTE_COUNT, F_PACKET_COUNT = (
+    "hit_count", "byte_count", "packet_count")
+F_LAST_UPDATE = "last_update_timestamp"
+F_RULE_PATH = "rule_path"
 F_TARGET_ID = "target_id"
 F_TARGET_DISPLAY_NAME = "target_display_name"
 F_TARGET_TYPE = "target_type"
@@ -69,6 +89,10 @@ F_CONJ_OP, F_KEY, F_OPERATOR, F_VALUE = (
 F_MEMBER_TYPE, F_EXPRESSIONS = "member_type", "expressions"
 F_IP_ADDRESSES, F_PATHS, F_EXTERNAL_IDS = "ip_addresses", "paths", "external_ids"
 KEY_TAG, TAG_SCOPE_SEPARATOR = "Tag", "|"
+
+# NSX's wildcard in source_groups / destination_groups / scope. A rule whose
+# source and destination are both ANY matches everything.
+ANY = "ANY"
 
 # --- Roles and domains -----------------------------------------------------
 DEFAULT_DOMAIN = "default"
@@ -108,6 +132,14 @@ def p_sec_rules(base, domain, pid):
 
 def p_vm_group_assoc(base):
     return base + PATH_VM_GROUP_ASSOC
+
+
+def p_policy_stats(base, domain, pid):
+    return base + PATH_POLICY_STATS.format(domain=domain, pid=pid)
+
+
+def p_rule_stats(base, domain, pid, rid):
+    return base + PATH_RULE_STATS.format(domain=domain, pid=pid, rid=rid)
 
 
 def p_domains(base):

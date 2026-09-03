@@ -37,6 +37,8 @@ class FakeState:
         self.policies = []
         self.rules = {}              # policy id -> [rule dicts]
         self.associations = {}       # vm external_id -> [association dicts]
+        self.stats = {}              # policy id -> {rule id: stats dict}
+        self.stats_unsupported = False   # 404 the statistics route
         self.request_log = []
         self.fail_times = {}         # path substring -> remaining 503s
         self.require_auth = True
@@ -80,18 +82,33 @@ class FakeState:
         return pol
 
     def add_rule(self, pid, rid, source_groups=(), destination_groups=(),
-                 scope=(), action="ALLOW", origin="LM", display_name=None):
+                 scope=(), action="ALLOW", origin="LM", display_name=None,
+                 services=("ANY",), disabled=False, logged=True,
+                 sequence_number=None, direction="IN_OUT"):
         prefix = "/global-infra" if origin == "GM" else "/infra"
+        existing = self.rules.setdefault(pid, [])
         rule = {"id": rid,
                 "display_name": display_name or rid,
                 "path": "{}/domains/default/security-policies/{}/rules/{}".format(
                     prefix, pid, rid),
-                "source_groups": list(source_groups),
-                "destination_groups": list(destination_groups),
-                "scope": list(scope),
-                "action": action}
-        self.rules.setdefault(pid, []).append(rule)
+                "source_groups": list(source_groups) or ["ANY"],
+                "destination_groups": list(destination_groups) or ["ANY"],
+                "scope": list(scope) or ["ANY"],
+                "services": list(services),
+                "action": action,
+                "disabled": bool(disabled),
+                "logged": bool(logged),
+                "direction": direction,
+                "sequence_number": (sequence_number if sequence_number
+                                    is not None else (len(existing) + 1) * 10)}
+        existing.append(rule)
         return rule
+
+    def set_hit_count(self, pid, rid, hits, last_update=1700000000000):
+        """Drive the hit-count and baseline checks."""
+        self.stats.setdefault(pid, {})[rid] = {
+            "hit_count": hits, "byte_count": hits * 100,
+            "packet_count": hits * 2, "last_update_timestamp": last_update}
 
     def fail_next(self, path_fragment, times=1):
         """Return HTTP 503 for the next `times` requests matching a path."""
@@ -236,13 +253,43 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send(
                     200, _page(st.group_members.get(parts[3], []), query))
 
-        # domains/{domain}/security-policies[/{pid}/rules]
+        # domains/{domain}/security-policies[/{pid}/rules|statistics]
         if len(parts) >= 3 and parts[0] == "domains" and \
                 parts[2] == "security-policies":
             if len(parts) == 3:
                 return self._send(200, _page(st.policies, query))
             if len(parts) == 5 and parts[4] == "rules":
                 return self._send(200, _page(st.rules.get(parts[3], []), query))
+            if len(parts) == 5 and parts[4] == "statistics":
+                if st.stats_unsupported:
+                    return self._send(
+                        404, {"error_message": "statistics not supported"})
+                pid = parts[3]
+                entries = []
+                for rule in st.rules.get(pid, []):
+                    counters = st.stats.get(pid, {}).get(rule["id"])
+                    if counters is None:
+                        continue
+                    entry = dict(counters)
+                    entry["rule_path"] = rule["path"]
+                    entries.append(entry)
+                return self._send(200, {"results": [
+                    {"statistics": entries,
+                     "enforcement_point_path": "/infra/sites/default"}]})
+            if len(parts) == 7 and parts[4] == "rules" and \
+                    parts[6] == "statistics":
+                if st.stats_unsupported:
+                    return self._send(
+                        404, {"error_message": "statistics not supported"})
+                pid, rid = parts[3], parts[5]
+                counters = st.stats.get(pid, {}).get(rid)
+                if counters is None:
+                    return self._send(200, {"results": []})
+                rule = next((r for r in st.rules.get(pid, [])
+                             if r["id"] == rid), None)
+                entry = dict(counters)
+                entry["rule_path"] = rule["path"] if rule else ""
+                return self._send(200, {"results": [{"statistics": [entry]}]})
 
         return self._send(404, {"error_message": "unhandled GET " + path})
 

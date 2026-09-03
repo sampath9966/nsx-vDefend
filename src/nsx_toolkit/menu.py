@@ -11,6 +11,7 @@ from .actions.bulk import act_bulk_tag
 from .actions.change_ticket import act_change_ticket
 from .actions.dashboard import act_dashboard
 from .actions.groups import act_groups
+from .actions.hygiene import act_hygiene
 from .actions.parity import act_parity
 from .actions.reverse import act_reverse_lookup
 from .actions.tags import act_manage_tags, act_vm_tags, act_vms_by_tag
@@ -80,6 +81,7 @@ def menu_text(mode_str):
     7.  Reverse lookup: VM -> groups -> rules  {rl}
     8.  Parity validation (static vs dynamic)
     9.  Compliance dashboard
+   15.  DFW rule hygiene                       {hyg}
 
   {ops}
   {d}
@@ -96,7 +98,8 @@ def menu_text(mode_str):
            tags=cB("TAGS"), tsub=cD("(Local Managers only)"),
            bulk=cB("BULK & ANALYSIS"), ops=cB("OPERATIONS"),
            audit=cD("(audit logged)"), dry=cD("(dry-run first)"),
-           rl=cD("(any member type, deduped)"))
+           rl=cD("(any member type, deduped)"),
+           hyg=cD("(any-any, shadowed, unused, broken refs)"))
 
 
 def select_managers(sessions, allow_roles, allow_all=False, label=""):
@@ -240,6 +243,10 @@ def interactive(ctx):
 
             elif c == "9":
                 act_dashboard(ctx.sessions, ctx.exporter, ctx.taxonomy)
+                offer_export(ctx.exporter)
+
+            elif c == "15":
+                act_hygiene(ctx.sessions, ctx.domain, ctx.exporter)
                 offer_export(ctx.exporter)
 
             elif c == "10":
