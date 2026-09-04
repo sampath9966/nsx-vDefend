@@ -27,6 +27,7 @@ from .api import (
     API_BASE_GM_CANDIDATES,
     API_BASE_LM,
     DEFAULT_DOMAIN,
+    DEFAULT_ORG,
     F_CURSOR,
     F_DISPLAY_NAME,
     F_EXTERNAL_ID,
@@ -47,8 +48,9 @@ from .api import (
     ROLE_GM,
     p_groups,
     parse_version,
+    project_base,
 )
-from .errors import NsxError
+from .errors import NsxError, NsxHttpError
 from .output import cG, debug, say
 
 RETRY_STATUS = (429, 500, 502, 503, 504)
@@ -223,6 +225,10 @@ class Nsx:
         self.auth_mode = (entry.get("auth") or "session").lower()
         self._user, self._pwd = user, pwd
         self._base = entry.get("policy_base")
+        # NSX Project scoping. Set, every policy path hangs off the project's
+        # own infra tree instead of the default one.
+        self.project = entry.get("project")
+        self.org = entry.get("org") or DEFAULT_ORG
         self._version = None
         self._vm_index = None
         self._vm_lock = threading.Lock()
@@ -350,8 +356,8 @@ class Nsx:
                 time.sleep(wait)
                 continue
             if r.status >= 400:
-                raise NsxError("[{}] {} {} -> HTTP {}: {}".format(
-                    self.name, method, url, r.status, r.text()))
+                raise NsxHttpError("[{}] {} {} -> HTTP {}: {}".format(
+                    self.name, method, url, r.status, r.text()), r.status)
             return r.json()
         raise last_exc or NsxError("[{}] {} {} -> exhausted retries".format(
             self.name, method, url))
@@ -364,6 +370,13 @@ class Nsx:
 
     def patch(self, path, body=None, params=None):
         return self._req("PATCH", path, body=body, params=params)
+
+    def put(self, path, body=None, params=None):
+        """Full-object write. PUT rather than PATCH for anything carrying a
+        `_revision`: NSX only enforces the optimistic-concurrency check when
+        the whole object is sent, and that check is the entire safety
+        mechanism behind authoring."""
+        return self._req("PUT", path, body=body, params=params)
 
     def delete(self, path, params=None):
         return self._req("DELETE", path, params=params)
@@ -391,6 +404,12 @@ class Nsx:
             return self._base
         with self._base_lock:
             if self._base:
+                return self._base
+            if self.project:
+                # A project's tree is the same on either role, so no probe.
+                self._base = project_base(self.project, self.org)
+                if verbose:
+                    say("    project scope: {}".format(cG(self._base)))
                 return self._base
             if self.role != ROLE_GM:
                 self._base = API_BASE_LM

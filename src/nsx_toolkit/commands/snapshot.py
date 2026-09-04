@@ -7,7 +7,16 @@ differs, so the two can never disagree about what counts as a change.
 
 import os
 
-from ..diff import DRIFT_HEADERS, at_impact, diff_rows, diff_snapshots, summarise_diff
+from ..actions.author import act_restore
+from ..diff import (
+    DRIFT_HEADERS,
+    at_impact,
+    diff_rows,
+    diff_snapshots,
+    drift_findings,
+    summarise_diff,
+)
+from ..errors import ConfigError, NsxError
 from ..output import cB, cBG, cBR, cBY, cC, cD, cG, err, hr, ok_msg, say, section, table
 from ..paths import DEFAULT_SNAPSHOT_DIR
 from ..report import write_report
@@ -19,7 +28,7 @@ from ..snapshot import (
     resolve_snapshot,
     save_snapshot,
 )
-from . import add_command
+from . import add_action, add_command
 
 CONSOLE_CHANGE_LIMIT = 40
 IMPACT_COLOUR = {"security": cBR, "cosmetic": cD}
@@ -84,6 +93,33 @@ def register_snapshot(sub, parents):
                            "(security | any).")
     diff.set_defaults(func=cmd_snapshot_diff, needs_inventory=False,
                       needs_sessions=False)
+
+    rs = add_action(
+        ssub, parents, "restore", "Put a snapshot's configuration back.",
+        description="Bring live NSX back into line with a stored snapshot, "
+                    "one object at a time through the same plan-then-apply "
+                    "path as `nsxctl rule edit`.\n\n"
+                    "Each object gets a field-level diff you can read, a "
+                    "_revision check that refuses to overwrite a concurrent "
+                    "edit, and its own audit entry -- so a restore is "
+                    "reviewable and individually undoable, not a blind push "
+                    "of a whole tree.\n\n"
+                    "Objects that exist now but not in the snapshot are LEFT "
+                    "ALONE unless --prune is given: a snapshot records what "
+                    "was there, it does not assert that nothing else may "
+                    "exist, and a group created legitimately since is not "
+                    "drift to be erased.\n\n"
+                    "Dry run by default.",
+        epilog="examples:\n"
+               "  nsxctl snapshot restore approved\n"
+               "  nsxctl snapshot restore approved --enable-writes\n"
+               "  nsxctl snapshot restore approved --prune --enable-writes")
+    rs.add_argument("name", nargs="?", help="Snapshot name or path.")
+    rs.add_argument("--snapshot-dir", metavar="DIR")
+    rs.add_argument("--prune", action="store_true",
+                    help="Also DELETE objects that exist now but are not in "
+                         "the snapshot.")
+    rs.set_defaults(func=cmd_snapshot_restore)
 
     p.set_defaults(func=_snapshot_needs_action)
 
@@ -157,6 +193,23 @@ def cmd_snapshot_show(args, ctx):
 
 
 # === diff / drift ===
+def cmd_snapshot_restore(args, ctx):
+    try:
+        root = resolve_snapshot(args.name, args.snapshot_dir)
+        snapshot = load_snapshot(root)
+    except NsxError as e:
+        err(str(e))
+        return 2
+    try:
+        result = act_restore(ctx, snapshot,
+                             dry_run=not ctx.write_enabled,
+                             force=args.force, prune=args.prune)
+    except (NsxError, ConfigError) as e:
+        err(str(e))
+        return 2
+    return 1 if result.failed else 0
+
+
 def cmd_snapshot_diff(args, ctx):
     directory = _snapshot_dir(args)
     before = load_snapshot(resolve_snapshot(args.before, directory))
@@ -189,6 +242,7 @@ def _report(args, ctx, before, after):
     changes = diff_snapshots(before, after)
     counts = summarise_diff(changes)
     ctx.exporter.stage("drift", DRIFT_HEADERS, diff_rows(changes))
+    ctx.exporter.stage_findings("config_drift", drift_findings(changes))
     hr()
 
     if not changes:

@@ -33,6 +33,10 @@ class Exporter:
     def __init__(self, export_dir=None):
         self.export_dir = export_dir or DEFAULT_EXPORT_DIR
         self._sets = []
+        # Findings are a second channel alongside rows: rows are "here is the
+        # data", findings are "here is what is wrong with it". CSV and JSON
+        # want the first; JUnit, SARIF, metrics and a webhook want the second.
+        self._findings = []
 
     def stage(self, label, headers, rows):
         """Add a result set. Empty sets are still recorded so --json reports
@@ -43,11 +47,32 @@ class Exporter:
     def sets(self):
         return list(self._sets)
 
+    def stage_findings(self, label, findings):
+        """Record machine-readable findings for this run."""
+        for item in findings:
+            entry = dict(item)
+            entry.setdefault("suite", label)
+            self._findings.append(entry)
+
+    @property
+    def findings(self):
+        return list(self._findings)
+
+    def findings_by_suite(self):
+        suites = {}
+        for item in self._findings:
+            suites.setdefault(item.get("suite", "nsxctl"), []).append(item)
+        return suites
+
+    def has_findings(self):
+        return bool(self._findings)
+
     def has_staged(self):
         return any(rs.rows for rs in self._sets)
 
     def clear(self):
         self._sets = []
+        self._findings = []
 
     def _ensure_dir(self, path):
         d = os.path.dirname(os.path.abspath(path))

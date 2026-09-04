@@ -42,7 +42,17 @@ def register_analysis(sub, parents):
                "  nsxctl compliance --out-csv posture.csv")
     p.set_defaults(func=cmd_compliance)
 
-    p = add_command(sub, parents, "audit", "Review and undo audited writes.")
+    p = add_command(
+        sub, parents, "audit", "Review and undo audited writes.",
+        description="Every write the toolkit makes -- tags, groups and rules "
+                    "alike -- is logged with both sides of it, and one entry "
+                    "at a time can be reversed.\n\n"
+                    "Undo is asymmetric: reversing a create is a delete and "
+                    "reversing a modify is a write of the before-body, both "
+                    "exact. Reversing a delete recreates an object whose "
+                    "references may have been cleaned up in the meantime, "
+                    "which cannot be guaranteed -- a snapshot restore is the "
+                    "reliable way back from a delete.")
     asub = p.add_subparsers(dest="audit_action", metavar="<action>")
     ls = asub.add_parser("list", parents=parents,
                          help="Show recent audited writes.")
@@ -50,7 +60,7 @@ def register_analysis(sub, parents):
                     help="How many entries (default 20).")
     ls.set_defaults(func=cmd_audit_list)
     un = asub.add_parser("undo", parents=parents,
-                         help="Restore a VM's tags from an audit entry.")
+                         help="Reverse one audited write.")
     un.add_argument("-n", "--limit", type=int, default=20,
                     help="How many entries to choose from (default 20).")
     un.set_defaults(func=cmd_audit_undo)
@@ -77,14 +87,14 @@ def cmd_compliance(args, ctx):
 
 def cmd_audit_list(args, ctx):
     act_audit_log(ctx.audit, ctx.sessions, write_enabled=False,
-                  exporter=ctx.exporter, limit=args.limit)
+                  exporter=ctx.exporter, limit=args.limit, domain=args.domain)
     return 0
 
 
 def cmd_audit_undo(args, ctx):
     if not ctx.write_enabled:
-        err("Undo changes tags. Re-run with --enable-writes.")
+        err("Undo writes to NSX. Re-run with --enable-writes.")
         return 2
     act_audit_log(ctx.audit, ctx.sessions, write_enabled=True,
-                  exporter=ctx.exporter, limit=args.limit)
+                  exporter=ctx.exporter, limit=args.limit, domain=args.domain)
     return 0

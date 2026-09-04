@@ -23,6 +23,8 @@ PROG = "nsxctl"
 # SUPPRESS so that "not given" is distinguishable from "given the default".
 GLOBAL_DEFAULTS = {
     "inventory": None,
+    "profile": None,
+    "project": None,
     "taxonomy": None,
     "manager": None,
     "all_lm": False,
@@ -39,20 +41,39 @@ GLOBAL_DEFAULTS = {
     "out_csv": None,
     "out_json": None,
     "out_html": None,
+    "out_junit": None,
+    "out_sarif": None,
+    "out_metrics": None,
+    "notify": None,
+    "only_on_change": False,
 }
 
 EPILOG = """
 getting started:
   nsxctl init                       guided setup: managers, credentials, a check
   nsxctl status                     can I reach and authenticate everywhere?
+  nsxctl doctor                     what does this NSX actually serve?
   nsxctl                            interactive menu
 
 everyday:
   nsxctl compliance                 tagging posture across every Local Manager
   nsxctl tag find --scope env --tag prod
   nsxctl impact web-prod-01         what breaks if I retag this VM
+  nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
+  nsxctl rule list --policy app-tier
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
+
+authoring (dry run unless --enable-writes):
+  nsxctl group create g-web --criteria 'tag:env=prod AND tag:tier=web'
+  nsxctl rule create allow-web-db --policy app-tier --from g-web --to g-db
+  nsxctl apply changes.yaml         a declarative file of groups and rules
+  nsxctl recommend flows.csv --policy app-tier --out-file proposed.json
+
+scheduled:
+  nsxctl rule hygiene --only-on-change --notify $SLACK_URL
+  nsxctl drift --fail-on-drift security --out-junit drift.xml
+  nsxctl doctor --out-metrics /var/lib/node_exporter/nsxctl.prom
 
 Run `nsxctl <command> --help` for a command's options and examples.
 """
@@ -66,6 +87,13 @@ def add_global_args(parser):
                           "~/.nsx_toolkit/inventory.json).")
     cfg.add_argument("--taxonomy", metavar="PATH", default=argparse.SUPPRESS,
                      help="Tag taxonomy file (JSON, or YAML with PyYAML).")
+    cfg.add_argument("--profile", metavar="NAME", default=argparse.SUPPRESS,
+                     help="Which estate in a multi-profile inventory. "
+                          "Also read from $NSX_PROFILE.")
+    cfg.add_argument("--project", metavar="NAME", default=argparse.SUPPRESS,
+                     help="Scope every policy path to an NSX Project. "
+                          "Objects in the default infra are not visible from "
+                          "inside a project.")
     cfg.add_argument("--manager", metavar="NAME", default=argparse.SUPPRESS,
                      help="Target one manager by name.")
     cfg.add_argument("--all-lm", action="store_true", default=argparse.SUPPRESS,
@@ -98,6 +126,22 @@ def add_global_args(parser):
                      help="Write results to JSON.")
     out.add_argument("--out-html", metavar="PATH", default=argparse.SUPPRESS,
                      help="Write a shareable HTML report where supported.")
+    out.add_argument("--out-junit", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write findings as JUnit XML, for a pipeline.")
+    out.add_argument("--out-sarif", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write findings as SARIF, for a code-scanning UI.")
+    out.add_argument("--out-metrics", metavar="PATH",
+                     default=argparse.SUPPRESS,
+                     help="Write Prometheus textfile metrics, for a "
+                          "node_exporter collector directory.")
+    out.add_argument("--notify", metavar="URL", default=argparse.SUPPRESS,
+                     help="POST a JSON summary to a webhook when the run "
+                          "finishes.")
+    out.add_argument("--only-on-change", action="store_true",
+                     default=argparse.SUPPRESS,
+                     help="Print nothing and notify nobody unless the "
+                          "findings differ from the last run. For cron: a "
+                          "quiet night sends no mail.")
     out.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS,
                      help="Disable colored output.")
     out.add_argument("--non-interactive", action="store_true",
@@ -118,12 +162,16 @@ def apply_global_defaults(args):
 
 def build_parser():
     from .analysis import register_analysis
+    from .apply import register_apply
     from .group import register_group
+    from .inspect import register_inspect
+    from .recommend import register_recommend
     from .rule import register_rule
     from .setup import register_setup
     from .shell import register_shell
     from .snapshot import register_snapshot
     from .tag import register_tag
+    from .trace import register_trace
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -141,10 +189,22 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     parents = [global_parent]
     for register in (register_setup, register_group, register_tag,
-                     register_rule, register_analysis, register_snapshot,
+                     register_rule, register_inspect,
+                     register_analysis, register_trace,
+                     register_snapshot, register_apply,
+                     register_recommend,
                      register_shell):
         register(sub, parents)
     return parser
+
+
+def add_action(sub, parents, name, help_text, description=None, epilog=None):
+    """A second-level subparser (`nsxctl group create`), with the same raw
+    formatter as a top-level command so a syntax table survives --help."""
+    return sub.add_parser(
+        name, parents=parents, help=help_text,
+        description=description or help_text, epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
 
 
 def add_command(sub, parents, name, help_text, description=None, epilog=None):
