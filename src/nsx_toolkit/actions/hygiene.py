@@ -71,6 +71,7 @@ from ..policy import (
     rule_sequence,
     sweep_rules,
 )
+from ..sinks import make_finding
 
 HYGIENE_CONSOLE_LIMIT = 40
 
@@ -438,6 +439,12 @@ def act_hygiene(sessions, domain, exporter, with_members=True):
     findings = evaluate(ctx)
     rows = [f.row() for f in findings]
     exporter.stage("rule_hygiene", HYGIENE_HEADERS, rows)
+    exporter.stage_findings("rule_hygiene", [
+        make_finding(f.check, f.severity, f.detail,
+                     where="{}/{}".format(f.record.policy_name,
+                                          f.record.rule_name),
+                     detail="[{}] {}".format(f.confidence, f.detail))
+        for f in findings])
 
     if not findings:
         say("  {} no hygiene problems found.".format(cBG("Clean:")))

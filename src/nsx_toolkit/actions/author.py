@@ -630,6 +630,156 @@ def act_apply_file(ctx, path, dry_run=True, force=False):
                         exporter=ctx.exporter, cache=cache)
 
 
+# === SNAPSHOT RESTORE ===
+def plan_restore(sessions, domain, snapshot, cache=None, prune=False,
+                 kinds=(KIND_GROUP, KIND_RULE)):
+    """Planned writes that bring live NSX back to a snapshot.
+
+    Deliberately per-object through the same engine as every other write, not
+    a bulk push of a whole tree: each object gets a field-level diff you can
+    read, a `_revision` check that refuses to clobber a concurrent edit, and
+    its own audit entry. A blind whole-DFW restore is a different class of
+    risk, and this is not that.
+
+    **Deleting is opt-in.** An object that exists live and not in the snapshot
+    is left alone unless `prune` is set: a snapshot is a record of what was
+    there, not an assertion that nothing else may exist, and something created
+    legitimately since is not drift to be erased.
+    """
+    cache = cache or PlanCache(sessions, domain)
+    changes = []
+    objects = snapshot.get("objects") or {}
+    live_groups = cache.groups
+    live_rules = {r.path: r for r in cache.records if r.path}
+
+    for path, entry in sorted(objects.items()):
+        kind_name = entry.get("kind")
+        body = dict(entry.get("body") or {})
+        if kind_name == "groups" and KIND_GROUP in kinds:
+            changes.extend(_restore_group(sessions, domain, cache, path, body,
+                                          live_groups))
+        elif kind_name == "rules" and KIND_RULE in kinds:
+            changes.extend(_restore_rule(cache, path, body, live_rules,
+                                         domain))
+
+    if prune:
+        changes.extend(_prune_extras(cache, objects, live_groups, live_rules,
+                                     domain, kinds))
+    return [c for c in changes if c is not None]
+
+
+def _restore_group(sessions, domain, cache, path, body, live_groups):
+    group_id = body.get(F_ID) or path.rsplit("/", 1)[-1]
+    existing_entry = live_groups.get(path)
+    if existing_entry is None:
+        # Match on id as well: a group recreated by hand has a new path.
+        for live_path, (nsx, group) in live_groups.items():
+            if group.get(F_ID) == group_id:
+                existing_entry = (nsx, group)
+                path = live_path
+                break
+    if existing_entry is not None:
+        nsx, existing = existing_entry
+    else:
+        gm_sessions, lm_sessions = ordered_sessions(sessions)
+        if not gm_sessions + lm_sessions:
+            return []
+        nsx, existing = (gm_sessions + lm_sessions)[0], None
+    _author_writable(nsx, path, "Group '{}'".format(group_id))
+    after = dict(existing or {})
+    after.update(body)
+    if existing is not None and not [
+            f for f in diff_objects(existing, after)
+            if _author_is_real_change(f)]:
+        return []
+    url = object_url(nsx, domain, KIND_GROUP, group_id)
+    return [PlannedWrite(OP_MODIFY if existing else OP_CREATE, KIND_GROUP,
+                         nsx, url, group_id,
+                         after.get(F_DISPLAY_NAME, group_id),
+                         before=existing, after=after, path=path)]
+
+
+def _restore_rule(cache, path, body, live_rules, domain):
+    record = live_rules.get(path)
+    rule_id = body.get(F_ID) or path.rsplit("/", 1)[-1]
+    policy_id = policy_id_from_rule_path(path)
+    if record is None:
+        # The rule is gone. Recreating it needs a manager that still has the
+        # policy; without one there is nothing to restore it into.
+        for candidate in cache.records:
+            if candidate.policy_id == policy_id:
+                record = candidate
+                break
+        if record is None:
+            return []
+        nsx, existing = record.nsx, None
+    else:
+        nsx, existing = record.nsx, record.rule
+    _author_writable(nsx, path, "Rule '{}'".format(rule_id))
+    after = dict(existing or {})
+    after.update(body)
+    if existing is not None and not [
+            f for f in diff_objects(existing, after)
+            if _author_is_real_change(f)]:
+        return []
+    url = object_url(nsx, domain, KIND_RULE, rule_id, policy_id=policy_id)
+    return [PlannedWrite(OP_MODIFY if existing else OP_CREATE, KIND_RULE, nsx,
+                         url, rule_id, after.get(F_DISPLAY_NAME, rule_id),
+                         before=existing, after=after, policy_id=policy_id,
+                         path=path)]
+
+
+def _prune_extras(cache, objects, live_groups, live_rules, domain, kinds):
+    """Objects that exist live but not in the snapshot. Only with --prune."""
+    changes = []
+    snapshot_ids = {(e.get("kind"), (e.get("body") or {}).get(F_ID))
+                    for e in objects.values()}
+    if KIND_RULE in kinds:
+        for path, record in sorted(live_rules.items()):
+            if ("rules", record.rule_id) in snapshot_ids or path in objects:
+                continue
+            if origin_of_path(path) == "GM" and record.nsx.role == ROLE_LM:
+                continue
+            changes.append(PlannedWrite(
+                OP_DELETE, KIND_RULE, record.nsx,
+                object_url(record.nsx, domain, KIND_RULE, record.rule_id,
+                           policy_id=record.policy_id),
+                record.rule_id, record.rule_name, before=record.rule,
+                policy_id=record.policy_id, path=path))
+    if KIND_GROUP in kinds:
+        for path, (nsx, group) in sorted(live_groups.items()):
+            gid = group.get(F_ID)
+            if ("groups", gid) in snapshot_ids or path in objects:
+                continue
+            if origin_of_path(path) == "GM" and nsx.role == ROLE_LM:
+                continue
+            changes.append(PlannedWrite(
+                OP_DELETE, KIND_GROUP, nsx,
+                object_url(nsx, domain, KIND_GROUP, gid), gid,
+                group.get(F_DISPLAY_NAME, gid), before=group, path=path))
+    return changes
+
+
+def act_restore(ctx, snapshot, dry_run=True, force=False, prune=False):
+    section("RESTORE FROM SNAPSHOT")
+    manifest = snapshot.get("manifest", {})
+    say("  Snapshot taken : {}".format(manifest.get("taken", "?")))
+    say("  Domain         : {}".format(manifest.get("domain", "?")))
+    if prune:
+        say("  {} objects not in the snapshot will be DELETED.".format(
+            cBR("--prune:")))
+    else:
+        say("  {}".format(cD(
+            "Objects that exist now but not in the snapshot are left alone. "
+            "Pass --prune to delete them.")))
+    cache = PlanCache(ctx.sessions, ctx.domain)
+    changes = plan_restore(ctx.sessions, ctx.domain, snapshot, cache=cache,
+                           prune=prune)
+    return execute_plan(changes, ctx.audit, ctx.write_enabled,
+                        dry_run=dry_run, force=force, sessions=ctx.sessions,
+                        domain=ctx.domain, exporter=ctx.exporter, cache=cache)
+
+
 # === UNDO ===
 def undo_object_entry(entry, sessions, domain, audit, force=False):
     """Reverse one audited object write.

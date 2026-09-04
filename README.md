@@ -29,7 +29,10 @@ present and the Python standard library when it is not.
 nsxctl                                  interactive menu
 nsxctl init                             guided first-run setup
 nsxctl status                           reachability, auth and API base per manager
+nsxctl doctor                           what does THIS NSX actually serve?
 nsxctl managers                         list configured managers
+nsxctl profiles                         estates this inventory defines
+nsxctl projects                         NSX Projects on each manager
 nsxctl login [NAME]                     set or replace stored credentials
 nsxctl config show | path | validate    what config is in effect, and from where
 
@@ -47,11 +50,17 @@ nsxctl tag ticket FILE.csv              change-plan document, validated against 
 nsxctl snapshot save [NAME]             capture the current configuration
 nsxctl snapshot list | show NAME
 nsxctl snapshot diff BEFORE AFTER       compare two snapshots
+nsxctl snapshot restore NAME            put a snapshot's config back
 nsxctl drift [NAME]                     what changed since the snapshot, and who
+
+nsxctl rule list [--policy P] [--action DROP] [--disabled]
+nsxctl rule show NAME
+nsxctl policy list | service list | service show NAME
 
 nsxctl rule create NAME --policy P --from G1 --to G2 --service S --action ALLOW
 nsxctl rule edit NAME | rule move NAME --before OTHER | rule delete NAME
 nsxctl apply FILE.yaml                  declarative batch (dry run by default)
+nsxctl recommend FLOWS.csv              propose rules from observed traffic
 
 nsxctl trace VM_A VM_B [--port N]       can A reach B, and what decided it
 nsxctl impact VM                        what breaks if I change this VM
@@ -67,6 +76,24 @@ nsxctl version
 
 Global flags work on either side of the subcommand — `nsxctl --json compliance`
 and `nsxctl compliance --json` are the same thing.
+
+### Reading what is there
+
+```bash
+nsxctl rule list --policy app-tier      # in NSX evaluation order
+nsxctl rule show allow-web-db
+nsxctl policy list
+nsxctl service list                     # and which ones trace can decide
+```
+
+`rule list` sorts by **category first** (Ethernet -> Emergency ->
+Infrastructure -> Environment -> Application), then policy and rule sequence.
+That is not the order the API returns them in, and it is the order that decides
+traffic.
+
+`service list`'s last column says whether each service is a plain L4 port set.
+That is what makes an undecided `nsxctl trace` verdict explicable rather than
+mystifying.
 
 ### Rule hygiene
 
@@ -343,6 +370,153 @@ Audit entries written before authoring existed still list and still undo. The
 tag fields were kept and the general ones added alongside, with one reader
 mapping both shapes.
 
+### What does this NSX actually serve?
+
+```bash
+nsxctl doctor
+```
+
+The toolkit degrades rather than fails in a dozen places -- statistics may 404,
+traceflow is Local-Manager-only, Projects may not exist, some group criteria
+are not VM-resolvable. Every one of those is handled where it happens, which
+means **a missing feature and a bug in the tool look identical** until you ask:
+
+```
+  lm-london  Local Manager  https://lm-lon.example.com:443
+    Capability          Status   Detail                    Affects
+    ------------------  -------  ------------------------  -----------------------
+    groups              ok       412 item(s)
+    rule statistics     missing  404 -- not served ...      rule hygiene unused
+                                                            checks, rule baseline
+    traceflow           ok       0 item(s)
+```
+
+Every probe is a bounded read. Nothing is written, and **traceflow is checked
+by listing, never by injecting a packet** -- a capability check that put real
+traffic on the data plane every time somebody asked what their NSX supports
+would be its own kind of bug.
+
+`nsxctl doctor --json` is the one output worth pasting into a bug report.
+`--fail-on-missing` makes it a pipeline gate.
+
+### Running it on a schedule
+
+```bash
+nsxctl rule hygiene --only-on-change --notify "$SLACK_WEBHOOK"
+nsxctl drift --fail-on-drift security --out-junit drift.xml
+nsxctl doctor --out-metrics /var/lib/node_exporter/nsxctl.prom
+```
+
+| Flag | What consumes it |
+|---|---|
+| `--out-junit PATH` | A pipeline, showing each check as a test |
+| `--out-sarif PATH` | A code-scanning UI, annotating findings by severity |
+| `--out-metrics PATH` | A node_exporter textfile collector |
+| `--notify URL` | One POST with the summary, for chat or an incident tool |
+| `--only-on-change` | Print nothing and notify nobody unless the findings differ |
+
+**`--only-on-change` is what makes a nightly cron bearable.** Each run
+fingerprints its own findings and compares that with the last. Unchanged, the
+whole report is discarded *before it reaches stdout*, so cron sends no mail;
+changed, it prints in full and the webhook fires. Without it a scheduled
+hygiene report mails you the same 40 findings every morning until you pipe it
+to `/dev/null` -- and then you never see number 41.
+
+The fingerprint is built only from what a finding *is*, never from when it ran,
+and the state is written **only when `--only-on-change` is given**: a plain
+interactive run that quietly primed it would make your first scheduled run
+silent with forty findings sitting there unreported.
+
+Metrics emit a zero series when clean, because an alert rule needs a series
+that exists and reads zero, not one that vanishes.
+
+### Proposing rules from traffic you actually saw
+
+```bash
+nsxctl recommend flows.csv
+nsxctl recommend flows.csv --policy app-tier --out-file proposed.json
+nsxctl apply proposed.json          # review first; dry run by default
+```
+
+Reads a flow export you already have -- NSX Intelligence export, vRNI, a
+firewall-log query -- rather than calling the Intelligence recommendation API,
+which is licensed separately and absent on most estates. Column names are
+matched loosely (`src`, `src_ip`, `source_ip` all work) because every exporter
+names them differently and none of them are wrong.
+
+```
+    Source   Destination  Proto  Ports  Flows
+    Web      DB           tcp    3306   913
+
+  UNCLASSIFIED: 1 address(es) belong to no group:
+    10.9.9.9           destination  5 flow(s)
+    These are the most useful rows here: traffic exists and nobody has
+    classified the workload. No rule is proposed for them.
+```
+
+Three things it will not do:
+
+- **It never proposes a default-deny.** No traffic seen in one window is not
+  evidence none exists -- the same reasoning that stops a zero hit count
+  retiring a rule.
+- **It never invents a group for an address nobody claims.** An unresolved
+  endpoint is reported, because that is the finding.
+- **A pair talking on more than `--max-ports` ports is flagged, not ruled.**
+  That shape is usually a scanner or a monitoring host, and one rule with fifty
+  ports would bury it.
+
+Denied flows are ignored unless `--include-denied`: a blocked flow is usually
+evidence the segmentation is working, not evidence a rule is missing.
+
+### Putting a snapshot back
+
+```bash
+nsxctl snapshot restore approved                      # dry run
+nsxctl snapshot restore approved --enable-writes
+nsxctl snapshot restore approved --prune --enable-writes
+```
+
+Per-object, through the same plan-then-apply path as `nsxctl rule edit`: each
+object gets a field-level diff you can read, a `_revision` check that refuses
+to overwrite a concurrent edit, and its own audit entry. A restore is
+reviewable and individually undoable, not a blind push of a whole tree.
+
+**Deleting is opt-in.** An object that exists now but not in the snapshot is
+left alone unless you pass `--prune`: a snapshot records what *was* there, it
+does not assert that nothing else may exist, and a group created legitimately
+since is not drift to be erased.
+
+### More than one estate
+
+```bash
+nsxctl profiles
+nsxctl --profile dr status
+NSX_PROFILE=dr nsxctl compliance
+```
+
+```json
+{"default_profile": "prod",
+ "profiles": {
+   "prod": {"managers": [...]},
+   "dr":   {"managers": [...]}}}
+```
+
+The flat single-estate inventory `nsxctl init` writes still works exactly as
+it always did. With several profiles and no `default_profile`, the tool
+**refuses rather than picking one** -- guessing which estate to talk to is the
+one wrong answer that matters.
+
+### NSX Projects
+
+```bash
+nsxctl projects
+nsxctl --project tenant-a rule list
+```
+
+A Project has its own infra tree, so `--project` swaps the policy base rather
+than filtering results. Objects in the default infra are genuinely not visible
+from inside a project, and vice versa.
+
 ### The three you'll actually use daily
 
 ```bash
@@ -383,10 +557,20 @@ Shell completion:
 nsxctl completion bash > /etc/bash_completion.d/nsxctl
 nsxctl completion zsh  > "${fpath[1]}/_nsxctl"
 nsxctl completion fish > ~/.config/fish/completions/nsxctl.fish
+nsxctl completion cache          # so TAB can complete object names too
 ```
 
-The completion script is generated from the live command tree, so it always
-matches the commands your build actually has.
+The script is generated from the live command tree, so it always matches the
+commands your build actually has.
+
+It also completes **names**, not just flags -- `--policy <TAB>`, `--from
+<TAB>`, `nsxctl rule show <TAB>`. Those come from a cache file that ordinary
+list commands refresh as a side effect. **Pressing TAB never makes a network
+call**: a completion that reached out to eight managers would turn a keystroke
+into a two-second stall, and into a hang on an unreachable one. A stale cache
+completes a stale name and NSX says so, which is the right failure. The cache
+is per profile and project, because completing production names into a DR
+command is worse than completing nothing.
 
 ---
 
@@ -571,6 +755,9 @@ src/nsx_toolkit/
   policy.py snapshot.py diff.py             traversal, capture, comparison
   trace.py                                  traceflow + static path evaluation
   authoring.py                              criteria parsing, planned writes
+  sinks.py                                  JUnit, SARIF, metrics, webhook, state
+  flows.py                                  observed flows -> proposed rules
+  namecache.py                              names for completion, never live
   actions/                                  one module per operation
   commands/                                 the nsxctl command tree
   legacy.py                                 pre-4.0 flag translation

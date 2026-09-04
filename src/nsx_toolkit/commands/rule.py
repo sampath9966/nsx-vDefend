@@ -13,6 +13,7 @@ from ..actions.hygiene import (
     at_or_above,
     fetch_hit_counts,
 )
+from ..actions.inspect import act_rule_list, act_rule_show
 from ..authoring import RULE_ACTIONS, RULE_DIRECTIONS
 from ..baseline import (
     BASELINE_HEADERS,
@@ -91,6 +92,40 @@ def register_rule(sub, parents):
                          "(required for compare).")
     bl.set_defaults(func=cmd_rule_baseline)
 
+    ls = add_action(
+        rsub, parents, "list", "List DFW rules in evaluation order.",
+        description="Every rule across the Global Manager and Local Managers, "
+                    "deduplicated, listed in the order NSX evaluates them: "
+                    "category first (Ethernet, Emergency, Infrastructure, "
+                    "Environment, Application), then policy and rule "
+                    "sequence.\n\n"
+                    "That is not the order the API returns them in, and it is "
+                    "the order that decides traffic.",
+        epilog="examples:\n"
+               "  nsxctl rule list\n"
+               "  nsxctl rule list --policy app-tier\n"
+               "  nsxctl rule list --action DROP --out-csv drops.csv\n"
+               "  nsxctl rule list --disabled")
+    ls.add_argument("--contains", metavar="TEXT",
+                    help="Only rules whose name or id contains TEXT.")
+    ls.add_argument("--policy", metavar="NAME",
+                    help="Only rules in policies matching NAME.")
+    ls.add_argument("--action", metavar="ACTION",
+                    help="Only rules with this action.")
+    ls.add_argument("--disabled", action="store_true",
+                    help="Only disabled rules.")
+    ls.set_defaults(func=cmd_rule_list)
+
+    sh = add_action(
+        rsub, parents, "show", "Show one rule in full.",
+        description="Every field of a rule, unabridged, including its "
+                    "realized numeric id -- the one a traceflow observation "
+                    "names when it drops a packet.",
+        epilog="example:\n  nsxctl rule show allow-web-db")
+    sh.add_argument("name", help="Rule name or id.")
+    sh.add_argument("--policy", help="Policy the rule is in.")
+    sh.set_defaults(func=cmd_rule_show)
+
     cr = add_action(
         rsub, parents, "create", "Create a DFW rule.",
         description="Create a rule in an existing security policy.\n\n"
@@ -144,6 +179,24 @@ def register_rule(sub, parents):
     dl.set_defaults(func=cmd_rule_delete)
 
     p.set_defaults(func=_rule_needs_action)
+
+
+def cmd_rule_list(args, ctx):
+    act_rule_list(ctx.sessions, args.domain, ctx.exporter,
+                  contains=args.contains, policy_ref=args.policy,
+                  action=args.action, disabled_only=args.disabled,
+                  cache_key=ctx.cache_key())
+    return 0
+
+
+def cmd_rule_show(args, ctx):
+    try:
+        act_rule_show(ctx.sessions, args.domain, ctx.exporter, args.name,
+                      policy_ref=args.policy)
+    except NsxError as e:
+        err(str(e))
+        return 2
+    return 0
 
 
 def _add_rule_body_args(parser, require_policy=False):
@@ -226,8 +279,8 @@ def cmd_rule_delete(args, ctx):
 
 
 def _rule_needs_action(args, ctx):
-    err("Specify what to do: nsxctl rule hygiene | baseline | create | edit "
-        "| move | delete")
+    err("Specify what to do: nsxctl rule list | show | hygiene | baseline "
+        "| create | edit | move | delete")
     return 2
 
 

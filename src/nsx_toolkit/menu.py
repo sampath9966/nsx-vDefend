@@ -43,7 +43,8 @@ class AppContext:
     """Everything an action needs, assembled once in cli.main()."""
 
     def __init__(self, sessions, audit, exporter, taxonomy,
-                 write_enabled=False, domain=DEFAULT_DOMAIN, managers=None):
+                 write_enabled=False, domain=DEFAULT_DOMAIN, managers=None,
+                 profile=None, project=None, inventory_path=None):
         self.sessions = sessions
         self.audit = audit
         self.exporter = exporter
@@ -53,6 +54,16 @@ class AppContext:
         # Inventory entries, for commands that act on configuration rather
         # than on a live connection (login).
         self.managers = managers or []
+        # Which estate, and which tenant inside it, this run is talking to.
+        self.profile = profile
+        self.project = project
+        self.inventory_path = inventory_path
+
+    def cache_key(self):
+        """(profile, project) -- which estate and tenant a cached name
+        belongs to. Completing production names into a DR command is worse
+        than completing nothing."""
+        return (self.profile, self.project)
 
     def lms(self):
         return [s for s in self.sessions if s.role == ROLE_LM]

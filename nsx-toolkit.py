@@ -29,7 +29,9 @@ import base64
 import csv
 import datetime
 import getpass
+import hashlib
 import html
+import ipaddress
 import json
 import os
 import platform
@@ -43,6 +45,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.sax.saxutils as saxutils
 
 
 # ==========================================================================
@@ -170,6 +173,12 @@ _interactive = sys.stdin.isatty()
 _assume_yes = False
 _debug = False
 
+# When buffering, say() collects instead of printing, so a caller that later
+# discovers the run found nothing new can drop the whole report before it
+# reaches stdout. That is what makes a nightly cron job silent on a quiet
+# night -- and errors are deliberately never buffered.
+_buffer = None
+
 
 def set_color(enabled):
     global _color_enabled
@@ -214,6 +223,32 @@ def set_debug(enabled):
 
 def is_debug():
     return _debug
+
+
+def start_buffering():
+    """Collect console output instead of printing it."""
+    global _buffer
+    _buffer = []
+
+
+def is_buffering():
+    return _buffer is not None
+
+
+def flush_buffered():
+    """Print everything collected, and stop buffering."""
+    global _buffer
+    lines, _buffer = _buffer, None
+    for line in (lines or []):
+        print(line, flush=True)
+    return len(lines or [])
+
+
+def drop_buffered():
+    """Discard everything collected, and stop buffering."""
+    global _buffer
+    dropped, _buffer = _buffer, None
+    return len(dropped or [])
 
 
 # === COLOR ===
@@ -267,8 +302,12 @@ def strip_ansi(text):
 
 # === MESSAGES ===
 def say(msg=""):
-    if not _json_mode:
-        print(msg, flush=True)
+    if _json_mode:
+        return
+    if _buffer is not None:
+        _buffer.append(msg)
+        return
+    print(msg, flush=True)
 
 
 def err(msg):
@@ -444,6 +483,15 @@ API_BASE_GM_CANDIDATES = [
     "/global-manager/api/v1/global-infra",
     "/policy/api/v1/global-infra",
 ]
+
+# NSX Projects (multi-tenancy). A project has its own infra tree, so every
+# policy path the toolkit builds hangs off a different base -- which is why
+# scoping is a base swap here rather than a filter at each call site. Objects
+# in the default infra are simply not visible from inside a project, and vice
+# versa, so `--project` genuinely changes what the tool can see.
+DEFAULT_ORG = "default"
+API_BASE_PROJECT = "/policy/api/v1/orgs/{org}/projects/{project}/infra"
+PATH_PROJECTS = "/policy/api/v1/orgs/{org}/projects"
 
 # --- Policy paths (relative to a base) -------------------------------------
 PATH_GROUPS = "/domains/{domain}/groups"
@@ -661,6 +709,14 @@ def p_services(base):
     return base + PATH_SERVICES
 
 
+def project_base(project, org=DEFAULT_ORG):
+    return API_BASE_PROJECT.format(org=org, project=project)
+
+
+def p_projects(org=DEFAULT_ORG):
+    return PATH_PROJECTS.format(org=org)
+
+
 def p_traceflow_one(tid):
     """Absolute: traceflow is a Manager API, not a Policy one."""
     return PATH_TRACEFLOW_ONE.format(tid=tid)
@@ -861,6 +917,14 @@ def load_taxonomy(explicit_path=None, search_dirs=(), names=()):
 
 VALID_AUTH_MODES = ("session", "basic", "token", "cert")
 
+PROFILES_KEY = "profiles"
+DEFAULT_PROFILE_KEY = "default_profile"
+PROFILE_ENV = "NSX_PROFILE"
+
+# The name reported for a flat, single-estate inventory, so output that says
+# "which estate am I talking to" has something to print either way.
+IMPLICIT_PROFILE = "(default)"
+
 
 def inventory_candidates(explicit_path=None, search_dirs=()):
     if explicit_path:
@@ -902,8 +966,7 @@ def validate_manager(entry, index):
     return problems
 
 
-def load_inventory(path):
-    """Read and validate an inventory file. Raises ConfigError on any problem."""
+def _read_inventory_file(path):
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -913,11 +976,90 @@ def load_inventory(path):
         raise ConfigError("Cannot read {}: {}".format(path, e)) from e
     if not isinstance(data, dict):
         raise ConfigError("{}: top level must be an object".format(path))
-    managers = data.get("managers")
+    return data
+
+
+def list_profiles(path):
+    """Profile names in an inventory, newest-format first.
+
+    A flat inventory has none, and says so with an empty list rather than
+    inventing one -- callers distinguish "no profiles" from "profile absent".
+    """
+    data = _read_inventory_file(path)
+    profiles = data.get(PROFILES_KEY)
+    if not isinstance(profiles, dict):
+        return []
+    return sorted(profiles)
+
+
+def resolve_profile(path, requested=None):
+    """Which profile a run should use, and why.
+
+    Precedence: --profile, then $NSX_PROFILE, then the file's
+    default_profile, then the only profile if there is exactly one. A file
+    with several profiles and no default refuses rather than picking, because
+    guessing which estate to talk to is the one wrong answer that matters.
+    """
+    data = _read_inventory_file(path)
+    profiles = data.get(PROFILES_KEY)
+    if not isinstance(profiles, dict) or not profiles:
+        if requested:
+            raise ConfigError(
+                "{} has no profiles, so --profile {} means nothing. It is a "
+                "single-estate inventory.".format(path, requested))
+        return None, "single estate"
+    wanted = requested or os.environ.get(PROFILE_ENV) or data.get(
+        DEFAULT_PROFILE_KEY)
+    if not wanted:
+        if len(profiles) == 1:
+            only = next(iter(profiles))
+            return only, "the only profile"
+        raise ConfigError(
+            "{} defines {} profiles ({}) and no '{}'. Choose one with "
+            "--profile, or set {}.".format(
+                path, len(profiles), ", ".join(sorted(profiles)),
+                DEFAULT_PROFILE_KEY, PROFILE_ENV))
+    if wanted not in profiles:
+        raise ConfigError(
+            "No profile '{}' in {}. Known: {}".format(
+                wanted, path, ", ".join(sorted(profiles))))
+    source = ("--profile" if requested
+              else (PROFILE_ENV if os.environ.get(PROFILE_ENV)
+                    else DEFAULT_PROFILE_KEY))
+    return wanted, source
+
+
+def load_inventory(path, profile=None):
+    """Read and validate an inventory file. Raises ConfigError on any problem.
+
+    `profile` selects one estate out of a multi-profile file. It is resolved
+    by the caller so the chosen name can be reported; passing it again here
+    is what actually narrows the managers.
+    """
+    data = _read_inventory_file(path)
+    profiles = data.get(PROFILES_KEY)
+    where = path
+    if isinstance(profiles, dict) and profiles:
+        name = profile
+        if name is None:
+            name, _why = resolve_profile(path)
+        section = profiles.get(name)
+        if not isinstance(section, dict):
+            raise ConfigError(
+                "No profile '{}' in {}. Known: {}".format(
+                    name, path, ", ".join(sorted(profiles))))
+        managers = section.get("managers")
+        where = "{} [profile {}]".format(path, name)
+    else:
+        if profile:
+            raise ConfigError(
+                "{} has no profiles, so --profile {} means nothing.".format(
+                    path, profile))
+        managers = data.get("managers")
     if not managers:
-        raise ConfigError("{} has no 'managers'.".format(path))
+        raise ConfigError("{} has no 'managers'.".format(where))
     if not isinstance(managers, list):
-        raise ConfigError("{}: 'managers' must be a list".format(path))
+        raise ConfigError("{}: 'managers' must be a list".format(where))
     problems = []
     seen = set()
     for i, entry in enumerate(managers):
@@ -930,7 +1072,8 @@ def load_inventory(path):
             problems.append("duplicate manager name {!r}".format(name))
         seen.add(name)
     if problems:
-        raise ConfigError("{}:\n      - {}".format(path, "\n      - ".join(problems)))
+        raise ConfigError("{}:\n      - {}".format(where,
+                                                   "\n      - ".join(problems)))
     return managers
 
 
@@ -1354,6 +1497,10 @@ class Nsx:
         self.auth_mode = (entry.get("auth") or "session").lower()
         self._user, self._pwd = user, pwd
         self._base = entry.get("policy_base")
+        # NSX Project scoping. Set, every policy path hangs off the project's
+        # own infra tree instead of the default one.
+        self.project = entry.get("project")
+        self.org = entry.get("org") or DEFAULT_ORG
         self._version = None
         self._vm_index = None
         self._vm_lock = threading.Lock()
@@ -1529,6 +1676,12 @@ class Nsx:
             return self._base
         with self._base_lock:
             if self._base:
+                return self._base
+            if self.project:
+                # A project's tree is the same on either role, so no probe.
+                self._base = project_base(self.project, self.org)
+                if verbose:
+                    say("    project scope: {}".format(cG(self._base)))
                 return self._base
             if self.role != ROLE_GM:
                 self._base = API_BASE_LM
@@ -1847,6 +2000,10 @@ class Exporter:
     def __init__(self, export_dir=None):
         self.export_dir = export_dir or DEFAULT_EXPORT_DIR
         self._sets = []
+        # Findings are a second channel alongside rows: rows are "here is the
+        # data", findings are "here is what is wrong with it". CSV and JSON
+        # want the first; JUnit, SARIF, metrics and a webhook want the second.
+        self._findings = []
 
     def stage(self, label, headers, rows):
         """Add a result set. Empty sets are still recorded so --json reports
@@ -1857,11 +2014,32 @@ class Exporter:
     def sets(self):
         return list(self._sets)
 
+    def stage_findings(self, label, findings):
+        """Record machine-readable findings for this run."""
+        for item in findings:
+            entry = dict(item)
+            entry.setdefault("suite", label)
+            self._findings.append(entry)
+
+    @property
+    def findings(self):
+        return list(self._findings)
+
+    def findings_by_suite(self):
+        suites = {}
+        for item in self._findings:
+            suites.setdefault(item.get("suite", "nsxctl"), []).append(item)
+        return suites
+
+    def has_findings(self):
+        return bool(self._findings)
+
     def has_staged(self):
         return any(rs.rows for rs in self._sets)
 
     def clear(self):
         self._sets = []
+        self._findings = []
 
     def _ensure_dir(self, path):
         d = os.path.dirname(os.path.abspath(path))
@@ -3304,6 +3482,293 @@ def describe_snapshot(snapshot):
 
 
 # ==========================================================================
+# sinks.py  --  Machine-readable outputs, and the state that makes a scheduled run quiet.
+# ==========================================================================
+
+STATE_DIR = os.path.join(DATA_DIR, "state")
+
+# Every severity vocabulary in the toolkit, mapped onto the two that machine
+# formats understand. Anything unrecognised is a warning: under-reporting a
+# finding is worse than over-reporting one.
+SARIF_LEVELS = {
+    "critical": "error", "high": "error", "security": "error",
+    "missing": "error", "medium": "warning", "degraded": "warning",
+    "low": "note", "cosmetic": "note", "ok": "none", "n/a": "none",
+}
+FAILING_SEVERITIES = frozenset({"critical", "high", "security", "missing",
+                                "medium", "degraded"})
+
+WEBHOOK_TIMEOUT = 10.0
+
+
+def sarif_level(severity):
+    return SARIF_LEVELS.get(str(severity).lower(), "warning")
+
+
+def is_failing(severity):
+    return str(severity).lower() in FAILING_SEVERITIES
+
+
+# === FINDINGS ===
+def make_finding(check, severity, message, where="", passed=False, detail=""):
+    """One machine-readable finding. A plain dict on purpose: it is written to
+    four formats and posted to a fifth, and none of them want an object."""
+    return {"check": str(check), "severity": str(severity),
+            "message": str(message), "where": str(where),
+            "passed": bool(passed), "detail": str(detail)}
+
+
+def summarise_findings(findings):
+    counts = {}
+    for item in findings:
+        counts[item["severity"]] = counts.get(item["severity"], 0) + 1
+    return counts
+
+
+# === JUNIT ===
+def _xml_attr(value):
+    return saxutils.quoteattr(str(value))
+
+
+def _xml_text(value):
+    return saxutils.escape(str(value))
+
+
+def render_junit(suites):
+    """suites: {suite name: [finding, ...]}.
+
+    A passing check still emits a testcase. A suite with no testcases at all
+    reads in most CI UIs as "did not run", which is exactly the wrong thing to
+    show for a clean estate.
+    """
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>', "<testsuites>"]
+    for name in sorted(suites):
+        items = suites[name]
+        failures = sum(1 for f in items if not f["passed"])
+        parts.append(
+            '  <testsuite name={} tests="{}" failures="{}" timestamp={}>'
+            .format(_xml_attr(name), len(items) or 1, failures,
+                    _xml_attr(utc_now_iso())))
+        if not items:
+            parts.append(
+                '    <testcase classname={} name="no findings"/>'.format(
+                    _xml_attr(name)))
+        for item in items:
+            case = '    <testcase classname={} name={}'.format(
+                _xml_attr(name),
+                _xml_attr("{}: {}".format(item["check"], item["where"])
+                          if item["where"] else item["check"]))
+            if item["passed"]:
+                parts.append(case + "/>")
+                continue
+            parts.append(case + ">")
+            parts.append(
+                '      <failure type={} message={}>{}</failure>'.format(
+                    _xml_attr(item["severity"]), _xml_attr(item["message"]),
+                    _xml_text(item["detail"] or item["message"])))
+            parts.append("    </testcase>")
+        parts.append("  </testsuite>")
+    parts.append("</testsuites>")
+    return "\n".join(parts) + "\n"
+
+
+# === SARIF ===
+def render_sarif(findings, tool_name=TOOL_NAME, version=VERSION):
+    """SARIF 2.1.0. Rules are deduplicated by check name so a UI groups them."""
+    rules, seen = [], {}
+    for item in findings:
+        if item["check"] in seen:
+            continue
+        seen[item["check"]] = len(rules)
+        rules.append({
+            "id": item["check"],
+            "shortDescription": {"text": item["check"].replace("_", " ")},
+            "defaultConfiguration": {"level": sarif_level(item["severity"])},
+        })
+    results = []
+    for item in findings:
+        if item["passed"]:
+            continue
+        results.append({
+            "ruleId": item["check"],
+            "ruleIndex": seen[item["check"]],
+            "level": sarif_level(item["severity"]),
+            "message": {"text": item["detail"] or item["message"]},
+            "properties": {"severity": item["severity"],
+                           "object": item["where"]},
+            # NSX objects are not files, so the "location" is the object path.
+            # Emitting a fake file location would make a UI offer to open it.
+            "locations": [{"logicalLocations": [
+                {"fullyQualifiedName": item["where"] or item["check"],
+                 "kind": "resource"}]}],
+        })
+    return json.dumps({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": tool_name, "version": version,
+                                "rules": rules}},
+            "results": results,
+        }],
+    }, indent=2) + "\n"
+
+
+# === PROMETHEUS ===
+def _metric_name(text):
+    cleaned = "".join(c if c.isalnum() else "_" for c in str(text).lower())
+    return cleaned.strip("_") or "unknown"
+
+
+def render_metrics(command, findings, extra=None, prefix="nsxctl"):
+    """Prometheus textfile format, for a node_exporter collector directory.
+
+    One gauge per severity plus a run timestamp, which is what an alert rule
+    needs: "critical findings above zero" and "this check has not run today"
+    are both real alerts, and the second one is the one people forget.
+    """
+    counts = summarise_findings([f for f in findings if not f["passed"]])
+    lines = [
+        "# HELP {}_findings Findings by severity from the last run.".format(
+            prefix),
+        "# TYPE {}_findings gauge".format(prefix),
+    ]
+    for severity in sorted(counts):
+        lines.append('{}_findings{{command="{}",severity="{}"}} {}'.format(
+            prefix, _metric_name(command), _metric_name(severity),
+            counts[severity]))
+    if not counts:
+        lines.append('{}_findings{{command="{}",severity="none"}} 0'.format(
+            prefix, _metric_name(command)))
+    lines.extend([
+        "# HELP {}_last_run_timestamp_seconds When this command last "
+        "completed.".format(prefix),
+        "# TYPE {}_last_run_timestamp_seconds gauge".format(prefix),
+        '{}_last_run_timestamp_seconds{{command="{}"}} {}'.format(
+            prefix, _metric_name(command), int(time.time())),
+    ])
+    for key, value in sorted((extra or {}).items()):
+        lines.extend([
+            "# TYPE {}_{} gauge".format(prefix, _metric_name(key)),
+            '{}_{}{{command="{}"}} {}'.format(
+                prefix, _metric_name(key), _metric_name(command), value),
+        ])
+    return "\n".join(lines) + "\n"
+
+
+# === WRITING ===
+def write_text(path, text):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    # Written whole then moved, so a collector never reads half a file.
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+# === WEBHOOK ===
+def post_webhook(url, payload, timeout=WEBHOOK_TIMEOUT):
+    """POST a JSON summary. Returns the status code.
+
+    Deliberately stdlib-only and deliberately not retried: a notification that
+    silently retries into a chat channel is how one failing check becomes
+    forty messages. One attempt, and the failure is reported.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise NsxError(
+            "Webhook URL must be http or https (got {!r}).".format(url))
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "{}/{}".format(TOOL_NAME.replace(" ", "-"),
+                                              VERSION)})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status
+    except urllib.error.HTTPError as e:
+        raise NsxError("Webhook returned HTTP {}.".format(e.code)) from e
+    except (urllib.error.URLError, OSError) as e:
+        raise NsxError("Webhook could not be reached: {}".format(e)) from e
+
+
+def webhook_payload(command, findings, changed, profile=None, project=None):
+    counts = summarise_findings([f for f in findings if not f["passed"]])
+    worst = ""
+    for severity in ("critical", "security", "missing", "high", "medium",
+                     "degraded", "low", "cosmetic"):
+        if counts.get(severity):
+            worst = severity
+            break
+    return {
+        "tool": TOOL_NAME, "version": VERSION, "command": command,
+        "timestamp": utc_now_iso(), "profile": profile or "",
+        "project": project or "", "changed_since_last_run": bool(changed),
+        "total": sum(counts.values()), "worst_severity": worst,
+        "counts": counts,
+        "findings": [f for f in findings if not f["passed"]][:50],
+    }
+
+
+# === RUN STATE ===
+def fingerprint(findings):
+    """A stable hash of what the run found.
+
+    Sorted and built only from what a finding *is*, never from when it ran or
+    how long it took -- otherwise every run differs from the last and
+    "quiet unless changed" is never quiet.
+    """
+    material = sorted(
+        "{}|{}|{}|{}".format(f["check"], f["severity"], f["where"],
+                             f["message"])
+        for f in findings if not f["passed"])
+    digest = hashlib.sha256("\n".join(material).encode("utf-8")).hexdigest()
+    return digest
+
+
+def state_path(command, profile=None, project=None, root=None):
+    safe = "".join(c if c.isalnum() else "_"
+                   for c in "{}_{}_{}".format(command, profile or "default",
+                                              project or "infra"))
+    return os.path.join(root or STATE_DIR, safe[:100] + ".json")
+
+
+def load_state(command, profile=None, project=None, root=None):
+    try:
+        with open(state_path(command, profile, project, root),
+                  encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(command, digest, counts, profile=None, project=None, root=None):
+    path = state_path(command, profile, project, root)
+    try:
+        write_text(path, json.dumps({
+            "command": command, "fingerprint": digest, "counts": counts,
+            "last_run": utc_now_iso()}, indent=2, sort_keys=True) + "\n")
+    except OSError as e:
+        debug("could not write run state {}: {}".format(path, e))
+        return None
+    return path
+
+
+def changed_since_last(command, findings, profile=None, project=None,
+                       root=None):
+    """(changed, previous_state). A first run always counts as changed."""
+    digest = fingerprint(findings)
+    previous = load_state(command, profile, project, root)
+    if not previous:
+        return True, {}
+    return previous.get("fingerprint") != digest, previous
+
+
+# ==========================================================================
 # diff.py  --  Comparing two configuration snapshots.
 # ==========================================================================
 
@@ -3505,6 +3970,27 @@ def diff_rows(changes):
                          fmt_diff_value(field.before), fmt_diff_value(field.after),
                          change.changed_by, str(change.changed_at)])
     return rows
+
+
+def drift_findings(changes):
+    """Object changes as machine-readable findings.
+
+    Severity is the impact the diff engine already computed, so a scheduled
+    drift check reports a new any-any rule as an error and a rename as a note
+    without a second classification anybody could get out of step.
+    """
+    out = []
+    for change in changes:
+        fields = ", ".join(sorted({f.field for f in change.fields})) or \
+            change.status
+        out.append(make_finding(
+            "drift_{}".format(change.status), change.impact,
+            "{} {} {}".format(change.status, change.kind, change.name),
+            where="{}/{}".format(change.manager, change.name),
+            detail="{}  changed by {} {}".format(
+                fields, change.changed_by or "unknown",
+                change.changed_at or "")))
+    return out
 
 
 def at_impact(changes, level):
@@ -3969,6 +4455,481 @@ def load_change_file(path):
 
 
 # ==========================================================================
+# flows.py  --  Observed flows into a proposed ruleset.
+# ==========================================================================
+
+# Column names accepted for each field, lowercased. Every flow exporter names
+# these differently and none of them are wrong, so the reader accepts the
+# common spellings instead of demanding one.
+COLUMN_ALIASES = {
+    "source": ("source", "src", "src_ip", "source_ip", "sourceaddress",
+               "source_address", "src_addr"),
+    "destination": ("destination", "dst", "dst_ip", "destination_ip",
+                    "destinationaddress", "destination_address", "dst_addr"),
+    "port": ("port", "dst_port", "destination_port", "dstport", "port_display",
+             "service_port", "destinationport"),
+    "protocol": ("protocol", "proto", "ip_protocol", "l4_protocol"),
+    "action": ("action", "flow_action", "disposition"),
+    "count": ("count", "flows", "sessions", "hits", "packets"),
+}
+
+DEFAULT_MAX_PORTS = 12
+ALLOWED_ACTIONS = ("allow", "allowed", "accept", "accepted", "permit", "")
+
+
+class Flow:
+    """One observed conversation, already aggregated by the exporter."""
+
+    __slots__ = ("source", "destination", "port", "protocol", "count", "line")
+
+    def __init__(self, source, destination, port, protocol="tcp", count=1,
+                 line=0):
+        self.source = source
+        self.destination = destination
+        self.port = port
+        self.protocol = (protocol or "tcp").lower()
+        self.count = count
+        self.line = line
+
+    def key(self):
+        return (self.source, self.destination, self.protocol)
+
+
+def _pick(row, field):
+    for alias in COLUMN_ALIASES[field]:
+        for key in row:
+            if key and key.strip().lower() == alias:
+                value = row[key]
+                if value not in (None, ""):
+                    return str(value).strip()
+    return ""
+
+
+def _normalise_protocol(text):
+    value = str(text or "tcp").strip().lower()
+    if value in ("6", "tcp"):
+        return "tcp"
+    if value in ("17", "udp"):
+        return "udp"
+    if value in ("1", "icmp", "icmpv4"):
+        return "icmp"
+    return value or "tcp"
+
+
+def read_flows(path, include_denied=False):
+    """(flows, problems) from a CSV or JSON flow export.
+
+    Rows that cannot be read are reported individually rather than failing the
+    file, the same way bulk tagging handles a bad CSV line: one malformed row
+    in a ten-thousand-row export should not cost you the other 9,999.
+    """
+    if not os.path.isfile(path):
+        raise ConfigError("Not found: {}".format(path))
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        head = f.read(1)
+        f.seek(0)
+        if head == "[":
+            try:
+                rows = json.load(f)
+            except ValueError as e:
+                raise ConfigError(
+                    "{} is not valid JSON: {}".format(path, e)) from e
+            if not isinstance(rows, list):
+                raise ConfigError("{}: expected a list of flows.".format(path))
+        elif head == "{":
+            raise ConfigError(
+                "{}: expected a list of flows, not an object. Export the "
+                "rows themselves.".format(path))
+        else:
+            rows = list(csv.DictReader(f))
+    if not rows:
+        raise ConfigError("No flows in {}.".format(path))
+
+    flows, problems = [], []
+    for index, row in enumerate(rows, 2):
+        if not isinstance(row, dict):
+            problems.append("line {}: not a record".format(index))
+            continue
+        source = _pick(row, "source")
+        destination = _pick(row, "destination")
+        if not source or not destination:
+            problems.append(
+                "line {}: needs a source and a destination address".format(
+                    index))
+            continue
+        action = _pick(row, "action").lower()
+        if action and action not in ALLOWED_ACTIONS and not include_denied:
+            # A denied flow is not evidence the rule should exist -- it is
+            # usually evidence the segmentation is working.
+            continue
+        port_text = _pick(row, "port")
+        protocol = _normalise_protocol(_pick(row, "protocol"))
+        port = None
+        if port_text:
+            try:
+                port = int(str(port_text).split("/")[0])
+            except ValueError:
+                problems.append("line {}: port {!r} is not a number".format(
+                    index, port_text))
+                continue
+        elif protocol != "icmp":
+            problems.append("line {}: no destination port".format(index))
+            continue
+        try:
+            count = int(float(_pick(row, "count") or 1))
+        except ValueError:
+            count = 1
+        flows.append(Flow(source, destination, port, protocol, count, index))
+    return flows, problems
+
+
+# === ENDPOINT RESOLUTION ===
+def build_address_index(groups):
+    """{address or network: [group path]} from group criteria.
+
+    Only literal addresses and CIDRs declared on a group are used. There is no
+    reverse VM-IP lookup here on purpose: an address that resolves to nothing
+    is reported as unclassified, which is a finding, whereas guessing at it
+    would produce a rule for a workload nobody has actually placed.
+    """
+    index = {}
+    for path, entry in groups.items():
+        group = entry[1] if isinstance(entry, tuple) else entry
+        for item in (group.get(F_EXPRESSION) or []):
+            for raw in (item.get(F_IP_ADDRESSES) or []):
+                index.setdefault(str(raw), []).append(path)
+    return index
+
+
+def resolve_address(address, index, vm_addresses=None):
+    """Group paths an address belongs to, most specific first.
+
+    Exact match, then containing CIDR, then a VM whose VIF carries the
+    address. Anything else is unresolved and says so.
+    """
+    hits = list(index.get(address, []))
+    if not hits:
+        try:
+            wanted = ipaddress.ip_address(address)
+        except ValueError:
+            wanted = None
+        if wanted is not None:
+            for raw, paths in index.items():
+                if "/" not in str(raw):
+                    continue
+                try:
+                    network = ipaddress.ip_network(str(raw), strict=False)
+                except ValueError:
+                    continue
+                if wanted in network:
+                    hits.extend(paths)
+    if not hits and vm_addresses:
+        hits.extend(vm_addresses.get(address, []))
+    seen, ordered = set(), []
+    for path in hits:
+        if path not in seen:
+            seen.add(path)
+            ordered.append(path)
+    return ordered
+
+
+# === PROPOSAL ===
+class Proposal:
+    """One proposed rule, plus what it was derived from."""
+
+    __slots__ = ("source_groups", "destination_groups", "protocol", "ports",
+                 "flow_count", "source_address", "destination_address")
+
+    def __init__(self, source_groups, destination_groups, protocol, ports,
+                 flow_count, source_address="", destination_address=""):
+        self.source_groups = list(source_groups)
+        self.destination_groups = list(destination_groups)
+        self.protocol = protocol
+        self.ports = sorted(set(ports))
+        self.flow_count = flow_count
+        self.source_address = source_address
+        self.destination_address = destination_address
+
+    def rule_id(self, prefix="flow"):
+        def short(paths):
+            return (paths[0].rsplit("/", 1)[-1] if paths else "any")[:24]
+        ports = "-".join(str(p) for p in self.ports[:3]) or self.protocol
+        return "{}-{}-to-{}-{}".format(prefix, short(self.source_groups),
+                                       short(self.destination_groups), ports)
+
+    def row(self):
+        return [", ".join(p.rsplit("/", 1)[-1] for p in self.source_groups),
+                ", ".join(p.rsplit("/", 1)[-1]
+                          for p in self.destination_groups),
+                self.protocol,
+                ",".join(str(p) for p in self.ports),
+                str(self.flow_count)]
+
+
+class Unresolved:
+    """An observed endpoint no group claims. The most useful row in the file."""
+
+    __slots__ = ("address", "side", "flow_count")
+
+    def __init__(self, address, side, flow_count):
+        self.address = address
+        self.side = side
+        self.flow_count = flow_count
+
+    def row(self):
+        return [self.address, self.side, str(self.flow_count)]
+
+
+def propose_rules(flows, groups, max_ports=DEFAULT_MAX_PORTS,
+                  vm_addresses=None):
+    """(proposals, unresolved, wide) from observed flows.
+
+    `wide` is pairs that talked on more than `max_ports` distinct ports --
+    usually a scanner or a monitoring host, and turning that into one rule
+    with fifty ports would bury the finding rather than surface it.
+    """
+    index = build_address_index(groups)
+    pairs = {}
+    unresolved = {}
+
+    for flow in flows:
+        sources = resolve_address(flow.source, index, vm_addresses)
+        destinations = resolve_address(flow.destination, index, vm_addresses)
+        if not sources:
+            entry = unresolved.setdefault(("source", flow.source), 0)
+            unresolved[("source", flow.source)] = entry + flow.count
+        if not destinations:
+            entry = unresolved.setdefault(("destination", flow.destination), 0)
+            unresolved[("destination", flow.destination)] = entry + flow.count
+        if not sources or not destinations:
+            continue
+        key = (tuple(sources), tuple(destinations), flow.protocol)
+        bucket = pairs.setdefault(key, {"ports": set(), "count": 0,
+                                        "src": flow.source,
+                                        "dst": flow.destination})
+        if flow.port is not None:
+            bucket["ports"].add(flow.port)
+        bucket["count"] += flow.count
+
+    proposals, wide = [], []
+    for (sources, destinations, protocol), bucket in sorted(
+            pairs.items(), key=lambda kv: -kv[1]["count"]):
+        proposal = Proposal(sources, destinations, protocol, bucket["ports"],
+                            bucket["count"], bucket["src"], bucket["dst"])
+        if len(proposal.ports) > max_ports:
+            wide.append(proposal)
+            continue
+        proposals.append(proposal)
+
+    unresolved_list = [Unresolved(address, side, count)
+                       for (side, address), count in sorted(
+                           unresolved.items(), key=lambda kv: -kv[1])]
+    return proposals, unresolved_list, wide
+
+
+def proposals_to_change_file(proposals, policy, action="ALLOW",
+                             prefix="flow", services=None):
+    """The proposal as an `nsxctl apply` document.
+
+    Emitted as a change file rather than written directly, because a ruleset
+    derived from observed traffic is a draft: it needs a person to read it,
+    name the rules properly, and decide what the observation window missed.
+    """
+    rules = []
+    for proposal in proposals:
+        entry = {
+            "id": proposal.rule_id(prefix),
+            "policy": policy,
+            "source": list(proposal.source_groups),
+            "destination": list(proposal.destination_groups),
+            "action": action,
+            "description": "derived from {} observed flow(s) on {}/{}".format(
+                proposal.flow_count, proposal.protocol,
+                ",".join(str(p) for p in proposal.ports) or "any"),
+        }
+        if services:
+            entry["services"] = list(services)
+        rules.append(entry)
+    return {"rules": rules}
+
+
+def group_display_names(groups):
+    return {path: (entry[1] if isinstance(entry, tuple) else entry).get(
+        F_DISPLAY_NAME) or (entry[1] if isinstance(entry, tuple)
+                            else entry).get(F_ID) or path
+            for path, entry in groups.items()}
+
+
+# ==========================================================================
+# namecache.py  --  Cached object names, so shell completion never blocks on NSX.
+# ==========================================================================
+
+CACHE_DIR = os.path.join(DATA_DIR, "completion")
+
+# Kinds of name worth completing. Each maps to one argument the CLI takes.
+KIND_GROUP = "groups"
+KIND_POLICY = "policies"
+KIND_SERVICE = "services"
+KIND_RULE = "rules"
+KIND_MANAGER = "managers"
+KIND_PROFILE = "profiles"
+
+CACHE_KINDS = (KIND_GROUP, KIND_POLICY, KIND_SERVICE, KIND_RULE,
+               KIND_MANAGER, KIND_PROFILE)
+
+# Beyond this the cache is reported as stale. Nothing refuses to use it --
+# stale names are still better than no completion -- but `completion cache`
+# and `doctor` can say so.
+STALE_AFTER_SECONDS = 24 * 3600
+
+_SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+
+
+def _slug(text):
+    cleaned = "".join(c if c in _SAFE else "_" for c in str(text or "default"))
+    return cleaned[:60] or "default"
+
+
+def cache_path(profile=None, project=None, root=None):
+    """One cache file per estate and tenant.
+
+    Keyed that way because a group name in production and the same name in DR
+    are different objects, and completing one into the other is a mistake the
+    shell would make silently.
+    """
+    name = "{}__{}.json".format(_slug(profile or "default"),
+                                _slug(project or "infra"))
+    return os.path.join(root or CACHE_DIR, name)
+
+
+def load_cache(profile=None, project=None, root=None):
+    """The cached names, or an empty cache. Never raises.
+
+    Completion runs inside a shell hook where a traceback would be printed
+    over the user's prompt, so every failure here is silent and empty.
+    """
+    path = cache_path(profile, project, root)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {"written": 0, "names": {}}
+    if not isinstance(data, dict):
+        return {"written": 0, "names": {}}
+    names = data.get("names")
+    if not isinstance(names, dict):
+        names = {}
+    return {"written": data.get("written", 0), "names": names}
+
+
+def save_cache(names, profile=None, project=None, root=None):
+    """Write the cache. Returns the path, or None if it could not be written.
+
+    A failure here is never fatal: completion degrades to nothing, and the
+    command the user actually ran still succeeded.
+    """
+    path = cache_path(profile, project, root)
+    payload = {"written": int(time.time()),
+               "profile": profile or "", "project": project or "",
+               "names": {k: sorted(set(v)) for k, v in names.items() if v}}
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=1, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError:
+        return None
+    return path
+
+
+def update_cache(kind, values, profile=None, project=None, root=None):
+    """Merge one kind of name into the cache, leaving the others alone.
+
+    Merge rather than replace, because `nsxctl group list --contains web` is a
+    filtered view: replacing would shrink the cache to whatever the last
+    filtered command happened to return.
+    """
+    values = [str(v) for v in values if v]
+    if not values:
+        return None
+    cache = load_cache(profile, project, root)
+    names = dict(cache["names"])
+    names[kind] = sorted(set(names.get(kind, [])) | set(values))
+    return save_cache(names, profile, project, root)
+
+
+def cached_names(kind, profile=None, project=None, root=None):
+    return load_cache(profile, project, root)["names"].get(kind, [])
+
+
+def cache_age(profile=None, project=None, root=None):
+    """Seconds since the cache was written, or None if there isn't one."""
+    written = load_cache(profile, project, root)["written"]
+    if not written:
+        return None
+    return max(0, int(time.time()) - int(written))
+
+
+def is_stale(profile=None, project=None, root=None):
+    age = cache_age(profile, project, root)
+    return age is None or age > STALE_AFTER_SECONDS
+
+
+def describe_age(seconds):
+    if seconds is None:
+        return "never written"
+    if seconds < 90:
+        return "{}s ago".format(seconds)
+    if seconds < 5400:
+        return "{}m ago".format(seconds // 60)
+    if seconds < 172800:
+        return "{}h ago".format(seconds // 3600)
+    return "{}d ago".format(seconds // 86400)
+
+
+def refresh_from_nsx(sessions, domain, profile=None, project=None, root=None):
+    """Rebuild the cache from live NSX. Returns (path, {kind: count}).
+
+    The one place in this module that touches the network, and it is never
+    called from a completion hook -- only from `nsxctl completion cache`, which
+    a person ran deliberately.
+    """
+    names = {KIND_MANAGER: [s.name for s in sessions]}
+
+    groups = group_inventory(sessions, domain)
+    names[KIND_GROUP] = sorted({
+        str(g.get(F_ID) or "") for _n, g in groups.values()} | {
+        str(g.get(F_DISPLAY_NAME) or "") for _n, g in groups.values()})
+
+    gm_sessions, lm_sessions = ordered_sessions(sessions)
+    policy_names = set()
+    for nsx in gm_sessions + lm_sessions:
+        for policy in policies_for(nsx, domain):
+            policy_names.add(str(policy.get(F_ID) or ""))
+            policy_names.add(str(policy.get(F_DISPLAY_NAME) or ""))
+    names[KIND_POLICY] = sorted(policy_names)
+
+    services = service_inventory(sessions, domain)
+    names[KIND_SERVICE] = sorted({
+        str(s.get(F_ID) or "") for s in services.values()} | {
+        str(s.get(F_DISPLAY_NAME) or "") for s in services.values()})
+
+    rule_names = set()
+    for record in sweep_rules(sessions, domain):
+        rule_names.add(str(record.rule_id or ""))
+        rule_names.add(str(record.rule_name or ""))
+    names[KIND_RULE] = sorted(rule_names)
+
+    names = {k: [v for v in vals if v] for k, vals in names.items()}
+    path = save_cache(names, profile, project, root)
+    return path, {k: len(v) for k, v in names.items()}
+
+
+# ==========================================================================
 # report.py  --  Self-contained HTML reports.
 # ==========================================================================
 
@@ -4114,7 +5075,8 @@ GROUPS_HEADERS = ["manager", "group_id", "display_name", "path", "criteria",
                   "members"]
 
 
-def act_groups(sessions, domain, needle, show_members, exporter):
+def act_groups(sessions, domain, needle, show_members, exporter,
+               cache_key=None):
     rows = []
     for nsx in sessions:
         try:
@@ -4167,6 +5129,9 @@ def act_groups(sessions, domain, needle, show_members, exporter):
                          criteria_summary(g.get(F_EXPRESSION)), member_count])
     hr()
     exporter.stage("groups", GROUPS_HEADERS, rows)
+    # Keep TAB completion warm off a listing somebody ran anyway.
+    remember_names(KIND_GROUP, [r[1] for r in rows] + [r[2] for r in rows],
+                   cache_key)
 
 
 # ==========================================================================
@@ -5531,6 +6496,12 @@ def act_hygiene(sessions, domain, exporter, with_members=True):
     findings = evaluate(ctx)
     rows = [f.row() for f in findings]
     exporter.stage("rule_hygiene", HYGIENE_HEADERS, rows)
+    exporter.stage_findings("rule_hygiene", [
+        make_finding(f.check, f.severity, f.detail,
+                     where="{}/{}".format(f.record.policy_name,
+                                          f.record.rule_name),
+                     detail="[{}] {}".format(f.confidence, f.detail))
+        for f in findings])
 
     if not findings:
         say("  {} no hygiene problems found.".format(cBG("Clean:")))
@@ -6134,6 +7105,156 @@ def act_apply_file(ctx, path, dry_run=True, force=False):
                         exporter=ctx.exporter, cache=cache)
 
 
+# === SNAPSHOT RESTORE ===
+def plan_restore(sessions, domain, snapshot, cache=None, prune=False,
+                 kinds=(KIND_GROUP, KIND_RULE)):
+    """Planned writes that bring live NSX back to a snapshot.
+
+    Deliberately per-object through the same engine as every other write, not
+    a bulk push of a whole tree: each object gets a field-level diff you can
+    read, a `_revision` check that refuses to clobber a concurrent edit, and
+    its own audit entry. A blind whole-DFW restore is a different class of
+    risk, and this is not that.
+
+    **Deleting is opt-in.** An object that exists live and not in the snapshot
+    is left alone unless `prune` is set: a snapshot is a record of what was
+    there, not an assertion that nothing else may exist, and something created
+    legitimately since is not drift to be erased.
+    """
+    cache = cache or PlanCache(sessions, domain)
+    changes = []
+    objects = snapshot.get("objects") or {}
+    live_groups = cache.groups
+    live_rules = {r.path: r for r in cache.records if r.path}
+
+    for path, entry in sorted(objects.items()):
+        kind_name = entry.get("kind")
+        body = dict(entry.get("body") or {})
+        if kind_name == "groups" and KIND_GROUP in kinds:
+            changes.extend(_restore_group(sessions, domain, cache, path, body,
+                                          live_groups))
+        elif kind_name == "rules" and KIND_RULE in kinds:
+            changes.extend(_restore_rule(cache, path, body, live_rules,
+                                         domain))
+
+    if prune:
+        changes.extend(_prune_extras(cache, objects, live_groups, live_rules,
+                                     domain, kinds))
+    return [c for c in changes if c is not None]
+
+
+def _restore_group(sessions, domain, cache, path, body, live_groups):
+    group_id = body.get(F_ID) or path.rsplit("/", 1)[-1]
+    existing_entry = live_groups.get(path)
+    if existing_entry is None:
+        # Match on id as well: a group recreated by hand has a new path.
+        for live_path, (nsx, group) in live_groups.items():
+            if group.get(F_ID) == group_id:
+                existing_entry = (nsx, group)
+                path = live_path
+                break
+    if existing_entry is not None:
+        nsx, existing = existing_entry
+    else:
+        gm_sessions, lm_sessions = ordered_sessions(sessions)
+        if not gm_sessions + lm_sessions:
+            return []
+        nsx, existing = (gm_sessions + lm_sessions)[0], None
+    _author_writable(nsx, path, "Group '{}'".format(group_id))
+    after = dict(existing or {})
+    after.update(body)
+    if existing is not None and not [
+            f for f in diff_objects(existing, after)
+            if _author_is_real_change(f)]:
+        return []
+    url = object_url(nsx, domain, KIND_GROUP, group_id)
+    return [PlannedWrite(OP_MODIFY if existing else OP_CREATE, KIND_GROUP,
+                         nsx, url, group_id,
+                         after.get(F_DISPLAY_NAME, group_id),
+                         before=existing, after=after, path=path)]
+
+
+def _restore_rule(cache, path, body, live_rules, domain):
+    record = live_rules.get(path)
+    rule_id = body.get(F_ID) or path.rsplit("/", 1)[-1]
+    policy_id = policy_id_from_rule_path(path)
+    if record is None:
+        # The rule is gone. Recreating it needs a manager that still has the
+        # policy; without one there is nothing to restore it into.
+        for candidate in cache.records:
+            if candidate.policy_id == policy_id:
+                record = candidate
+                break
+        if record is None:
+            return []
+        nsx, existing = record.nsx, None
+    else:
+        nsx, existing = record.nsx, record.rule
+    _author_writable(nsx, path, "Rule '{}'".format(rule_id))
+    after = dict(existing or {})
+    after.update(body)
+    if existing is not None and not [
+            f for f in diff_objects(existing, after)
+            if _author_is_real_change(f)]:
+        return []
+    url = object_url(nsx, domain, KIND_RULE, rule_id, policy_id=policy_id)
+    return [PlannedWrite(OP_MODIFY if existing else OP_CREATE, KIND_RULE, nsx,
+                         url, rule_id, after.get(F_DISPLAY_NAME, rule_id),
+                         before=existing, after=after, policy_id=policy_id,
+                         path=path)]
+
+
+def _prune_extras(cache, objects, live_groups, live_rules, domain, kinds):
+    """Objects that exist live but not in the snapshot. Only with --prune."""
+    changes = []
+    snapshot_ids = {(e.get("kind"), (e.get("body") or {}).get(F_ID))
+                    for e in objects.values()}
+    if KIND_RULE in kinds:
+        for path, record in sorted(live_rules.items()):
+            if ("rules", record.rule_id) in snapshot_ids or path in objects:
+                continue
+            if origin_of_path(path) == "GM" and record.nsx.role == ROLE_LM:
+                continue
+            changes.append(PlannedWrite(
+                OP_DELETE, KIND_RULE, record.nsx,
+                object_url(record.nsx, domain, KIND_RULE, record.rule_id,
+                           policy_id=record.policy_id),
+                record.rule_id, record.rule_name, before=record.rule,
+                policy_id=record.policy_id, path=path))
+    if KIND_GROUP in kinds:
+        for path, (nsx, group) in sorted(live_groups.items()):
+            gid = group.get(F_ID)
+            if ("groups", gid) in snapshot_ids or path in objects:
+                continue
+            if origin_of_path(path) == "GM" and nsx.role == ROLE_LM:
+                continue
+            changes.append(PlannedWrite(
+                OP_DELETE, KIND_GROUP, nsx,
+                object_url(nsx, domain, KIND_GROUP, gid), gid,
+                group.get(F_DISPLAY_NAME, gid), before=group, path=path))
+    return changes
+
+
+def act_restore(ctx, snapshot, dry_run=True, force=False, prune=False):
+    section("RESTORE FROM SNAPSHOT")
+    manifest = snapshot.get("manifest", {})
+    say("  Snapshot taken : {}".format(manifest.get("taken", "?")))
+    say("  Domain         : {}".format(manifest.get("domain", "?")))
+    if prune:
+        say("  {} objects not in the snapshot will be DELETED.".format(
+            cBR("--prune:")))
+    else:
+        say("  {}".format(cD(
+            "Objects that exist now but not in the snapshot are left alone. "
+            "Pass --prune to delete them.")))
+    cache = PlanCache(ctx.sessions, ctx.domain)
+    changes = plan_restore(ctx.sessions, ctx.domain, snapshot, cache=cache,
+                           prune=prune)
+    return execute_plan(changes, ctx.audit, ctx.write_enabled,
+                        dry_run=dry_run, force=force, sessions=ctx.sessions,
+                        domain=ctx.domain, exporter=ctx.exporter, cache=cache)
+
+
 # === UNDO ===
 def undo_object_entry(entry, sessions, domain, audit, force=False):
     """Reverse one audited object write.
@@ -6226,6 +7347,662 @@ def author_menu(ctx):
             say("  Not a valid choice.")
     except (NsxError, ConfigError) as e:
         err(str(e))
+
+
+# ==========================================================================
+# actions/inspect.py  --  Reading rules, policies and services.
+# ==========================================================================
+
+RULE_HEADERS = ["manager", "origin", "category", "policy", "seq", "rule",
+                "action", "direction", "source", "destination", "service",
+                "applied_to", "state", "rule_id"]
+POLICY_HEADERS = ["manager", "origin", "category", "seq", "id", "name",
+                  "rules", "applied_to"]
+SERVICE_HEADERS = ["id", "name", "protocol", "ports", "kind"]
+
+LIST_CONSOLE_LIMIT = 60
+
+
+def _short_refs(paths, limit=2):
+    """Group paths as short ids, because a full NSX path is 60 characters of
+    prefix and 8 of meaning."""
+    values = [p for p in (paths or []) if p]
+    if not values or values == [ANY]:
+        return ANY
+    names = [group_id_from_path(p) for p in values]
+    if len(names) <= limit:
+        return ", ".join(names)
+    return "{}, +{}".format(", ".join(names[:limit]), len(names) - limit)
+
+
+def _state(rule):
+    return "disabled" if rule.get(F_DISABLED) else "enabled"
+
+
+def _rule_action_colour(action):
+    return {"ALLOW": cG, "DROP": cR, "REJECT": cR}.get(action, cY)
+
+
+def rule_row(record):
+    rule = record.rule
+    return [record.nsx.name, record.origin,
+            str(record.policy.get(F_CATEGORY, "")),
+            record.policy_name, str(rule.get(F_SEQUENCE_NUMBER, "")),
+            record.rule_name, rule.get(F_ACTION_FIELD, "?"),
+            rule.get(F_DIRECTION, ""),
+            _short_refs(rule.get(F_SOURCE_GROUPS)),
+            _short_refs(rule.get(F_DEST_GROUPS)),
+            _short_refs(rule.get(F_SERVICES)),
+            _short_refs(rule.get(F_SCOPE)),
+            _state(rule), str(rule.get(F_RULE_ID, ""))]
+
+
+def _matches(record, needle, policy_ref, action, disabled_only):
+    if needle and needle not in "{} {}".format(
+            record.rule_name, record.rule_id).lower():
+        return False
+    if policy_ref and policy_ref not in "{} {}".format(
+            record.policy_name, record.policy_id).lower():
+        return False
+    if action and str(record.rule.get(F_ACTION_FIELD, "")).upper() != action:
+        return False
+    if disabled_only and not record.rule.get(F_DISABLED):
+        return False
+    return True
+
+
+def remember_names(kind, values, cache_key=None):
+    """Refresh part of the completion cache, never fatally.
+
+    A listing that succeeded must not fail because a cache file could not be
+    written -- the user asked for a list, not for a cache.
+    """
+    if not cache_key:
+        return
+    try:
+        update_cache(kind, values, *cache_key)
+    except Exception:  # noqa: BLE001 - never break a read over a cache write
+        pass
+
+
+def act_rule_list(sessions, domain, exporter, contains=None, policy_ref=None,
+                  action=None, disabled_only=False, cache_key=None):
+    """Every DFW rule, in NSX evaluation order.
+
+    Evaluation order rather than fetch order, because the order rules are
+    listed in is the order they decide traffic in -- and a listing sorted any
+    other way invites exactly the mistake `nsxctl trace` exists to catch.
+    """
+    section("DFW RULES")
+    records = evaluation_order(sweep_rules(sessions, domain))
+    needle = (contains or "").lower() or None
+    policy_needle = (policy_ref or "").lower() or None
+    wanted_action = (action or "").upper() or None
+    hits = [r for r in records
+            if _matches(r, needle, policy_needle, wanted_action, disabled_only)]
+
+    say("  {} rule(s) across {} manager(s){}".format(
+        cC(str(len(hits))), len(sessions),
+        "" if len(hits) == len(records)
+        else cD("  ({} total before filtering)".format(len(records)))))
+    say("  {}".format(cD("listed in NSX evaluation order: category, then "
+                         "policy and rule sequence")))
+    hr()
+
+    rows = [rule_row(r) for r in hits]
+    exporter.stage("rules", RULE_HEADERS, rows)
+    # Keep TAB completion warm off work somebody was doing anyway.
+    remember_names(KIND_RULE, [r.rule_name for r in records]
+                   + [r.rule_id for r in records], cache_key)
+    remember_names(KIND_POLICY, [r.policy_name for r in records]
+                   + [r.policy_id for r in records], cache_key)
+    if not hits:
+        say("  {}".format(cD("(nothing matches)")))
+        return rows
+
+    current = None
+    shown = 0
+    for record in hits:
+        if shown >= LIST_CONSOLE_LIMIT:
+            break
+        key = (record.nsx.name, record.policy_id)
+        if key != current:
+            current = key
+            category = record.policy.get(F_CATEGORY)
+            say("\n  {}{}   [{}/{}]".format(
+                cB(record.policy_name),
+                cD("  ({})".format(category)) if category else "",
+                cC(record.nsx.name), cD(record.origin)))
+        rule = record.rule
+        flag = cD("  [disabled]") if rule.get(F_DISABLED) else ""
+        say("    {:>5}  {:26s} {:7s} {} -> {}   svc {}   applied {}{}".format(
+            str(rule.get(F_SEQUENCE_NUMBER, "")),
+            str(record.rule_name)[:26],
+            _rule_action_colour(rule.get(F_ACTION_FIELD))(
+                str(rule.get(F_ACTION_FIELD, "?"))),
+            _short_refs(rule.get(F_SOURCE_GROUPS)),
+            _short_refs(rule.get(F_DEST_GROUPS)),
+            _short_refs(rule.get(F_SERVICES)),
+            _short_refs(rule.get(F_SCOPE)), flag))
+        shown += 1
+    more_note(LIST_CONSOLE_LIMIT, len(hits))
+    hr()
+    return rows
+
+
+def act_rule_show(sessions, domain, exporter, ref, policy_ref=None):
+    """One rule in full, with every field spelled out rather than shortened."""
+    section("RULE")
+    record = find_rule(sessions, domain, ref, policy_ref=policy_ref)
+    rule = record.rule
+    say("  {}   {}".format(cB(record.rule_name),
+                           cD(rule.get(F_ID, ""))))
+    say("  policy      : {}  {}".format(
+        record.policy_name, cD("({})".format(
+            record.policy.get(F_CATEGORY, "?")))))
+    say("  manager     : {}  [{}]".format(cC(record.nsx.name), record.origin))
+    hr()
+    for label, value in (
+            ("action", _rule_action_colour(rule.get(F_ACTION_FIELD))(
+                str(rule.get(F_ACTION_FIELD, "?")))),
+            ("direction", rule.get(F_DIRECTION, "")),
+            ("sequence", rule.get(F_SEQUENCE_NUMBER, "")),
+            ("state", _state(rule)),
+            ("logged", "yes" if rule.get(F_LOGGED) else "no"),
+            ("realized id", rule.get(F_RULE_ID, "")),
+            ("path", cD(record.path))):
+        say("    {:12s}: {}".format(label, value))
+    for label, field in (("source", F_SOURCE_GROUPS),
+                         ("destination", F_DEST_GROUPS),
+                         ("services", F_SERVICES),
+                         ("applied to", F_SCOPE)):
+        values = [v for v in (rule.get(field) or []) if v] or [ANY]
+        say("    {:12s}: {}".format(label, values[0]))
+        for extra in values[1:]:
+            say("    {:12s}  {}".format("", extra))
+    if rule.get("description"):
+        say("    {:12s}: {}".format("description", rule["description"]))
+    hr()
+    say("  {} {}".format(cD("next:"), cC(
+        "nsxctl trace VM_A VM_B --port N   # does this rule actually decide "
+        "a flow?")))
+    rows = [rule_row(record)]
+    exporter.stage("rule", RULE_HEADERS, rows)
+    return rows
+
+
+def act_policy_list(sessions, domain, exporter, contains=None,
+                    cache_key=None):
+    """Security policies, in evaluation order, with their rule counts."""
+    section("SECURITY POLICIES")
+    records = sweep_rules(sessions, domain)
+    counts = {}
+    for record in records:
+        counts[(record.nsx.name, record.policy_id)] = counts.get(
+            (record.nsx.name, record.policy_id), 0) + 1
+
+    gm_sessions, lm_sessions = ordered_sessions(sessions)
+    needle = (contains or "").lower()
+    seen = set()
+    rows = []
+    for nsx in gm_sessions + lm_sessions:
+        for policy in policies_for(nsx, domain):
+            path = policy.get(F_PATH, "")
+            if path and path in seen:
+                continue
+            if path:
+                seen.add(path)
+            pid = policy.get(F_ID, "?")
+            name = policy.get(F_DISPLAY_NAME, pid)
+            if needle and needle not in "{} {}".format(name, pid).lower():
+                continue
+            rows.append([nsx.name, origin_of_path(path),
+                         str(policy.get(F_CATEGORY, "")),
+                         str(policy.get(F_SEQUENCE_NUMBER, "")),
+                         pid, name, str(counts.get((nsx.name, pid), 0)),
+                         _short_refs(policy.get(F_SCOPE))])
+
+    rows.sort(key=lambda r: (category_rank(r[2]), r[3], r[5]))
+    say("  {} policy(ies) across {} manager(s)".format(
+        cC(str(len(rows))), len(sessions)))
+    hr()
+    table(["Manager", "Origin", "Category", "Seq", "Id", "Name", "Rules",
+           "Applied to"],
+          [[cC(r[0]), cD(r[1]), r[2], r[3], cB(r[4]), r[5], r[6], r[7]]
+           for r in rows[:LIST_CONSOLE_LIMIT]], indent=4)
+    more_note(LIST_CONSOLE_LIMIT, len(rows))
+    exporter.stage("policies", POLICY_HEADERS, rows)
+    remember_names(KIND_POLICY, [r[4] for r in rows] + [r[5] for r in rows],
+                   cache_key)
+    return rows
+
+
+def describe_service(service):
+    """(protocol, ports, kind) for one service definition.
+
+    `kind` is what the port matcher in trace.py can do with it: an L4 port set
+    reduces to a port comparison, anything else does not, and saying so here
+    is what makes an undecided trace verdict explicable rather than mystifying.
+    """
+    entries = service.get(F_SERVICE_ENTRIES) or []
+    if not entries:
+        return "", "", "empty"
+    protocols, ports, kinds = [], [], []
+    for entry in entries:
+        kind = entry.get(RT, "?")
+        kinds.append(str(kind).replace("ServiceEntry", ""))
+        if kind != RT_L4_PORTSET:
+            continue
+        protocols.append(str(entry.get(F_L4_PROTOCOL, "")))
+        ports.extend(str(p) for p in (entry.get(F_DESTINATION_PORTS) or []))
+    l4 = all(e.get(RT) == RT_L4_PORTSET for e in entries)
+    return (",".join(sorted({p for p in protocols if p})),
+            ",".join(ports) or ("any" if l4 else ""),
+            "L4 port set" if l4 else "/".join(sorted(set(kinds))))
+
+
+def act_service_list(sessions, domain, exporter, contains=None,
+                     cache_key=None):
+    """Service definitions, and whether each is one trace can decide."""
+    section("SERVICES")
+    services = service_inventory(sessions, domain)
+    needle = (contains or "").lower()
+    rows = []
+    for path, service in sorted(services.items()):
+        sid = service.get(F_ID, path)
+        name = service.get(F_DISPLAY_NAME, sid)
+        if needle and needle not in "{} {}".format(name, sid).lower():
+            continue
+        protocol, ports, kind = describe_service(service)
+        rows.append([sid, name, protocol, ports, kind])
+
+    say("  {} service(s)".format(cC(str(len(rows)))))
+    hr()
+    table(["Id", "Name", "Protocol", "Ports", "Kind"],
+          [[cB(r[0]), r[1], r[2], r[3],
+            r[4] if r[4] == "L4 port set" else cY(r[4])]
+           for r in rows[:LIST_CONSOLE_LIMIT]], indent=4)
+    more_note(LIST_CONSOLE_LIMIT, len(rows))
+    not_l4 = sum(1 for r in rows if r[4] != "L4 port set")
+    if not_l4:
+        say("\n  {} {} service(s) are not plain L4 port sets, so "
+            "`nsxctl trace`".format(cD("note:"), not_l4))
+        say("  {}".format(cD(
+            "reports a rule limited to one of them as undecided rather than "
+            "guessing.")))
+    exporter.stage("services", SERVICE_HEADERS, rows)
+    remember_names(KIND_SERVICE, [r[0] for r in rows] + [r[1] for r in rows],
+                   cache_key)
+    return rows
+
+
+def act_service_show(sessions, domain, exporter, ref):
+    section("SERVICE")
+    services = service_inventory(sessions, domain)
+    needle = str(ref).strip().lower()
+    hits = [s for s in services.values()
+            if needle in (str(s.get(F_ID, "")).lower(),
+                          str(s.get(F_DISPLAY_NAME, "")).lower())]
+    if not hits:
+        say("  {} no service called '{}'.".format(cBR("Not found:"), ref))
+        exporter.stage("service", SERVICE_HEADERS, [])
+        return []
+    service = hits[0]
+    protocol, ports, kind = describe_service(service)
+    say("  {}   {}".format(cB(service.get(F_DISPLAY_NAME, ref)),
+                           cD(service.get(F_ID, ""))))
+    say("  path        : {}".format(cD(service.get(F_PATH, ""))))
+    say("  kind        : {}".format(kind))
+    hr()
+    for entry in (service.get(F_SERVICE_ENTRIES) or []):
+        say("    {}".format(cB(str(entry.get(RT, "?")))))
+        for key in sorted(entry):
+            if key in (RT, F_ID, F_DISPLAY_NAME, F_PATH) or key.startswith("_"):
+                continue
+            say("      {:20s} {}".format(key, entry[key]))
+    if kind != "L4 port set":
+        say("\n  {}".format(cD(
+            "Not a plain L4 port set, so `nsxctl trace` cannot decide whether "
+            "a rule limited to this service matches a given port.")))
+    rows = [[service.get(F_ID, ""), service.get(F_DISPLAY_NAME, ""),
+             protocol, ports, kind]]
+    exporter.stage("service", SERVICE_HEADERS, rows)
+    return rows
+
+
+# ==========================================================================
+# actions/doctor.py  --  What does THIS NSX actually serve.
+# ==========================================================================
+
+DOCTOR_HEADERS = ["manager", "role", "capability", "status", "detail"]
+
+OK, MISSING, DEGRADED, NA = "ok", "missing", "degraded", "n/a"
+
+# What each capability is FOR, so a missing one names the command it breaks
+# rather than an endpoint nobody has heard of.
+CAPABILITY_USES = {
+    "policy base": "everything",
+    "groups": "group list, impact, hygiene",
+    "security policies": "rule list, hygiene, drift, trace",
+    "services": "rule create --service, trace port matching",
+    "rule statistics": "rule hygiene unused checks, rule baseline",
+    "vm inventory": "tag commands, compliance, trace",
+    "group associations": "impact, trace static evaluation",
+    "vifs": "trace (source NIC resolution)",
+    "logical ports": "trace (packet injection point)",
+    "traceflow": "trace (the live half)",
+    "projects": "--project scoping",
+}
+
+
+class Probe:
+    """One capability check against one manager."""
+
+    __slots__ = ("manager", "role", "capability", "status", "detail")
+
+    def __init__(self, manager, role, capability, status, detail=""):
+        self.manager = manager
+        self.role = role
+        self.capability = capability
+        self.status = status
+        self.detail = detail
+
+    def row(self):
+        return [self.manager, self.role, self.capability, self.status,
+                self.detail]
+
+
+def _count_of(payload):
+    if not isinstance(payload, dict):
+        return None
+    if F_RESULT_COUNT in payload:
+        return payload.get(F_RESULT_COUNT)
+    results = payload.get(F_RESULTS)
+    return len(results) if isinstance(results, list) else None
+
+
+def _probe_get(nsx, path, params=None):
+    """(status, detail) for one bounded GET."""
+    try:
+        payload = nsx.get(path, params=params or {PARAM_PAGE_SIZE: 1})
+    except NsxError as e:
+        text = str(e)
+        if "HTTP 404" in text:
+            return MISSING, "404 -- not served by this version"
+        if "HTTP 403" in text:
+            return DEGRADED, "403 -- the account cannot read it"
+        return MISSING, text[-110:]
+    count = _count_of(payload)
+    return OK, "" if count is None else "{} item(s)".format(count)
+
+
+def probe_manager(nsx, domain=DEFAULT_DOMAIN):
+    """Every capability the toolkit depends on, checked once."""
+    probes = []
+    role = ROLE_LABEL.get(nsx.role, "?")
+
+    def add(capability, status, detail=""):
+        probes.append(Probe(nsx.name, role, capability, status, detail))
+
+    version = None
+    try:
+        payload = nsx.get(PATH_NODE_VERSION)
+        version = payload.get("node_version") or payload.get("product_version")
+        add("version", OK, str(version or "unknown"))
+    except NsxError as e:
+        add("version", MISSING, str(e)[-110:])
+
+    try:
+        base = nsx.base(domain)
+        add("policy base", OK, base)
+    except NsxError as e:
+        add("policy base", MISSING, str(e)[-110:])
+        return probes, version
+
+    add("groups", *_probe_get(nsx, p_groups(base, domain)))
+    add("security policies", *_probe_get(nsx, p_sec_policies(base, domain)))
+    add("services", *_probe_get(nsx, p_services(base)))
+    add("group associations", *_probe_get(nsx, p_vm_group_assoc(base),
+                                          params={"vm_external_id": "probe"}))
+
+    # Statistics hang off a real policy, so probe one rather than guessing an
+    # id -- a 404 for "no such policy" would look like "not supported".
+    stats_status, stats_detail = _probe_statistics(nsx, base, domain)
+    add("rule statistics", stats_status, stats_detail)
+
+    if nsx.role == ROLE_LM:
+        add("vm inventory", *_probe_get(nsx, PATH_FABRIC_VMS))
+        add("vifs", *_probe_get(nsx, PATH_FABRIC_VIFS))
+        add("logical ports", *_probe_get(nsx, PATH_LOGICAL_PORTS))
+        add("traceflow", *_probe_get(nsx, PATH_TRACEFLOW))
+    else:
+        for capability in ("vm inventory", "vifs", "logical ports",
+                           "traceflow"):
+            add(capability, NA, "Local Manager only")
+
+    add("projects", *_probe_get(nsx, p_projects(nsx.org)))
+    return probes, version
+
+
+def _probe_statistics(nsx, base, domain):
+    """Statistics need a policy to hang off, so find one first."""
+    try:
+        policies = nsx.get(p_sec_policies(base, domain),
+                           params={PARAM_PAGE_SIZE: 1}).get(F_RESULTS) or []
+    except NsxError as e:
+        return MISSING, "could not list policies: {}".format(str(e)[-80:])
+    if not policies:
+        return NA, "no policy to measure against"
+    pid = policies[0].get("id", "?")
+    status, detail = _probe_get(nsx, p_policy_stats(base, domain, pid),
+                                params={})
+    if status == MISSING:
+        return status, (detail + " -- hit-count checks will be skipped")
+    return status, detail
+
+
+def _probe_colour(status):
+    return {OK: cBG, MISSING: cBR, DEGRADED: cBY, NA: cD}.get(status, cD)
+
+
+def act_doctor(sessions, domain, exporter):
+    """Returns (probes, healthy). Prints a per-manager capability report."""
+    section("NSX CAPABILITY REPORT")
+    say("  {}".format(cD(
+        "What this NSX actually serves. Every probe is a bounded read -- "
+        "nothing is written,")))
+    say("  {}".format(cD(
+        "and traceflow is checked by listing, never by injecting a packet.")))
+
+    all_probes = []
+    for nsx in sessions:
+        hr()
+        say("  {}  {}  {}".format(cB(nsx.name),
+                                  cD(ROLE_LABEL.get(nsx.role, "?")),
+                                  cD(nsx.base_url)))
+        if nsx.project:
+            say("  {}".format(cD("scoped to project {}".format(nsx.project))))
+        probes, _version = probe_manager(nsx, domain)
+        all_probes.extend(probes)
+        rows = []
+        for probe in probes:
+            use = CAPABILITY_USES.get(probe.capability, "")
+            rows.append([
+                probe.capability,
+                _probe_colour(probe.status)(probe.status),
+                probe.detail[:52],
+                cD(use) if probe.status in (MISSING, DEGRADED) else ""])
+        table(["Capability", "Status", "Detail", "Affects"], rows, indent=4)
+
+    hr()
+    missing = [p for p in all_probes if p.status == MISSING]
+    degraded = [p for p in all_probes if p.status == DEGRADED]
+    exporter.stage("doctor", DOCTOR_HEADERS, [p.row() for p in all_probes])
+    exporter.stage_findings("nsx_capabilities", [
+        make_finding(probe.capability, probe.status,
+                     "{} on {}".format(probe.capability, probe.manager),
+                     where=probe.manager,
+                     passed=probe.status in (OK, NA),
+                     detail="{}  affects: {}".format(
+                         probe.detail,
+                         CAPABILITY_USES.get(probe.capability, "")))
+        for probe in all_probes])
+
+    if not missing and not degraded:
+        say("  {} every surface the toolkit uses is available.".format(
+            cBG("Healthy:")))
+        return all_probes, True
+
+    if missing:
+        say("  {} {} capability(ies) are not served here:".format(
+            cBR("Missing:"), len(missing)))
+        for probe in missing:
+            say("    {} / {}   {}".format(
+                cC(probe.manager), cB(probe.capability),
+                cD(CAPABILITY_USES.get(probe.capability, ""))))
+    if degraded:
+        say("  {} {} capability(ies) exist but this account cannot read "
+            "them:".format(cBY("Degraded:"), len(degraded)))
+        for probe in degraded:
+            say("    {} / {}".format(cC(probe.manager), cB(probe.capability)))
+    say("\n  {}".format(cD(
+        "A missing capability is not a bug in the toolkit -- the commands "
+        "that use it")))
+    say("  {}".format(cD(
+        "degrade and say so. This report is the thing to paste into a "
+        "question about it.")))
+    return all_probes, False
+
+
+def unhealthy_count(probes):
+    return sum(1 for p in probes if p.status in (MISSING, DEGRADED))
+
+
+def gm_only_estate(sessions):
+    """True when nothing that needs a Local Manager can possibly work."""
+    return bool(sessions) and all(s.role == ROLE_GM for s in sessions)
+
+
+# ==========================================================================
+# actions/recommend.py  --  Turn observed flows into a reviewable ruleset proposal.
+# ==========================================================================
+
+PROPOSAL_HEADERS = ["source", "destination", "protocol", "ports", "flows"]
+UNRESOLVED_HEADERS = ["address", "side", "flows"]
+
+RECOMMEND_CONSOLE_LIMIT = 30
+
+
+def act_recommend(sessions, domain, exporter, flow_file, policy=None,
+                  out_file=None, max_ports=DEFAULT_MAX_PORTS,
+                  include_denied=False, action="ALLOW"):
+    """Read a flow export, propose rules, and write a change file.
+
+    Returns (proposals, unresolved, wide). Nothing is written to NSX: the
+    output is an `nsxctl apply` document, because a ruleset derived from an
+    observation window is a draft that needs a person to read it.
+    """
+    section("RULE RECOMMENDATIONS FROM OBSERVED FLOWS")
+    flows, problems = read_flows(flow_file, include_denied=include_denied)
+    for problem in problems[:10]:
+        warn(problem)
+    more_note(10, len(problems), "rows skipped")
+
+    groups = group_inventory(sessions, domain)
+    names = group_display_names(groups)
+    proposals, unresolved, wide = propose_rules(flows, groups,
+                                                max_ports=max_ports)
+
+    say("  Flows read     : {}".format(cC(str(len(flows)))))
+    say("  Groups known   : {}".format(cC(str(len(groups)))))
+    say("  Rules proposed : {}".format(cC(str(len(proposals)))))
+    hr()
+
+    def label(paths):
+        return ", ".join(names.get(p, p.rsplit("/", 1)[-1]) for p in paths)
+
+    if proposals:
+        table(["Source", "Destination", "Proto", "Ports", "Flows"],
+              [[cB(label(p.source_groups)), cB(label(p.destination_groups)),
+                p.protocol, ",".join(str(x) for x in p.ports),
+                str(p.flow_count)]
+               for p in proposals[:RECOMMEND_CONSOLE_LIMIT]], indent=4)
+        more_note(RECOMMEND_CONSOLE_LIMIT, len(proposals))
+    else:
+        say("  {}".format(cD("No flow resolved to a pair of known groups.")))
+
+    if wide:
+        say("\n  {} {} pair(s) talked on more than {} ports and were NOT "
+            "turned into rules:".format(cBY("WIDE:"), len(wide), max_ports))
+        for proposal in wide[:10]:
+            say("    {} -> {}   {} ports".format(
+                label(proposal.source_groups),
+                label(proposal.destination_groups), len(proposal.ports)))
+        say("  {}".format(cD(
+            "That shape is usually a scanner or a monitoring host. One rule "
+            "with fifty ports would bury it rather than surface it.")))
+
+    if unresolved:
+        say("\n  {} {} address(es) belong to no group:".format(
+            cBR("UNCLASSIFIED:"), len(unresolved)))
+        for item in unresolved[:RECOMMEND_CONSOLE_LIMIT]:
+            say("    {:18s} {:12s} {} flow(s)".format(
+                item.address, item.side, item.flow_count))
+        more_note(RECOMMEND_CONSOLE_LIMIT, len(unresolved))
+        say("  {}".format(cD(
+            "These are the most useful rows here: traffic exists and nobody "
+            "has classified the workload. No rule is proposed for them.")))
+
+    exporter.stage("flow_proposals", PROPOSAL_HEADERS,
+                   [p.row() for p in proposals])
+    exporter.stage("flow_unresolved", UNRESOLVED_HEADERS,
+                   [u.row() for u in unresolved])
+
+    hr()
+    say("  {} this proposes ALLOW rules for traffic that was "
+        "observed.".format(cD("note:")))
+    say("  {}".format(cD(
+        "It never proposes a default-deny: no traffic seen in one window is "
+        "not")))
+    say("  {}".format(cD(
+        "evidence none exists -- the same reason a zero hit count cannot "
+        "retire a rule.")))
+
+    if out_file and proposals:
+        if not policy:
+            raise ConfigError(
+                "Writing a change file needs --policy: a rule has to go "
+                "somewhere.")
+        document = proposals_to_change_file(proposals, policy, action=action)
+        _write_change_file(out_file, document)
+        ok_msg("Change file: {}".format(out_file))
+        say("  {} review it, then:".format(cD("next:")))
+        say("    {}".format(cC("nsxctl apply {}".format(out_file))))
+        say("    {}".format(cD(
+            "(dry run by default; add --enable-writes to commit)")))
+    elif out_file:
+        say("  {}".format(cD("Nothing to write: no rules proposed.")))
+    return proposals, unresolved, wide
+
+
+def _write_change_file(path, document):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return path
+
+
+def recommend_summary(proposals, unresolved, wide):
+    return {"proposed": len(proposals), "unclassified": len(unresolved),
+            "wide": len(wide)}
+
+
+def clean_estate(unresolved, wide):
+    """True when every observed endpoint was classified and nothing was wide."""
+    return not unresolved and not wide
 
 
 # ==========================================================================
@@ -6704,6 +8481,7 @@ def act_drift_menu(ctx):
 
     changes = diff_snapshots(before, after)
     ctx.exporter.stage("drift", DRIFT_HEADERS, diff_rows(changes))
+    ctx.exporter.stage_findings("config_drift", drift_findings(changes))
     hr()
     if not changes:
         say("  {} configuration matches the snapshot exactly.".format(
@@ -6939,7 +8717,8 @@ class AppContext:
     """Everything an action needs, assembled once in cli.main()."""
 
     def __init__(self, sessions, audit, exporter, taxonomy,
-                 write_enabled=False, domain=DEFAULT_DOMAIN, managers=None):
+                 write_enabled=False, domain=DEFAULT_DOMAIN, managers=None,
+                 profile=None, project=None, inventory_path=None):
         self.sessions = sessions
         self.audit = audit
         self.exporter = exporter
@@ -6949,6 +8728,16 @@ class AppContext:
         # Inventory entries, for commands that act on configuration rather
         # than on a live connection (login).
         self.managers = managers or []
+        # Which estate, and which tenant inside it, this run is talking to.
+        self.profile = profile
+        self.project = project
+        self.inventory_path = inventory_path
+
+    def cache_key(self):
+        """(profile, project) -- which estate and tenant a cached name
+        belongs to. Completing production names into a DR command is worse
+        than completing nothing."""
+        return (self.profile, self.project)
 
     def lms(self):
         return [s for s in self.sessions if s.role == ROLE_LM]
@@ -7218,6 +9007,8 @@ PROG = "nsxctl"
 # SUPPRESS so that "not given" is distinguishable from "given the default".
 GLOBAL_DEFAULTS = {
     "inventory": None,
+    "profile": None,
+    "project": None,
     "taxonomy": None,
     "manager": None,
     "all_lm": False,
@@ -7234,12 +9025,18 @@ GLOBAL_DEFAULTS = {
     "out_csv": None,
     "out_json": None,
     "out_html": None,
+    "out_junit": None,
+    "out_sarif": None,
+    "out_metrics": None,
+    "notify": None,
+    "only_on_change": False,
 }
 
 EPILOG = """
 getting started:
   nsxctl init                       guided setup: managers, credentials, a check
   nsxctl status                     can I reach and authenticate everywhere?
+  nsxctl doctor                     what does this NSX actually serve?
   nsxctl                            interactive menu
 
 everyday:
@@ -7247,6 +9044,7 @@ everyday:
   nsxctl tag find --scope env --tag prod
   nsxctl impact web-prod-01         what breaks if I retag this VM
   nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
+  nsxctl rule list --policy app-tier
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
 
@@ -7254,6 +9052,12 @@ authoring (dry run unless --enable-writes):
   nsxctl group create g-web --criteria 'tag:env=prod AND tag:tier=web'
   nsxctl rule create allow-web-db --policy app-tier --from g-web --to g-db
   nsxctl apply changes.yaml         a declarative file of groups and rules
+  nsxctl recommend flows.csv --policy app-tier --out-file proposed.json
+
+scheduled:
+  nsxctl rule hygiene --only-on-change --notify $SLACK_URL
+  nsxctl drift --fail-on-drift security --out-junit drift.xml
+  nsxctl doctor --out-metrics /var/lib/node_exporter/nsxctl.prom
 
 Run `nsxctl <command> --help` for a command's options and examples.
 """
@@ -7267,6 +9071,13 @@ def add_global_args(parser):
                           "~/.nsx_toolkit/inventory.json).")
     cfg.add_argument("--taxonomy", metavar="PATH", default=argparse.SUPPRESS,
                      help="Tag taxonomy file (JSON, or YAML with PyYAML).")
+    cfg.add_argument("--profile", metavar="NAME", default=argparse.SUPPRESS,
+                     help="Which estate in a multi-profile inventory. "
+                          "Also read from $NSX_PROFILE.")
+    cfg.add_argument("--project", metavar="NAME", default=argparse.SUPPRESS,
+                     help="Scope every policy path to an NSX Project. "
+                          "Objects in the default infra are not visible from "
+                          "inside a project.")
     cfg.add_argument("--manager", metavar="NAME", default=argparse.SUPPRESS,
                      help="Target one manager by name.")
     cfg.add_argument("--all-lm", action="store_true", default=argparse.SUPPRESS,
@@ -7299,6 +9110,22 @@ def add_global_args(parser):
                      help="Write results to JSON.")
     out.add_argument("--out-html", metavar="PATH", default=argparse.SUPPRESS,
                      help="Write a shareable HTML report where supported.")
+    out.add_argument("--out-junit", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write findings as JUnit XML, for a pipeline.")
+    out.add_argument("--out-sarif", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write findings as SARIF, for a code-scanning UI.")
+    out.add_argument("--out-metrics", metavar="PATH",
+                     default=argparse.SUPPRESS,
+                     help="Write Prometheus textfile metrics, for a "
+                          "node_exporter collector directory.")
+    out.add_argument("--notify", metavar="URL", default=argparse.SUPPRESS,
+                     help="POST a JSON summary to a webhook when the run "
+                          "finishes.")
+    out.add_argument("--only-on-change", action="store_true",
+                     default=argparse.SUPPRESS,
+                     help="Print nothing and notify nobody unless the "
+                          "findings differ from the last run. For cron: a "
+                          "quiet night sends no mail.")
     out.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS,
                      help="Disable colored output.")
     out.add_argument("--non-interactive", action="store_true",
@@ -7327,6 +9154,8 @@ def build_parser():
     pass
     pass
     pass
+    pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -7344,8 +9173,10 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     parents = [global_parent]
     for register in (register_setup, register_group, register_tag,
-                     register_rule, register_analysis, register_trace,
+                     register_rule, register_inspect,
+                     register_analysis, register_trace,
                      register_snapshot, register_apply,
+                     register_recommend,
                      register_shell):
         register(sub, parents)
     return parser
@@ -7373,6 +9204,10 @@ def add_command(sub, parents, name, help_text, description=None, epilog=None):
 # commands/setup.py  --  Setup and introspection: init, status, managers, login, config.
 # ==========================================================================
 
+PROFILE_HEADERS = ["profile", "in_effect", "managers"]
+PROJECT_HEADERS = ["manager", "id", "name", "description"]
+
+
 def register_setup(sub, parents):
     p = add_command(
         sub, parents, "init", "Guided first-run setup.",
@@ -7388,8 +9223,51 @@ def register_setup(sub, parents):
                "  nsxctl status --manager gm --debug")
     p.set_defaults(func=cmd_status)
 
+    p = add_command(
+        sub, parents, "doctor",
+        "What does this NSX actually serve?",
+        description="Probe every API surface the toolkit depends on and "
+                    "report, per manager, which are available.\n\n"
+                    "The toolkit degrades rather than fails when a surface is "
+                    "absent -- statistics may 404, traceflow is Local Manager "
+                    "only, Projects may not exist -- which means a missing "
+                    "feature and a bug in the tool look identical until you "
+                    "run this.\n\n"
+                    "Every probe is a bounded read. Nothing is written, and "
+                    "traceflow is checked by listing, never by injecting a "
+                    "packet.",
+        epilog="examples:\n"
+               "  nsxctl doctor\n"
+               "  nsxctl doctor --json          # paste this into a bug report\n"
+               "  nsxctl doctor --fail-on-missing   # for a pipeline")
+    p.add_argument("--fail-on-missing", action="store_true",
+                   help="Exit 1 if any capability is missing or unreadable.")
+    p.set_defaults(func=cmd_doctor)
+
     p = add_command(sub, parents, "managers", "List the configured managers.")
     p.set_defaults(func=cmd_managers)
+
+    p = add_command(
+        sub, parents, "profiles", "List the estates this inventory defines.",
+        description="An inventory can name several estates and select one "
+                    "with --profile. A flat single-estate inventory has none, "
+                    "and still works exactly as it always did.",
+        epilog="examples:\n"
+               "  nsxctl profiles\n"
+               "  nsxctl --profile dr status\n"
+               "  NSX_PROFILE=dr nsxctl compliance")
+    p.set_defaults(func=cmd_profiles, needs_sessions=False)
+
+    p = add_command(
+        sub, parents, "projects", "List NSX Projects on each manager.",
+        description="NSX Projects are multi-tenancy: each has its own infra "
+                    "tree, so objects in the default infra are NOT visible "
+                    "from inside a project and vice versa. Scope a run with "
+                    "--project.",
+        epilog="examples:\n"
+               "  nsxctl projects\n"
+               "  nsxctl --project tenant-a group list")
+    p.set_defaults(func=cmd_projects)
 
     p = add_command(
         sub, parents, "login", "Store or replace credentials for a manager.",
@@ -7430,6 +9308,71 @@ def cmd_managers(args, ctx):
     table(["Name", "Host", "Role", "Auth", "Verify TLS"],
           [[cC(s.name), s.host, ROLE_LABEL.get(s.role, "?"), s.auth_mode,
             str(s.verify)] for s in ctx.sessions])
+    return 0
+
+
+def cmd_doctor(args, ctx):
+    _probes, healthy = act_doctor(ctx.sessions, args.domain, ctx.exporter)
+    if args.fail_on_missing and not healthy:
+        return 1
+    return 0
+
+
+def cmd_profiles(args, ctx):
+    section("Profiles")
+    if not ctx.inventory_path:
+        err("No inventory in effect.")
+        return 2
+    names = list_profiles(ctx.inventory_path)
+    say("  Inventory: {}".format(cC(ctx.inventory_path)))
+    if not names:
+        say("\n  {} -- a single-estate inventory.".format(cD("No profiles")))
+        say("  {}".format(cD(
+            "Add a 'profiles' object to name several estates; see "
+            "`nsxctl profiles --help`.")))
+        ctx.exporter.stage("profiles", PROFILE_HEADERS,
+                           [[IMPLICIT_PROFILE, "yes", ""]])
+        return 0
+    active, why = resolve_profile(ctx.inventory_path, args.profile)
+    rows = []
+    for name in names:
+        try:
+            count = len(load_inventory(ctx.inventory_path, profile=name))
+        except ConfigError:
+            count = 0
+        rows.append([name, "yes" if name == active else "", str(count)])
+    table(["Profile", "In effect", "Managers"],
+          [[cC(r[0]), cBG(r[1]) if r[1] else "", r[2]] for r in rows],
+          indent=4)
+    say("\n  {} selected by {}.".format(cB(str(active)), cD(why)))
+    ctx.exporter.stage("profiles", PROFILE_HEADERS, rows)
+    return 0
+
+
+def cmd_projects(args, ctx):
+    section("NSX Projects")
+    rows = []
+    for nsx in ctx.sessions:
+        try:
+            found = nsx.get_all(p_projects(nsx.org))
+        except NsxError as e:
+            say("  {:22s}  {}".format(cC(nsx.name), cD(
+                "no project API ({})".format(str(e)[:70]))))
+            continue
+        if not found:
+            say("  {:22s}  {}".format(cC(nsx.name), cD("no projects")))
+            continue
+        for project in found:
+            rows.append([nsx.name, project.get(F_ID, "?"),
+                         project.get(F_DISPLAY_NAME, ""),
+                         project.get("description", "")])
+    if rows:
+        table(["Manager", "Id", "Name", "Description"],
+              [[cC(r[0]), cB(r[1]), r[2], cD(r[3])] for r in rows], indent=4)
+        say("\n  {}".format(cD(
+            "Scope a run to one with --project ID. Objects in the default "
+            "infra are not visible from inside a project.")))
+    ctx.exporter.stage("projects", PROJECT_HEADERS, rows)
     return 0
 
 
@@ -7617,13 +9560,15 @@ def _targets(ctx):
 
 def cmd_group_list(args, ctx):
     act_groups(_targets(ctx), args.domain, args.contains,
-               show_members=args.members, exporter=ctx.exporter)
+               show_members=args.members, exporter=ctx.exporter,
+               cache_key=ctx.cache_key())
     return 0
 
 
 def cmd_group_show(args, ctx):
     act_groups(_targets(ctx), args.domain, args.name,
-               show_members=True, exporter=ctx.exporter)
+               show_members=True, exporter=ctx.exporter,
+               cache_key=ctx.cache_key())
     return 0
 
 
@@ -7842,6 +9787,40 @@ def register_rule(sub, parents):
                          "(required for compare).")
     bl.set_defaults(func=cmd_rule_baseline)
 
+    ls = add_action(
+        rsub, parents, "list", "List DFW rules in evaluation order.",
+        description="Every rule across the Global Manager and Local Managers, "
+                    "deduplicated, listed in the order NSX evaluates them: "
+                    "category first (Ethernet, Emergency, Infrastructure, "
+                    "Environment, Application), then policy and rule "
+                    "sequence.\n\n"
+                    "That is not the order the API returns them in, and it is "
+                    "the order that decides traffic.",
+        epilog="examples:\n"
+               "  nsxctl rule list\n"
+               "  nsxctl rule list --policy app-tier\n"
+               "  nsxctl rule list --action DROP --out-csv drops.csv\n"
+               "  nsxctl rule list --disabled")
+    ls.add_argument("--contains", metavar="TEXT",
+                    help="Only rules whose name or id contains TEXT.")
+    ls.add_argument("--policy", metavar="NAME",
+                    help="Only rules in policies matching NAME.")
+    ls.add_argument("--action", metavar="ACTION",
+                    help="Only rules with this action.")
+    ls.add_argument("--disabled", action="store_true",
+                    help="Only disabled rules.")
+    ls.set_defaults(func=cmd_rule_list)
+
+    sh = add_action(
+        rsub, parents, "show", "Show one rule in full.",
+        description="Every field of a rule, unabridged, including its "
+                    "realized numeric id -- the one a traceflow observation "
+                    "names when it drops a packet.",
+        epilog="example:\n  nsxctl rule show allow-web-db")
+    sh.add_argument("name", help="Rule name or id.")
+    sh.add_argument("--policy", help="Policy the rule is in.")
+    sh.set_defaults(func=cmd_rule_show)
+
     cr = add_action(
         rsub, parents, "create", "Create a DFW rule.",
         description="Create a rule in an existing security policy.\n\n"
@@ -7895,6 +9874,24 @@ def register_rule(sub, parents):
     dl.set_defaults(func=cmd_rule_delete)
 
     p.set_defaults(func=_rule_needs_action)
+
+
+def cmd_rule_list(args, ctx):
+    act_rule_list(ctx.sessions, args.domain, ctx.exporter,
+                  contains=args.contains, policy_ref=args.policy,
+                  action=args.action, disabled_only=args.disabled,
+                  cache_key=ctx.cache_key())
+    return 0
+
+
+def cmd_rule_show(args, ctx):
+    try:
+        act_rule_show(ctx.sessions, args.domain, ctx.exporter, args.name,
+                      policy_ref=args.policy)
+    except NsxError as e:
+        err(str(e))
+        return 2
+    return 0
 
 
 def _add_rule_body_args(parser, require_policy=False):
@@ -7977,8 +9974,8 @@ def cmd_rule_delete(args, ctx):
 
 
 def _rule_needs_action(args, ctx):
-    err("Specify what to do: nsxctl rule hygiene | baseline | create | edit "
-        "| move | delete")
+    err("Specify what to do: nsxctl rule list | show | hygiene | baseline "
+        "| create | edit | move | delete")
     return 2
 
 
@@ -8132,6 +10129,72 @@ def _baseline_compare(args, ctx):
 def _status_colour(status):
     return {"counter_reset": cBY, "unused_since_baseline": cB,
             "active": cBG, "added": cD, "removed": cD}.get(status, cD)
+
+
+# ==========================================================================
+# commands/inspect.py  --  Policy and service inspection: `nsxctl policy|service list|show`.
+# ==========================================================================
+
+def register_inspect(sub, parents):
+    p = add_command(
+        sub, parents, "policy", "Inspect security policies.")
+    psub = p.add_subparsers(dest="policy_action", metavar="<action>")
+    ls = add_action(
+        psub, parents, "list", "List security policies.",
+        description="Policies across every manager, deduplicated, in NSX "
+                    "evaluation order with their rule counts. This is where "
+                    "the name `nsxctl rule create --policy` wants comes from.",
+        epilog="examples:\n"
+               "  nsxctl policy list\n"
+               "  nsxctl policy list --contains app")
+    ls.add_argument("--contains", metavar="TEXT",
+                    help="Only policies whose name or id contains TEXT.")
+    ls.set_defaults(func=cmd_policy_list)
+    p.set_defaults(func=cmd_policy_list, contains=None)
+
+    p = add_command(
+        sub, parents, "service", "Inspect service definitions.")
+    ssub = p.add_subparsers(dest="service_action", metavar="<action>")
+    ls = add_action(
+        ssub, parents, "list", "List services and their ports.",
+        description="Service definitions, with the ports each covers and "
+                    "whether it is a plain L4 port set.\n\n"
+                    "That last column is what makes an undecided "
+                    "`nsxctl trace` verdict explicable: only an L4 port set "
+                    "reduces to a port comparison, so a rule limited to an "
+                    "ICMP or ALG service cannot be decided by port alone.",
+        epilog="examples:\n"
+               "  nsxctl service list\n"
+               "  nsxctl service list --contains sql")
+    ls.add_argument("--contains", metavar="TEXT",
+                    help="Only services whose name or id contains TEXT.")
+    ls.set_defaults(func=cmd_service_list)
+    sh = add_action(
+        ssub, parents, "show", "Show one service in full.",
+        description="Every entry of a service definition, spelled out.",
+        epilog="example:\n  nsxctl service show MySQL")
+    sh.add_argument("name", help="Service name or id.")
+    sh.set_defaults(func=cmd_service_show)
+    p.set_defaults(func=cmd_service_list, contains=None)
+
+
+def cmd_policy_list(args, ctx):
+    act_policy_list(ctx.sessions, args.domain, ctx.exporter,
+                    contains=getattr(args, "contains", None),
+                    cache_key=ctx.cache_key())
+    return 0
+
+
+def cmd_service_list(args, ctx):
+    act_service_list(ctx.sessions, args.domain, ctx.exporter,
+                     contains=getattr(args, "contains", None),
+                     cache_key=ctx.cache_key())
+    return 0
+
+
+def cmd_service_show(args, ctx):
+    act_service_show(ctx.sessions, args.domain, ctx.exporter, args.name)
+    return 0
 
 
 # ==========================================================================
@@ -8361,6 +10424,74 @@ def cmd_apply(args, ctx):
 
 
 # ==========================================================================
+# commands/recommend.py  --  Flow-derived rule proposals: `nsxctl recommend flows.csv`.
+# ==========================================================================
+
+RECOMMEND_HELP = """flow export format (CSV or a JSON list of records):
+
+  source,destination,port,protocol,action,count
+  10.1.1.10,10.1.2.20,3306,tcp,ALLOW,842
+  10.1.1.11,10.1.2.20,3306,tcp,ALLOW,71
+
+Column names are matched loosely -- src/src_ip/source_ip all work, as do
+dst_port/destination_port -- because every exporter names them differently
+and none of them are wrong. Denied flows are ignored unless --include-denied:
+a blocked flow is usually evidence the segmentation is working, not evidence
+a rule is missing.
+"""
+
+
+def register_recommend(sub, parents):
+    p = add_command(
+        sub, parents, "recommend",
+        "Propose rules from a flow export.",
+        description="Turn traffic that actually happened into a reviewable "
+                    "ruleset.\n\n"
+                    "Reads a flow export you already have (NSX Intelligence "
+                    "export, vRNI, a firewall-log query) rather than calling "
+                    "the Intelligence recommendation API, which is licensed "
+                    "separately and absent on most estates.\n\n"
+                    "Endpoints are resolved against the IP addresses your "
+                    "groups declare. An address no group claims is REPORTED, "
+                    "never guessed at -- an unclassified workload is the most "
+                    "useful thing this finds.\n\n"
+                    "Output is an `nsxctl apply` change file. Nothing is "
+                    "written to NSX.\n\n" + RECOMMEND_HELP,
+        epilog="examples:\n"
+               "  nsxctl recommend flows.csv\n"
+               "  nsxctl recommend flows.csv --policy app-tier "
+               "--out-file proposed.json\n"
+               "  nsxctl recommend flows.csv --max-ports 25")
+    p.add_argument("flow_file", metavar="FLOWS",
+                   help="Flow export (CSV, or a JSON list of records).")
+    p.add_argument("--policy", metavar="NAME",
+                   help="Policy the proposed rules should go in. Required to "
+                        "write a change file.")
+    p.add_argument("--out-file", metavar="PATH",
+                   help="Write the proposal as an `nsxctl apply` document.")
+    p.add_argument("--max-ports", type=int, default=DEFAULT_MAX_PORTS,
+                   metavar="N",
+                   help="Flag a pair talking on more than N ports instead of "
+                        "proposing a rule for it (default {}).".format(
+                            DEFAULT_MAX_PORTS))
+    p.add_argument("--include-denied", action="store_true",
+                   help="Also derive rules from flows that were denied.")
+    p.set_defaults(func=cmd_recommend)
+
+
+def cmd_recommend(args, ctx):
+    try:
+        proposals, _unresolved, _wide = act_recommend(
+            ctx.sessions, args.domain, ctx.exporter, args.flow_file,
+            policy=args.policy, out_file=args.out_file,
+            max_ports=args.max_ports, include_denied=args.include_denied)
+    except (ConfigError, NsxError) as e:
+        err(str(e))
+        return 2
+    return 0 if proposals else 1
+
+
+# ==========================================================================
 # commands/snapshot.py  --  Snapshot and drift: `nsxctl snapshot ...` and `nsxctl drift`.
 # ==========================================================================
 
@@ -8427,6 +10558,33 @@ def register_snapshot(sub, parents):
                            "(security | any).")
     diff.set_defaults(func=cmd_snapshot_diff, needs_inventory=False,
                       needs_sessions=False)
+
+    rs = add_action(
+        ssub, parents, "restore", "Put a snapshot's configuration back.",
+        description="Bring live NSX back into line with a stored snapshot, "
+                    "one object at a time through the same plan-then-apply "
+                    "path as `nsxctl rule edit`.\n\n"
+                    "Each object gets a field-level diff you can read, a "
+                    "_revision check that refuses to overwrite a concurrent "
+                    "edit, and its own audit entry -- so a restore is "
+                    "reviewable and individually undoable, not a blind push "
+                    "of a whole tree.\n\n"
+                    "Objects that exist now but not in the snapshot are LEFT "
+                    "ALONE unless --prune is given: a snapshot records what "
+                    "was there, it does not assert that nothing else may "
+                    "exist, and a group created legitimately since is not "
+                    "drift to be erased.\n\n"
+                    "Dry run by default.",
+        epilog="examples:\n"
+               "  nsxctl snapshot restore approved\n"
+               "  nsxctl snapshot restore approved --enable-writes\n"
+               "  nsxctl snapshot restore approved --prune --enable-writes")
+    rs.add_argument("name", nargs="?", help="Snapshot name or path.")
+    rs.add_argument("--snapshot-dir", metavar="DIR")
+    rs.add_argument("--prune", action="store_true",
+                    help="Also DELETE objects that exist now but are not in "
+                         "the snapshot.")
+    rs.set_defaults(func=cmd_snapshot_restore)
 
     p.set_defaults(func=_snapshot_needs_action)
 
@@ -8500,6 +10658,23 @@ def cmd_snapshot_show(args, ctx):
 
 
 # === diff / drift ===
+def cmd_snapshot_restore(args, ctx):
+    try:
+        root = resolve_snapshot(args.name, args.snapshot_dir)
+        snapshot = load_snapshot(root)
+    except NsxError as e:
+        err(str(e))
+        return 2
+    try:
+        result = act_restore(ctx, snapshot,
+                             dry_run=not ctx.write_enabled,
+                             force=args.force, prune=args.prune)
+    except (NsxError, ConfigError) as e:
+        err(str(e))
+        return 2
+    return 1 if result.failed else 0
+
+
 def cmd_snapshot_diff(args, ctx):
     directory = _snapshot_dir(args)
     before = load_snapshot(resolve_snapshot(args.before, directory))
@@ -8532,6 +10707,7 @@ def _report(args, ctx, before, after):
     changes = diff_snapshots(before, after)
     counts = summarise_diff(changes)
     ctx.exporter.stage("drift", DRIFT_HEADERS, diff_rows(changes))
+    ctx.exporter.stage_findings("config_drift", drift_findings(changes))
     hr()
 
     if not changes:
@@ -8617,6 +10793,49 @@ def _line(field, value):
 
 SHELLS = ("bash", "zsh", "fish")
 
+# `completion <shell>` prints a script and needs no NSX at all; `completion
+# cache` reads the whole estate. Same command, opposite requirements, which is
+# why the requirement is set from the value rather than on the parser.
+CACHE_TARGET = "cache"
+
+
+class _CompletionTarget(argparse.Action):
+    """Set the NSX requirement from which target was asked for."""
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        setattr(namespace, self.dest, value)
+        needs_nsx = value == CACHE_TARGET
+        namespace.needs_inventory = needs_nsx
+        namespace.needs_sessions = needs_nsx
+
+# Which cached names an option takes. Everything not listed completes files,
+# which is the right default for --out-csv and friends.
+OPTION_VALUE_KINDS = {
+    "--policy": KIND_POLICY,
+    "--service": KIND_SERVICE,
+    "--from": KIND_GROUP,
+    "--to": KIND_GROUP,
+    "--applied-to": KIND_GROUP,
+    "--manager": KIND_MANAGER,
+    "--profile": KIND_PROFILE,
+    "--before": KIND_RULE,
+    "--after": KIND_RULE,
+    "--contains": "",          # free text: complete nothing rather than lie
+}
+
+# Which cached names a subcommand's first positional takes.
+POSITIONAL_VALUE_KINDS = {
+    ("group", "show"): KIND_GROUP,
+    ("group", "edit"): KIND_GROUP,
+    ("group", "delete"): KIND_GROUP,
+    ("rule", "show"): KIND_RULE,
+    ("rule", "edit"): KIND_RULE,
+    ("rule", "move"): KIND_RULE,
+    ("rule", "delete"): KIND_RULE,
+    ("service", "show"): KIND_SERVICE,
+    ("login", ""): KIND_MANAGER,
+}
+
 
 def register_shell(sub, parents):
     p = add_command(
@@ -8636,8 +10855,24 @@ def register_shell(sub, parents):
                "\"${fpath[1]}/_nsxctl\"\n"
                "  fish   nsxctl completion fish > "
                "~/.config/fish/completions/nsxctl.fish")
-    p.add_argument("shell", choices=SHELLS)
+    p.add_argument("target", nargs="?", choices=SHELLS + (CACHE_TARGET,),
+                   action=_CompletionTarget, metavar="TARGET",
+                   help="{} to print that shell's script, or '{}' to refresh "
+                        "the name cache.".format(" | ".join(SHELLS),
+                                                 CACHE_TARGET))
+    p.add_argument("--status", action="store_true",
+                   help="With '{}': report what is cached without refreshing "
+                        "it.".format(CACHE_TARGET))
     p.set_defaults(func=cmd_completion, needs_inventory=False,
+                   needs_sessions=False)
+
+    p = add_command(
+        sub, parents, "__complete", argparse.SUPPRESS,
+        description="Internal: print cached names for shell completion. "
+                    "Reads a file and never touches NSX.")
+    p.add_argument("kind", choices=CACHE_KINDS)
+    p.add_argument("prefix", nargs="?", default="")
+    p.set_defaults(func=cmd_internal_complete, needs_inventory=False,
                    needs_sessions=False)
 
     p = add_command(sub, parents, "version", "Print the version and exit.")
@@ -8727,10 +10962,45 @@ def _completion_bash(tree, global_opts):
             name, subs, opts))
     lines.extend([
         '    esac',
+        '    local prev="${COMP_WORDS[COMP_CWORD-1]}" kind=""',
+        '    case "$prev" in',
+    ])
+    for option, kind in sorted(OPTION_VALUE_KINDS.items()):
+        lines.append('        {}) kind="{}" ;;'.format(option, kind))
+    lines.extend([
+        '    esac',
+        '    if [ -n "$kind" ]; then',
+        # Reads a cache file. Never a network call -- see namecache.py.
+        '        COMPREPLY=( $(compgen -W "$({} __complete "$kind" '
+        '2>/dev/null)" -- "$cur") )'.format(PROG),
+        '        return',
+        '    fi',
+        '    if [[ "$prev" == -* ]] && [ -z "$kind" ]; then',
+        '        case "$prev" in',
+        '            --out-csv|--out-json|--out-html|--inventory|--taxonomy'
+        '|--ca-bundle|--baseline-file)',
+        '                COMPREPLY=( $(compgen -f -- "$cur") ); return ;;',
+        '        esac',
+        '    fi',
         '    if [[ "$cur" == -* ]]; then',
         '        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )',
-        '    elif [ -n "$subs" ] && [ -z "$sub" ]; then',
+        '        return',
+        '    fi',
+        '    if [ -n "$subs" ] && [ -z "$sub" ]; then',
         '        COMPREPLY=( $(compgen -W "$subs" -- "$cur") )',
+        '        return',
+        '    fi',
+        '    local poskind=""',
+        '    case "$cmd $sub" in',
+    ])
+    for (command, subcommand), kind in sorted(POSITIONAL_VALUE_KINDS.items()):
+        lines.append('        "{} {}") poskind="{}" ;;'.format(
+            command, subcommand, kind))
+    lines.extend([
+        '    esac',
+        '    if [ -n "$poskind" ]; then',
+        '        COMPREPLY=( $(compgen -W "$({} __complete "$poskind" '
+        '2>/dev/null)" -- "$cur") )'.format(PROG),
         '    else',
         '        COMPREPLY=( $(compgen -f -- "$cur") )',
         '    fi',
@@ -8768,6 +11038,20 @@ def _completion_zsh(tree, global_opts):
             lines.append("        {}) _files ;;".format(name))
     lines.extend([
         "    esac",
+        "    local prev=\"${words[CURRENT-1]}\" kind=\"\"",
+        "    case \"$prev\" in",
+    ])
+    for option, kind in sorted(OPTION_VALUE_KINDS.items()):
+        if kind:
+            lines.append("        {}) kind={} ;;".format(option, kind))
+    lines.extend([
+        "    esac",
+        "    if [[ -n \"$kind\" ]]; then",
+        # A cache read, not a network call.
+        "        local -a vals; vals=(${{(f)\"$({} __complete $kind "
+        "2>/dev/null)\"}})".format(PROG),
+        "        _describe 'name' vals",
+        "    fi",
         "}",
         "_{} \"$@\"".format(PROG),
     ])
@@ -8790,6 +11074,14 @@ def _completion_fish(tree, global_opts):
                     PROG, has_cmd, name, sub))
     for opt in global_opts:
         lines.append("complete -c {} -l '{}'".format(PROG, opt.lstrip("-")))
+    # Value completion reads the cache; fish runs this per keystroke, so it
+    # must stay a file read.
+    for option, kind in sorted(OPTION_VALUE_KINDS.items()):
+        if not kind:
+            continue
+        lines.append(
+            "complete -c {} -l '{}' -f -a '({} __complete {} 2>/dev/null)'"
+            .format(PROG, option.lstrip("-"), PROG, kind))
     return "\n".join(lines) + "\n"
 
 
@@ -8804,9 +11096,92 @@ def completion_script(shell):
 
 
 def cmd_completion(args, ctx):
+    if args.target == CACHE_TARGET:
+        return cmd_completion_cache(args, ctx)
+    if not args.target:
+        err("Which shell? {}   (or '{}' to refresh the name cache)".format(
+            " | ".join(SHELLS), CACHE_TARGET))
+        return 2
     # print(), not say(): this is data piped into a file, so it must be
     # emitted even when --json or a quiet mode is in effect.
-    print(completion_script(args.shell), end="")
+    print(completion_script(args.target), end="")
+    return 0
+
+
+def _completion_profile(args):
+    """Which cache to read, worked out without loading anything expensive.
+
+    This command runs with needs_inventory=False on purpose: if the inventory
+    were loaded the normal way, a shell hook on a machine with no config would
+    trigger the first-run WIZARD, at a prompt, from a TAB press. So the file is
+    read directly, only if it already exists, and every failure resolves to the
+    default cache rather than being reported.
+    """
+    if getattr(args, "profile", None):
+        return args.profile
+    try:
+        path = find_inventory(getattr(args, "inventory", None),
+                              config_search_dirs())
+        if not path:
+            return None
+        return resolve_profile(path)[0]
+    except Exception:  # noqa: BLE001 - never fail loudly inside a shell hook
+        return None
+
+
+def cmd_internal_complete(args, ctx):
+    """Print cached names, one per line. Never touches the network.
+
+    Deliberately tolerant of everything: this runs inside a shell hook where
+    an error message would be printed over the user's prompt.
+    """
+    try:
+        profile = _completion_profile(args)
+        project = getattr(args, "project", None)
+        names = cached_names(args.kind, profile, project)
+        if not names and profile:
+            # A cache written before the profile existed, or under a different
+            # one. Falling back to the default is better than offering nothing.
+            names = cached_names(args.kind, None, project)
+    except Exception:  # noqa: BLE001 - a completion hook must never fail loudly
+        return 0
+    prefix = args.prefix or ""
+    for name in names:
+        if name.startswith(prefix):
+            print(name)
+    return 0
+
+
+def cmd_completion_cache(args, ctx):
+    section("COMPLETION NAME CACHE")
+    profile = getattr(ctx, "profile", None)
+    project = getattr(ctx, "project", None)
+    path = cache_path(profile, project)
+    age = cache_age(profile, project)
+
+    if args.status:
+        say("  File   : {}".format(cC(path)))
+        say("  Written: {}".format(describe_age(age)))
+        rows = [[kind, str(len(cached_names(kind, profile, project)))]
+                for kind in CACHE_KINDS]
+        table(["Kind", "Names"], rows, indent=4)
+        if age is None:
+            say("\n  {} run `nsxctl completion cache` to build it.".format(
+                cBY("Empty:")))
+        return 0
+
+    written, counts = refresh_from_nsx(ctx.sessions, args.domain,
+                                       profile=profile, project=project)
+    if not written:
+        say("  {} the cache could not be written; completion will simply "
+            "offer nothing.".format(cBY("Note:")))
+        return 0
+    table(["Kind", "Names"],
+          [[k, str(v)] for k, v in sorted(counts.items())], indent=4)
+    hr()
+    ok_msg("Cached: {}".format(written))
+    say("  {}".format(cD(
+        "TAB now completes these names without talking to NSX.")))
     return 0
 
 
@@ -8975,12 +11350,17 @@ def translate_legacy_argv(argv):
 TAXONOMY_NAMES = ("taxonomy.json", "taxonomy.yaml", "taxonomy.yml")
 
 
-def banner(inv_path, mgr_count, audit_path, taxonomy, write_enabled):
+def banner(inv_path, mgr_count, audit_path, taxonomy, write_enabled,
+           profile=None, project=None):
     say(cBC("=" * W))
     say("  {} v{}    ({})".format(cB(TOOL_NAME), VERSION, VERSION_DATE))
     say("  {}".format(cC(TOOL_TAGLINE)))
     say(cD("-" * W))
     say("  Inventory  : {}  ({} manager(s))".format(cC(inv_path), mgr_count))
+    say("  Profile    : {}".format(cC(profile or IMPLICIT_PROFILE)))
+    if project:
+        say("  Project    : {}  {}".format(
+            cC(project), cD("(default infra is not visible from here)")))
     say("  Taxonomy   : {}".format(taxonomy.source))
     say("  Audit log  : {}".format(audit_path))
     say("  Exports    : {}".format(DEFAULT_EXPORT_DIR))
@@ -8993,7 +11373,8 @@ def banner(inv_path, mgr_count, audit_path, taxonomy, write_enabled):
     say(cBC("=" * W))
 
 
-def connect_all(managers, only=None, ca_bundle=None, quiet=True):
+def connect_all(managers, only=None, ca_bundle=None, quiet=True,
+                project=None):
     """Authenticate against each manager. Quiet by default: a one-shot command
     should print its results, not a login transcript."""
     if not quiet:
@@ -9004,10 +11385,13 @@ def connect_all(managers, only=None, ca_bundle=None, quiet=True):
         name = m.get("name", "?")
         if only and name not in only:
             continue
-        if ca_bundle:
+        if ca_bundle or project:
             m = dict(m)
-            m["ca_bundle"] = ca_bundle
-            m["verify_ssl"] = True
+            if ca_bundle:
+                m["ca_bundle"] = ca_bundle
+                m["verify_ssl"] = True
+            if project:
+                m["project"] = project
         try:
             user, pwd, src = credentials_for(m, allow_prompt=True)
             sessions.append(Nsx(m, user, pwd, transport=transport))
@@ -9022,6 +11406,40 @@ def connect_all(managers, only=None, ca_bundle=None, quiet=True):
         say("    ({} unavailable: {})".format(
             cBR(str(len(failed))), ", ".join(failed)))
     return sessions
+
+
+def _write_sinks(args, exporter, command, profile, project, changed):
+    """Machine-readable outputs. Each failure is reported, never fatal.
+
+    A hygiene report that found real problems must not be thrown away because
+    a metrics directory was read-only.
+    """
+    findings = exporter.findings
+    if args.out_junit:
+        try:
+            say("  Exported: {}".format(write_text(
+                args.out_junit, render_junit(exporter.findings_by_suite()))))
+        except OSError as e:
+            err("could not write JUnit XML: {}".format(e))
+    if args.out_sarif:
+        try:
+            say("  Exported: {}".format(write_text(
+                args.out_sarif, render_sarif(findings))))
+        except OSError as e:
+            err("could not write SARIF: {}".format(e))
+    if args.out_metrics:
+        try:
+            say("  Exported: {}".format(write_text(
+                args.out_metrics, render_metrics(command, findings))))
+        except OSError as e:
+            err("could not write metrics: {}".format(e))
+    if args.notify:
+        payload = webhook_payload(command, findings, changed, profile, project)
+        try:
+            status = post_webhook(args.notify, payload)
+            say("  Notified: HTTP {}".format(status))
+        except NsxError as e:
+            err(str(e))
 
 
 def _emit_json(exporter, errors, rc):
@@ -9095,6 +11513,7 @@ def main(argv=None):
 
     # --- configuration ----------------------------------------------------
     managers, inv_path, taxonomy = [], None, None
+    profile = None
     if needs_inventory:
         inv_path = find_inventory(first.inventory, config_search_dirs())
         if not inv_path:
@@ -9102,7 +11521,8 @@ def main(argv=None):
             if not inv_path:
                 return 2
         try:
-            managers = load_inventory(inv_path)
+            profile, _why = resolve_profile(inv_path, first.profile)
+            managers = load_inventory(inv_path, profile=profile)
         except ConfigError as e:
             err(str(e))
             return 2
@@ -9136,11 +11556,13 @@ def main(argv=None):
     if needs_sessions:
         if menu_mode:
             banner(inv_path, len(managers), audit.path, taxonomy,
-                   first.enable_writes)
+                   first.enable_writes, profile=profile,
+                   project=first.project)
         try:
             sessions = connect_all(managers, only=only,
                                    ca_bundle=first.ca_bundle,
-                                   quiet=not menu_mode)
+                                   quiet=not menu_mode,
+                                   project=first.project)
         except UserAbort:
             err("Credentials required.")
             return 2
@@ -9150,7 +11572,8 @@ def main(argv=None):
 
     ctx = AppContext(sessions, audit, exporter, taxonomy,
                      write_enabled=first.enable_writes, domain=first.domain,
-                     managers=managers)
+                     managers=managers, profile=profile,
+                     project=first.project, inventory_path=inv_path)
 
     # --- dispatch ---------------------------------------------------------
     rc = 0
@@ -9162,14 +11585,46 @@ def main(argv=None):
                 say("\n  Bye.")
                 return 0
 
+        # --only-on-change collects the report rather than printing it, so a
+        # run that turns out to have found nothing new can be discarded before
+        # it reaches stdout. Cron then sends mail only when something moved.
+        if first.only_on_change and not first.json:
+            start_buffering()
+
         for ns in parsed:
             handler = getattr(ns, "func", None)
             if handler is None:
+                if first.only_on_change and not first.json:
+                    flush_buffered()
                 parser.print_help()
                 return 2
             result = handler(ns, ctx)
             if result:
                 rc = result
+
+        command = getattr(first, "command", None) or "nsxctl"
+        changed, previous = True, {}
+        # State belongs to --only-on-change, and is written only when it is
+        # asked for. A plain interactive run that quietly primed it would make
+        # the FIRST scheduled run silent -- with forty findings sitting there
+        # unreported, which is the exact failure this feature exists to avoid.
+        if first.only_on_change:
+            state_root = os.path.join(DATA_DIR, "state")
+            changed, previous = changed_since_last(
+                command, exporter.findings, profile, first.project,
+                root=state_root)
+            save_state(command, fingerprint(exporter.findings),
+                       summarise_findings(exporter.findings),
+                       profile, first.project, root=state_root)
+        if first.only_on_change and not first.json:
+            if changed:
+                flush_buffered()
+            else:
+                drop_buffered()
+                if first.debug:
+                    err("unchanged since {}; output suppressed".format(
+                        previous.get("last_run", "the last run")))
+                return rc
 
         if first.out_csv and exporter.has_staged():
             for path in exporter.to_csv(first.out_csv):
@@ -9177,6 +11632,10 @@ def main(argv=None):
         if first.out_json and exporter.has_staged():
             for path in exporter.to_json(first.out_json):
                 say("  Exported: {}".format(path))
+        if any((first.out_junit, first.out_sarif, first.out_metrics,
+                first.notify)):
+            _write_sinks(first, exporter, command, profile, first.project,
+                         changed)
         if first.json:
             _emit_json(exporter, errors, rc)
         return rc
