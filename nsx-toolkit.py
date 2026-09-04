@@ -63,6 +63,21 @@ class NsxError(Exception):
     """Any failure talking to (or interpreting a response from) NSX."""
 
 
+class NsxHttpError(NsxError):
+    """An NSX response with a status code worth acting on.
+
+    A subclass rather than a new type so every existing `except NsxError`
+    keeps catching it. The status matters in exactly one place today:
+    NSX answers 412 when a write carries a stale `_revision`, which is
+    "somebody else changed this object since you read it" -- a different
+    outcome from a request that was merely malformed.
+    """
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
 class UserAbort(Exception):
     """The operator backed out of a prompt ('b', Ctrl-C, or EOF)."""
 
@@ -432,9 +447,16 @@ API_BASE_GM_CANDIDATES = [
 
 # --- Policy paths (relative to a base) -------------------------------------
 PATH_GROUPS = "/domains/{domain}/groups"
+PATH_GROUP = "/domains/{domain}/groups/{gid}"
 PATH_GROUP_MEMBERS = "/domains/{domain}/groups/{gid}/members/virtual-machines"
 PATH_SEC_POLICIES = "/domains/{domain}/security-policies"
+PATH_SEC_POLICY = "/domains/{domain}/security-policies/{pid}"
 PATH_SEC_RULES = "/domains/{domain}/security-policies/{pid}/rules"
+PATH_SEC_RULE = "/domains/{domain}/security-policies/{pid}/rules/{rid}"
+
+# Service definitions, for turning a rule's service paths into the L4 ports it
+# actually matches. NOT domain-scoped.
+PATH_SERVICES = "/services"
 
 # Rule hit counters. The per-POLICY form returns statistics for every rule in
 # one call; the per-RULE form is the fallback for versions that do not serve
@@ -452,7 +474,16 @@ PATH_DOMAINS = "/domains"
 PATH_VM_GROUP_ASSOC = "/virtual-machine-group-associations"
 
 # --- Manager (non-policy) paths, absolute ----------------------------------
+# These hang off the manager root, NOT off a policy base. Traceflow in
+# particular exists only on a Local Manager: the Global Manager serves no
+# /api/v1/traceflow at all, which is why `nsxctl trace` has to resolve the LM
+# that actually hosts the source VM and target that manager specifically.
 PATH_FABRIC_VMS = "/api/v1/fabric/virtual-machines"
+PATH_FABRIC_VIFS = "/api/v1/fabric/vifs"
+PATH_LOGICAL_PORTS = "/api/v1/logical-ports"
+PATH_TRACEFLOW = "/api/v1/traceflow"
+PATH_TRACEFLOW_ONE = "/api/v1/traceflow/{tid}"
+PATH_TRACEFLOW_OBSERVATIONS = "/api/v1/traceflow/{tid}/observations"
 PATH_SESSION_CREATE = "/api/session/create"
 PATH_NODE_VERSION = "/api/v1/node/version"
 
@@ -462,6 +493,8 @@ PARAM_PAGE_SIZE = "page_size"
 PARAM_DISPLAY_NAME = "display_name"
 PARAM_ACTION = "action"
 PARAM_VM_EXTERNAL_ID = "vm_external_id"
+PARAM_OWNER_VM_ID = "owner_vm_id"
+PARAM_ATTACHMENT_ID = "attachment_id"
 ACTION_UPDATE_TAGS = "update_tags"
 PAGE_SIZE = 1000
 
@@ -478,6 +511,65 @@ F_RULES = "rules"
 F_SERVICES, F_PROFILES = "services", "profiles"
 F_DISABLED, F_LOGGED = "disabled", "logged"
 F_DIRECTION, F_IP_PROTOCOL = "direction", "ip_protocol"
+F_REVISION = "_revision"
+
+# The realized numeric DFW id NSX assigns a policy rule. This is the join
+# between the two halves of `nsxctl trace`: a traceflow observation names the
+# rule that dropped the packet as `acl_rule_id`, an integer with no name
+# attached, and this is the field on the policy rule that carries the same
+# integer back.
+F_RULE_ID = "rule_id"
+
+# Service definitions. Only L4PortSetServiceEntry can be reduced to a port
+# match; everything else (ICMP, ALG, IP-protocol, nested) is left undecidable
+# rather than guessed at -- see trace.py.
+F_SERVICE_ENTRIES = "service_entries"
+F_L4_PROTOCOL = "l4_protocol"
+F_DESTINATION_PORTS = "destination_ports"
+RT_L4_PORTSET = "L4PortSetServiceEntry"
+
+# --- VIF, logical port and traceflow fields --------------------------------
+F_LPORT_ATTACHMENT_ID = "lport_attachment_id"
+F_ATTACHMENT_ID = "attachment_id"
+F_ATTACHMENT = "attachment"
+F_MAC_ADDRESS = "mac_address"
+F_IP_ADDRESS_INFO = "ip_address_info"
+F_DEVICE_KEY = "device_key"
+F_DEVICE_NAME = "device_name"
+F_OWNER_VM_ID = "owner_vm_id"
+F_OPERATION_STATE = "operation_state"
+F_ACL_RULE_ID = "acl_rule_id"
+F_COMPONENT_TYPE = "component_type"
+F_COMPONENT_NAME = "component_name"
+F_COMPONENT_SUB_TYPE = "component_sub_type"
+F_TRANSPORT_NODE_NAME = "transport_node_name"
+F_SEQUENCE_NO = "sequence_no"
+F_REASON = "reason"
+F_LPORT_ID = "lport_id"
+F_PACKET = "packet"
+
+# Traceflow round-trip states. A traceflow object is created, polled, and then
+# deleted -- it is a real object on the manager, not a query.
+TF_IN_PROGRESS, TF_FINISHED = "IN_PROGRESS", "FINISHED"
+TF_FAILED, TF_TIMEOUT = "FAILED", "TIMEOUT"
+TF_TERMINAL_STATES = (TF_FINISHED, TF_FAILED, TF_TIMEOUT)
+
+# Observation resource types. Only Delivered and Dropped are verdicts; the
+# rest are the path the packet took to get there.
+OBS_DELIVERED = "TraceflowObservationDelivered"
+OBS_DROPPED = "TraceflowObservationDropped"
+OBS_DROPPED_LOGICAL = "TraceflowObservationDroppedLogical"
+OBS_FORWARDED = "TraceflowObservationForwarded"
+OBS_FORWARDED_LOGICAL = "TraceflowObservationForwardedLogical"
+OBS_RECEIVED = "TraceflowObservationReceived"
+OBS_RECEIVED_LOGICAL = "TraceflowObservationReceivedLogical"
+OBS_DROP_TYPES = (OBS_DROPPED, OBS_DROPPED_LOGICAL)
+OBS_DELIVERED_TYPES = (OBS_DELIVERED,)
+
+RT_FIELDS_PACKET = "FieldsPacketData"
+
+# IANA protocol numbers for the packet the traceflow injects.
+IP_PROTOCOLS = {"tcp": 6, "udp": 17, "icmp": 1}
 
 # Statistics. NSX nests them as results[].statistics[], each entry carrying a
 # rule_path -- the parser tolerates a flat shape too, because this is the part
@@ -509,6 +601,14 @@ KEY_TAG, TAG_SCOPE_SEPARATOR = "Tag", "|"
 # source and destination are both ANY matches everything.
 ANY = "ANY"
 
+# DFW evaluation order across policies. NSX evaluates every rule in an earlier
+# category before any rule in a later one, regardless of sequence numbers, so a
+# per-policy ordering (which is all rule hygiene needs) is not enough to answer
+# "which rule decides this packet". Anything unrecognised sorts last but keeps
+# its relative order.
+CATEGORY_ORDER = ("Ethernet", "Emergency", "Infrastructure", "Environment",
+                  "Application")
+
 # --- Roles and domains -----------------------------------------------------
 DEFAULT_DOMAIN = "default"
 ROLE_GM, ROLE_LM = "gm", "lm"
@@ -533,6 +633,10 @@ def p_groups(base, domain):
     return base + PATH_GROUPS.format(domain=domain)
 
 
+def p_group(base, domain, gid):
+    return base + PATH_GROUP.format(domain=domain, gid=gid)
+
+
 def p_group_members(base, domain, gid):
     return base + PATH_GROUP_MEMBERS.format(domain=domain, gid=gid)
 
@@ -541,8 +645,29 @@ def p_sec_policies(base, domain):
     return base + PATH_SEC_POLICIES.format(domain=domain)
 
 
+def p_sec_policy(base, domain, pid):
+    return base + PATH_SEC_POLICY.format(domain=domain, pid=pid)
+
+
 def p_sec_rules(base, domain, pid):
     return base + PATH_SEC_RULES.format(domain=domain, pid=pid)
+
+
+def p_sec_rule(base, domain, pid, rid):
+    return base + PATH_SEC_RULE.format(domain=domain, pid=pid, rid=rid)
+
+
+def p_services(base):
+    return base + PATH_SERVICES
+
+
+def p_traceflow_one(tid):
+    """Absolute: traceflow is a Manager API, not a Policy one."""
+    return PATH_TRACEFLOW_ONE.format(tid=tid)
+
+
+def p_traceflow_observations(tid):
+    return PATH_TRACEFLOW_OBSERVATIONS.format(tid=tid)
 
 
 def p_vm_group_assoc(base):
@@ -564,6 +689,35 @@ def p_domains(base):
 def group_id_from_path(path):
     """Last path segment of a group path, which is its id."""
     return path.rsplit("/", 1)[-1] if "/" in str(path) else str(path)
+
+
+def policy_path_prefix(base):
+    """The policy-path prefix an object read from this base will carry.
+
+    An object's API URL and its NSX `path` are not the same string: the URL
+    is '/policy/api/v1/infra/domains/...' while the path NSX stores, and that
+    rules reference, is '/infra/domains/...'. Every declared base has the
+    shape '<something>/api/v1<prefix>', so the prefix is what follows the
+    version segment. Needed to predict the path of an object that does not
+    exist yet -- a rule in a change file may reference a group the same file
+    creates.
+    """
+    _, _, tail = str(base or "").partition("/api/v1")
+    return tail or API_BASE_LM
+
+
+def policy_id_from_rule_path(path):
+    """The policy id out of .../security-policies/<pid>/rules/<rid>."""
+    parts = str(path or "").split("/security-policies/", 1)
+    return parts[1].split("/")[0] if len(parts) > 1 else ""
+
+
+def category_rank(category):
+    """Where a policy's category sits in DFW evaluation order."""
+    try:
+        return CATEGORY_ORDER.index(category)
+    except ValueError:
+        return len(CATEGORY_ORDER)
 
 
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)")
@@ -1327,8 +1481,8 @@ class Nsx:
                 time.sleep(wait)
                 continue
             if r.status >= 400:
-                raise NsxError("[{}] {} {} -> HTTP {}: {}".format(
-                    self.name, method, url, r.status, r.text()))
+                raise NsxHttpError("[{}] {} {} -> HTTP {}: {}".format(
+                    self.name, method, url, r.status, r.text()), r.status)
             return r.json()
         raise last_exc or NsxError("[{}] {} {} -> exhausted retries".format(
             self.name, method, url))
@@ -1341,6 +1495,13 @@ class Nsx:
 
     def patch(self, path, body=None, params=None):
         return self._req("PATCH", path, body=body, params=params)
+
+    def put(self, path, body=None, params=None):
+        """Full-object write. PUT rather than PATCH for anything carrying a
+        `_revision`: NSX only enforces the optimistic-concurrency check when
+        the whole object is sent, and that check is the entire safety
+        mechanism behind authoring."""
+        return self._req("PUT", path, body=body, params=params)
 
     def delete(self, path, params=None):
         return self._req("DELETE", path, params=params)
@@ -1481,6 +1642,69 @@ def current_user():
     return (os.environ.get("USERNAME") or os.environ.get("USER") or "unknown")
 
 
+# What an entry describes. Tag entries predate the field and are inferred.
+OBJ_VM_TAGS = "vm_tags"
+OBJ_GROUP = "group"
+OBJ_RULE = "rule"
+OBJ_POLICY = "policy"
+
+ENTRY_VERSION = 2
+
+
+def _tag_pairs(entries):
+    return [(t.get("scope", ""), t.get("tag", "")) for t in (entries or [])]
+
+
+def normalise_entry(entry):
+    """One shape for an audit entry, whichever era wrote it.
+
+    Returns a dict with object_type, object_path, object_name, before and
+    after always present. For a tag entry `before`/`after` are lists of
+    (scope, tag) pairs; for an object entry they are the NSX bodies.
+    """
+    common = {
+        "timestamp": entry.get("timestamp", ""),
+        "user": entry.get("user", ""),
+        "manager": entry.get("manager", ""),
+        "action": entry.get("action", ""),
+        "status": entry.get("status", ""),
+        "detail": entry.get("detail", ""),
+        "raw": entry,
+    }
+    object_type = entry.get("object_type")
+    if object_type in (None, OBJ_VM_TAGS) and "vm_display_name" in entry:
+        # Pre-authoring entry, or a tag entry written since: both carry the
+        # VM fields, and undo reads them from here.
+        common.update({
+            "object_type": OBJ_VM_TAGS,
+            "object_path": entry.get("object_path")
+                           or "vm:{}".format(entry.get("vm_external_id", "")),
+            "object_name": entry.get("vm_display_name", "?"),
+            "before": _tag_pairs(entry.get("tags_before")),
+            "after": _tag_pairs(entry.get("tags_after")),
+        })
+        return common
+    common.update({
+        "object_type": object_type or "unknown",
+        "object_path": entry.get("object_path", ""),
+        "object_name": entry.get("object_name", ""),
+        "before": entry.get("before"),
+        "after": entry.get("after"),
+    })
+    return common
+
+
+def summarise_entry(normalised):
+    """A one-line 'what changed' for the listing, per object type."""
+    if normalised["object_type"] == OBJ_VM_TAGS:
+        before = normalised["before"] or []
+        after = normalised["after"] or []
+        added = [p for p in after if p not in before]
+        removed = [p for p in before if p not in after]
+        return added, removed
+    return [], []
+
+
 class AuditLog:
     def __init__(self, path=None, max_bytes=AUDIT_MAX_BYTES, keep=AUDIT_KEEP):
         self.path = path or DEFAULT_AUDIT_FILE
@@ -1507,21 +1731,7 @@ class AuditLog:
         except OSError as e:
             err("audit rotation failed: {}".format(e))
 
-    def log(self, action, manager, vm_name, vm_ext_id, tags_before, tags_after,
-            status="success", detail=""):
-        entry = {
-            "timestamp": utc_now_iso(),
-            "user": current_user(),
-            "host": platform.node(),
-            "manager": manager,
-            "action": action,
-            "vm_display_name": vm_name,
-            "vm_external_id": vm_ext_id,
-            "tags_before": [{"scope": s, "tag": t} for s, t in tags_before],
-            "tags_after": [{"scope": s, "tag": t} for s, t in tags_after],
-            "status": status,
-            "detail": detail,
-        }
+    def _append(self, entry):
         self._rotate_if_needed()
         try:
             with open(self.path, "a", encoding="utf-8") as f:
@@ -1529,6 +1739,58 @@ class AuditLog:
         except OSError as e:
             err("audit write failed: {}".format(e))
         return entry
+
+    def _envelope(self, action, manager, status, detail):
+        return {
+            "timestamp": utc_now_iso(),
+            "user": current_user(),
+            "host": platform.node(),
+            "manager": manager,
+            "action": action,
+            "status": status,
+            "detail": detail,
+            "entry_version": ENTRY_VERSION,
+        }
+
+    def log(self, action, manager, vm_name, vm_ext_id, tags_before, tags_after,
+            status="success", detail=""):
+        """A VM tag change.
+
+        Keeps writing `vm_display_name` / `tags_before` / `tags_after`
+        verbatim -- an undo path and a log file written by an earlier release
+        both read those, and neither should have to care that object entries
+        now exist alongside them. The general fields are added, not swapped in.
+        """
+        entry = self._envelope(action, manager, status, detail)
+        entry.update({
+            "object_type": OBJ_VM_TAGS,
+            "object_path": "vm:{}".format(vm_ext_id or ""),
+            "object_name": vm_name,
+            "vm_display_name": vm_name,
+            "vm_external_id": vm_ext_id,
+            "tags_before": [{"scope": s, "tag": t} for s, t in tags_before],
+            "tags_after": [{"scope": s, "tag": t} for s, t in tags_after],
+        })
+        return self._append(entry)
+
+    def log_change(self, action, manager, object_type, object_path,
+                   object_name, before_body, after_body, status="success",
+                   detail=""):
+        """A change to a policy object: a group, a rule or a policy.
+
+        `before_body` is None for a create and `after_body` is None for a
+        delete, which is exactly what undo needs to know which direction to
+        go without a separate flag to get out of step with reality.
+        """
+        entry = self._envelope(action, manager, status, detail)
+        entry.update({
+            "object_type": object_type,
+            "object_path": object_path,
+            "object_name": object_name,
+            "before": before_body,
+            "after": after_body,
+        })
+        return self._append(entry)
 
     def _tail_lines(self, n):
         """Last n non-empty lines without reading the whole file."""
@@ -1558,6 +1820,10 @@ class AuditLog:
             except ValueError:
                 pass
         return entries
+
+    def last_n_normalised(self, n=20):
+        """The same entries in one shape, whichever era wrote them."""
+        return [normalise_entry(e) for e in self.last_n(n)]
 
 
 # ==========================================================================
@@ -1834,6 +2100,21 @@ def policies_for(nsx, domain):
             return []
 
 
+def listed_values(rule, field):
+    """A rule's list-valued field with empties dropped."""
+    return [v for v in (rule.get(field) or []) if v]
+
+
+def is_wildcard(values):
+    """NSX writes the wildcard as ["ANY"]; an empty list means the same.
+
+    Shared rather than duplicated: rule hygiene and trace evaluation both turn
+    on this exact question, and two copies would eventually disagree about
+    what "matches everything" means.
+    """
+    return not values or list(values) == [ANY]
+
+
 def rule_sequence(record):
     """A rule's evaluation position, as an int. NSX omits or stringifies it on
     some versions, so this never raises."""
@@ -1897,6 +2178,684 @@ def group_inventory(sessions, domain):
             if path and path not in by_path:
                 by_path[path] = (nsx, group)
     return by_path
+
+
+# ==========================================================================
+# trace.py  --  Can A reach B, and which rule decided it.
+# ==========================================================================
+
+# How a rule relates to the flow being traced.
+MATCH, NO_MATCH, UNDECIDED = "match", "no_match", "undecided"
+
+TRACE_DEFAULT_TIMEOUT = 15.0
+TRACE_POLL_INTERVAL = 0.5
+DEFAULT_PROTO = "tcp"
+POWERED_ON = "VM_RUNNING"
+
+# The MAC used when the destination is an address rather than a VM we can
+# resolve. NSX rewrites the L2 header on a routed traceflow anyway, and the
+# request is marked routed, so this is a placeholder and not a claim.
+PLACEHOLDER_MAC = "02:00:00:00:00:01"
+
+
+def parse_duration(text, default=TRACE_DEFAULT_TIMEOUT):
+    """'15', '15s' or '2m' -> seconds. Raises on anything else."""
+    if text is None or str(text).strip() == "":
+        return default
+    raw = str(text).strip().lower()
+    multiplier = 1.0
+    if raw.endswith("ms"):
+        raw, multiplier = raw[:-2], 0.001
+    elif raw.endswith("s"):
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        raw, multiplier = raw[:-1], 60.0
+    try:
+        seconds = float(raw) * multiplier
+    except ValueError:
+        raise NsxError(
+            "Could not read '{}' as a duration. Use 15, 15s or 2m.".format(
+                text)) from None
+    if seconds <= 0:
+        raise NsxError("Timeout must be greater than zero.")
+    return seconds
+
+
+# === ENDPOINT RESOLUTION ===
+class TraceEndpoint:
+    """One end of a trace: a VM with a port to inject at, or a bare address."""
+
+    __slots__ = ("nsx", "vm", "vif", "lport_id", "ip", "mac", "label", "groups")
+
+    def __init__(self, nsx=None, vm=None, vif=None, lport_id=None, ip=None,
+                 mac=None, label="", groups=None):
+        self.nsx = nsx
+        self.vm = vm
+        self.vif = vif
+        self.lport_id = lport_id
+        self.ip = ip
+        self.mac = mac
+        self.label = label
+        self.groups = set(groups or ())
+
+    @property
+    def is_vm(self):
+        return self.vm is not None
+
+    @property
+    def powered_on(self):
+        return (self.vm or {}).get(F_POWER_STATE) == POWERED_ON
+
+    def describe(self):
+        if not self.is_vm:
+            return "{} (address)".format(self.ip or self.label)
+        parts = [self.label]
+        if self.ip:
+            parts.append(self.ip)
+        if self.nsx is not None:
+            parts.append("on " + self.nsx.name)
+        return "  ".join(parts)
+
+
+class AmbiguousNic(NsxError):
+    """A multi-NIC VM was traced without saying which NIC.
+
+    Deliberately not resolved by picking the first one: on a VM with a
+    management NIC and a data NIC, injecting at the wrong one answers a
+    question nobody asked.
+    """
+
+    def __init__(self, vm_name, vifs):
+        self.vm_name = vm_name
+        self.vifs = list(vifs)
+        super().__init__(
+            "{} has {} NICs -- say which one with --nic.".format(
+                vm_name, len(self.vifs)))
+
+
+def local_managers(sessions):
+    return [s for s in sessions if s.role == ROLE_LM]
+
+
+def find_vm_on_lms(sessions, needle):
+    """(nsx, vm) for the Local Manager that hosts a VM.
+
+    Traceflow, VM inventory and tags are all LM-local, so this is also the
+    answer to "which manager do I POST the traceflow to".
+    """
+    for nsx in local_managers(sessions):
+        try:
+            hits = nsx.find_vms(needle, exact=True) or nsx.find_vms(needle)
+        except NsxError as e:
+            debug("VM lookup on {} failed: {}".format(nsx.name, e))
+            continue
+        if hits:
+            return nsx, hits[0]
+    return None, None
+
+
+def vifs_for_vm(nsx, vm):
+    """Every virtual NIC of a VM, in device order."""
+    ext = vm.get(F_EXTERNAL_ID)
+    if not ext:
+        return []
+    vifs = nsx.get_all(PATH_FABRIC_VIFS, params={PARAM_OWNER_VM_ID: ext})
+    return sorted(vifs, key=lambda v: str(v.get(F_DEVICE_NAME, "")))
+
+
+def vif_addresses(vif):
+    """Every IP NSX has learned on a VIF."""
+    out = []
+    for info in (vif.get(F_IP_ADDRESS_INFO) or []):
+        out.extend(str(ip).split("/")[0] for ip in (info.get(F_IP_ADDRESSES) or []))
+    return out
+
+
+def describe_vif(vif, index=0):
+    ips = vif_addresses(vif)
+    return "{}. {:24s} {:20s} {}".format(
+        index + 1,
+        vif.get(F_DEVICE_NAME, "?"),
+        vif.get(F_MAC_ADDRESS, "?"),
+        ", ".join(ips) or "(no address learned)")
+
+
+def select_vif(vm_name, vifs, wanted=None):
+    """Pick the NIC to trace from, or refuse to guess.
+
+    `wanted` accepts a 1-based index or a device-name substring, so both
+    `--nic 2` and `--nic "Network adapter 2"` work.
+    """
+    if not vifs:
+        raise NsxError(
+            "{} has no VIF on this manager. A VM that has never been powered "
+            "on, or whose NIC is not attached to an NSX segment, has no "
+            "logical port to trace from.".format(vm_name))
+    if wanted:
+        text = str(wanted).strip()
+        if text.isdigit() and 1 <= int(text) <= len(vifs):
+            return vifs[int(text) - 1]
+        needle = text.lower()
+        hits = [v for v in vifs
+                if needle in str(v.get(F_DEVICE_NAME, "")).lower()
+                or needle == str(v.get(F_MAC_ADDRESS, "")).lower()]
+        if len(hits) == 1:
+            return hits[0]
+        if not hits:
+            raise NsxError("{} has no NIC matching '{}'. It has: {}".format(
+                vm_name, wanted,
+                "; ".join(str(v.get(F_DEVICE_NAME, "?")) for v in vifs)))
+        raise AmbiguousNic(vm_name, hits)
+    if len(vifs) == 1:
+        return vifs[0]
+    raise AmbiguousNic(vm_name, vifs)
+
+
+def logical_port_for_vif(nsx, vif):
+    """The logical switch port a VIF is attached to, or None if unrealized."""
+    attachment = vif.get(F_LPORT_ATTACHMENT_ID)
+    if not attachment:
+        return None
+    try:
+        ports = nsx.get_all(PATH_LOGICAL_PORTS,
+                            params={PARAM_ATTACHMENT_ID: attachment})
+    except NsxError as e:
+        debug("logical port lookup failed: {}".format(e))
+        return None
+    for port in ports:
+        if (port.get(F_ATTACHMENT) or {}).get(F_ID) == attachment:
+            return port
+    return ports[0] if ports else None
+
+
+def vm_group_paths(nsx, domain, vm):
+    """Every group path a VM is an effective member of.
+
+    Uses NSX's own reverse-association index rather than each group's VM
+    member sub-resource, for the reason act_reverse_lookup documents: the
+    sub-resource is silent for groups matched on VIF, IP-set, segment or
+    segment-port criteria, and a static verdict computed from a partial
+    membership set would name the wrong rule.
+    """
+    ext = vm.get(F_EXTERNAL_ID)
+    if not ext:
+        return set()
+    try:
+        assocs = nsx.get_all(p_vm_group_assoc(nsx.base(domain)),
+                             params={PARAM_VM_EXTERNAL_ID: ext})
+    except NsxError as e:
+        debug("association lookup on {} failed: {}".format(nsx.name, e))
+        return set()
+    paths = set()
+    for assoc in assocs:
+        path = assoc.get(F_PATH)
+        if path:
+            paths.add(path)
+        target = assoc.get(F_TARGET_ID)
+        if target:
+            paths.add(target)
+    return paths
+
+
+def groups_containing_address(groups, address):
+    """Group paths whose criteria literally lists an address.
+
+    Deliberately a literal match and not CIDR arithmetic: an address endpoint
+    resolves to the groups that name it and nothing more, so a static verdict
+    for `--to 10.20.30.40` under-claims rather than inventing membership.
+    """
+    if not address:
+        return set()
+    hits = set()
+    for path, (_nsx, group) in groups.items():
+        for item in (group.get(F_EXPRESSION) or []):
+            values = item.get(F_IP_ADDRESSES) or []
+            if any(str(v).split("/")[0] == address for v in values):
+                hits.add(path)
+                hits.add(group.get(F_ID, ""))
+    hits.discard("")
+    return hits
+
+
+def resolve_vm_endpoint(sessions, needle, domain, nic=None, need_port=True):
+    """A VM endpoint, with its NIC, address and group membership resolved."""
+    nsx, vm = find_vm_on_lms(sessions, needle)
+    if vm is None:
+        raise NsxError(
+            "No VM matching '{}' on any Local Manager. VM inventory is "
+            "LM-local -- a Global Manager holds none.".format(needle))
+    name = vm.get(F_DISPLAY_NAME, needle)
+    endpoint = TraceEndpoint(nsx=nsx, vm=vm, label=name,
+                             groups=vm_group_paths(nsx, domain, vm))
+    if not need_port:
+        # Static evaluation matches on group membership, never on addresses,
+        # so no NIC is chosen here: picking one to fill in an IP column would
+        # be a guess that reads like a fact on a multi-NIC VM.
+        try:
+            vifs = vifs_for_vm(nsx, vm)
+        except NsxError as e:
+            debug("VIF lookup for {} failed: {}".format(name, e))
+            vifs = []
+        if len(vifs) == 1 or (vifs and nic):
+            chosen = select_vif(name, vifs, nic)
+            endpoint.vif = chosen
+            endpoint.mac = chosen.get(F_MAC_ADDRESS)
+            addresses = vif_addresses(chosen)
+            endpoint.ip = addresses[0] if addresses else None
+        return endpoint
+
+    vif = select_vif(name, vifs_for_vm(nsx, vm), nic)
+    endpoint.vif = vif
+    endpoint.mac = vif.get(F_MAC_ADDRESS)
+    addresses = vif_addresses(vif)
+    endpoint.ip = addresses[0] if addresses else None
+    port = logical_port_for_vif(nsx, vif)
+    endpoint.lport_id = (port or {}).get(F_ID)
+    return endpoint
+
+
+# === STATIC EVALUATION ===
+def evaluation_order(records):
+    """Rules in the order NSX evaluates them.
+
+    Category first, and that is the part a per-policy ordering misses: every
+    rule in an earlier category is evaluated before any rule in a later one,
+    whatever the sequence numbers say. Rule hygiene only ever compares rules
+    inside one policy, so it never needed this; a verdict does.
+    """
+    def key(record):
+        return (category_rank(record.policy.get(F_CATEGORY)),
+                _int_or_zero(record.policy.get(F_SEQUENCE_NUMBER)),
+                str(record.policy_name),
+                rule_sequence(record),
+                str(record.rule_name))
+    return sorted(records, key=key)
+
+
+def _int_or_zero(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_service_index(sessions, domain):
+    """{service path: service} across every manager, GM first.
+
+    Needed because a rule names its services by path, and "does this rule
+    cover port 3306" cannot be answered from the path alone.
+    """
+    gm_sessions, lm_sessions = ordered_sessions(sessions)
+    index = {}
+    for nsx in gm_sessions + lm_sessions:
+        try:
+            services = nsx.get_all(p_services(nsx.base(domain)))
+        except NsxError as e:
+            debug("service listing on {} failed: {}".format(nsx.name, e))
+            continue
+        for service in services:
+            path = service.get(F_PATH)
+            if path and path not in index:
+                index[path] = service
+    return index
+
+
+def port_in_spec(port, spec):
+    """Whether a port falls in an NSX port spec ('443' or '8000-8100')."""
+    text = str(spec).strip()
+    try:
+        if "-" in text:
+            low, _, high = text.partition("-")
+            return int(low) <= int(port) <= int(high)
+        return int(text) == int(port)
+    except (TypeError, ValueError):
+        return False
+
+
+def service_port_verdict(service, proto, port):
+    """MATCH / NO_MATCH / UNDECIDED for one service against a port.
+
+    Only `L4PortSetServiceEntry` reduces to a port comparison. ICMP, ALG,
+    IP-protocol and nested entries are left UNDECIDED rather than guessed at:
+    claiming a rule does not match when it might is how a trace names the
+    wrong rule.
+    """
+    entries = service.get(F_SERVICE_ENTRIES) or []
+    if not entries:
+        return UNDECIDED
+    excluded = False
+    for entry in entries:
+        if entry.get(RT) != RT_L4_PORTSET:
+            return UNDECIDED
+        same_proto = str(entry.get(F_L4_PROTOCOL, "")).upper() == \
+            str(proto).upper()
+        ports = entry.get(F_DESTINATION_PORTS) or []
+        if not ports:
+            if same_proto:
+                return MATCH
+            excluded = True
+            continue
+        if same_proto and any(port_in_spec(port, spec) for spec in ports):
+            return MATCH
+        excluded = True
+    return NO_MATCH if excluded else UNDECIDED
+
+
+def rule_service_verdict(rule, services, proto, port):
+    """MATCH / NO_MATCH / UNDECIDED for a rule's whole service list."""
+    named = listed_values(rule, F_SERVICES)
+    if is_wildcard(named):
+        return MATCH, ""
+    if port is None:
+        return UNDECIDED, ("limited to {} and no --port was given".format(
+            ", ".join(_service_names(named, services))))
+    undecided = []
+    for path in named:
+        service = services.get(path)
+        if service is None:
+            undecided.append(path.rsplit("/", 1)[-1])
+            continue
+        verdict = service_port_verdict(service, proto, port)
+        if verdict == MATCH:
+            return MATCH, ""
+        if verdict == UNDECIDED:
+            undecided.append(service.get(F_DISPLAY_NAME) or
+                             path.rsplit("/", 1)[-1])
+    if undecided:
+        return UNDECIDED, ("service {} is not a plain L4 port set".format(
+            ", ".join(sorted(undecided))))
+    return NO_MATCH, ""
+
+
+def _service_names(paths, services):
+    names = []
+    for path in paths:
+        service = services.get(path)
+        names.append(service.get(F_DISPLAY_NAME) if service
+                     else path.rsplit("/", 1)[-1])
+    return names or ["(none)"]
+
+
+def _side_matches(rule, field, endpoint_groups):
+    """Whether one side of a rule can match an endpoint."""
+    named = listed_values(rule, field)
+    if is_wildcard(named):
+        return True
+    if not endpoint_groups:
+        return False
+    if set(named) & endpoint_groups:
+        return True
+    # A rule may name a group by path where the association index returned an
+    # id, or the other way round; compare on ids as well before deciding no.
+    ids = {group_id_from_path(p) for p in named}
+    return bool(ids & {group_id_from_path(p) for p in endpoint_groups})
+
+
+def rule_flow_verdict(record, source, destination, services, proto, port):
+    """(MATCH | NO_MATCH | UNDECIDED, reason) for one rule against one flow.
+
+    Direction is deliberately not used to exclude a rule. The packet crosses
+    both endpoints' vNICs, so an IN rule enforced at the destination and an
+    OUT rule enforced at the source are both on its path; treating either as
+    inapplicable would skip a rule that really can decide the flow.
+    """
+    rule = record.rule
+    if rule.get(F_DISABLED):
+        return NO_MATCH, "disabled"
+
+    scope = listed_values(rule, F_SCOPE)
+    if not is_wildcard(scope):
+        endpoints = source.groups | destination.groups
+        if not (set(scope) & endpoints or
+                {group_id_from_path(p) for p in scope} &
+                {group_id_from_path(p) for p in endpoints}):
+            return NO_MATCH, "applied-to does not cover either endpoint"
+
+    if not _side_matches(rule, "source_groups", source.groups):
+        return NO_MATCH, "source does not match"
+    if not _side_matches(rule, "destination_groups", destination.groups):
+        return NO_MATCH, "destination does not match"
+
+    verdict, reason = rule_service_verdict(rule, services, proto, port)
+    if verdict == MATCH:
+        return MATCH, ""
+    if verdict == NO_MATCH:
+        return NO_MATCH, "service does not cover {}/{}".format(proto, port)
+    return UNDECIDED, reason
+
+
+class StaticVerdict:
+    """What the policy says, and how much of it could actually be decided."""
+
+    __slots__ = ("record", "undecided", "evaluated")
+
+    def __init__(self, record=None, undecided=(), evaluated=0):
+        self.record = record
+        self.undecided = list(undecided)
+        self.evaluated = evaluated
+
+    @property
+    def action(self):
+        if self.record is None:
+            return None
+        return self.record.rule.get(F_ACTION_FIELD, "?")
+
+    @property
+    def allowed(self):
+        return self.action == "ALLOW"
+
+    @property
+    def certain(self):
+        """A verdict is only certain when nothing ahead of it was undecided.
+
+        An undecided rule earlier in evaluation order could have matched
+        first, which would make it -- not this one -- the real answer.
+        """
+        return bool(self.record) and not self.undecided
+
+
+def static_evaluate(records, source, destination, services, proto=DEFAULT_PROTO,
+                    port=None):
+    """First matching rule in NSX evaluation order, with what it could not
+    decide along the way."""
+    undecided = []
+    evaluated = 0
+    for record in evaluation_order(records):
+        evaluated += 1
+        verdict, reason = rule_flow_verdict(record, source, destination,
+                                            services, proto, port)
+        if verdict == MATCH:
+            return StaticVerdict(record, undecided, evaluated)
+        if verdict == UNDECIDED:
+            undecided.append((record, reason))
+    return StaticVerdict(None, undecided, evaluated)
+
+
+# === LIVE TRACEFLOW ===
+def rules_by_realized_id(records):
+    """{acl_rule_id: RuleRecord}. The join between an observation and a name."""
+    index = {}
+    for record in records:
+        realized = record.rule.get(F_RULE_ID)
+        if realized is None:
+            continue
+        try:
+            index[int(realized)] = record
+        except (TypeError, ValueError):
+            continue
+    return index
+
+
+def build_traceflow_request(lport_id, src_ip, dst_ip, src_mac, dst_mac,
+                            proto=DEFAULT_PROTO, port=None, src_port=49152,
+                            frame_size=128):
+    """The synthetic packet to inject, and where to inject it."""
+    protocol = IP_PROTOCOLS.get(str(proto).lower())
+    if protocol is None:
+        raise NsxError("Unsupported protocol '{}'. Use {}.".format(
+            proto, " | ".join(sorted(IP_PROTOCOLS))))
+    packet = {
+        RT: RT_FIELDS_PACKET,
+        "transport_type": "UNICAST",
+        "frame_size": frame_size,
+        # Routed: the trace is between two workloads that may be on different
+        # segments, and the L2 header is rewritten by the first hop anyway.
+        "routed": True,
+        "eth_header": {"src_mac": src_mac or PLACEHOLDER_MAC,
+                       "dst_mac": dst_mac or PLACEHOLDER_MAC},
+        "ip_header": {"src_ip": src_ip, "dst_ip": dst_ip,
+                      "protocol": protocol, "ttl": 64},
+    }
+    if protocol in (6, 17):
+        packet["transport_header"] = {"src_port": src_port,
+                                      "dst_port": int(port or 0)}
+    return {F_LPORT_ID: lport_id, F_PACKET: packet}
+
+
+def run_traceflow(nsx, request, timeout=TRACE_DEFAULT_TIMEOUT,
+                  poll_interval=TRACE_POLL_INTERVAL, sleep=time.sleep):
+    """Create, poll and clean up one traceflow.
+
+    Returns (traceflow_id, state, observations). The object is always deleted,
+    including when the poll times out: a traceflow left behind is litter on
+    somebody's manager.
+    """
+    created = nsx.post(PATH_TRACEFLOW, body=request)
+    tid = created.get(F_ID)
+    if not tid:
+        raise NsxError("NSX accepted the traceflow but returned no id.")
+    state = created.get(F_OPERATION_STATE, TF_IN_PROGRESS)
+    observations = []
+    try:
+        deadline = time.monotonic() + float(timeout)
+        while state not in TF_TERMINAL_STATES:
+            if time.monotonic() >= deadline:
+                break
+            sleep(poll_interval)
+            status = nsx.get(p_traceflow_one(tid))
+            state = status.get(F_OPERATION_STATE, state)
+        if state == TF_FINISHED:
+            observations = nsx.get_all(p_traceflow_observations(tid))
+    finally:
+        try:
+            nsx.delete(p_traceflow_one(tid))
+        except NsxError as e:
+            debug("traceflow {} could not be deleted: {}".format(tid, e))
+    return tid, state, observations
+
+
+class LiveVerdict:
+    """What the data plane actually did with the packet."""
+
+    __slots__ = ("state", "observations", "verdict_obs", "record", "acl_rule_id")
+
+    def __init__(self, state, observations, verdict_obs=None, record=None,
+                 acl_rule_id=None):
+        self.state = state
+        self.observations = list(observations)
+        self.verdict_obs = verdict_obs
+        self.record = record
+        self.acl_rule_id = acl_rule_id
+
+    @property
+    def delivered(self):
+        return bool(self.verdict_obs) and \
+            self.verdict_obs.get(RT) in OBS_DELIVERED_TYPES
+
+    @property
+    def dropped(self):
+        return bool(self.verdict_obs) and \
+            self.verdict_obs.get(RT) in OBS_DROP_TYPES
+
+    @property
+    def conclusive(self):
+        return self.delivered or self.dropped
+
+    @property
+    def action(self):
+        if self.delivered:
+            return "ALLOW"
+        return "DROP" if self.dropped else None
+
+
+def interpret_observations(state, observations, rules_by_id):
+    """Turn the observation list into a verdict, naming the rule if it can.
+
+    An acl_rule_id with no matching policy rule is reported as the raw number
+    rather than silently dropped: an unmatched id usually means the rule lives
+    outside the domain being swept, and hiding it would look like no rule was
+    involved at all.
+    """
+    ordered = sorted(observations, key=lambda o: _int_or_zero(o.get(F_SEQUENCE_NO)))
+    verdict_obs = None
+    for obs in ordered:
+        if obs.get(RT) in OBS_DROP_TYPES or obs.get(RT) in OBS_DELIVERED_TYPES:
+            verdict_obs = obs
+            break
+    acl_id = None
+    record = None
+    if verdict_obs is not None and verdict_obs.get(F_ACL_RULE_ID) is not None:
+        acl_id = _int_or_zero(verdict_obs.get(F_ACL_RULE_ID))
+        record = rules_by_id.get(acl_id)
+    return LiveVerdict(state, ordered, verdict_obs, record, acl_id)
+
+
+def observation_line(obs):
+    """One hop of the packet's path, for the console."""
+    kind = str(obs.get(RT, "")).replace("TraceflowObservation", "") or "?"
+    where = obs.get(F_TRANSPORT_NODE_NAME) or obs.get(F_COMPONENT_NAME) or ""
+    component = obs.get(F_COMPONENT_TYPE) or ""
+    reason = obs.get(F_REASON)
+    tail = "  {}".format(reason) if reason else ""
+    return "{:12s} {:14s} {}{}".format(kind, component, where, tail)
+
+
+# === AGREEMENT ===
+def verdicts_agree(static, live):
+    """Whether the policy and the data plane told the same story.
+
+    None when there is nothing to compare -- one of the two did not produce a
+    verdict, which is not a disagreement.
+    """
+    if live is None or not live.conclusive or static.action is None:
+        return None
+    if static.action != live.action:
+        return False
+    if live.record is not None and static.record is not None:
+        return live.record.path == static.record.path
+    return True
+
+
+def disagreement_reasons(static, live):
+    """Why the two engines can legitimately differ, most likely first."""
+    reasons = []
+    if live is not None and live.record is None and live.acl_rule_id:
+        reasons.append(
+            "the data plane named rule id {} and no policy rule in this "
+            "domain carries it -- the rule may live in another domain, or on "
+            "a manager not in this inventory".format(live.acl_rule_id))
+    reasons.append(
+        "a rule edited in the policy but not yet realized onto the host "
+        "still reads as authoritative here and has no effect there")
+    reasons.append(
+        "NAT rewrites addresses between the two ends, so the packet the "
+        "firewall saw is not the one the policy was matched against")
+    if not static.certain:
+        reasons.append(
+            "static evaluation could not decide {} earlier rule(s), any of "
+            "which may be the real match".format(len(static.undecided)))
+    return reasons
+
+
+def endpoint_summary_rows(source, destination, proto, port):
+    return [
+        ["source", source.describe(), source.lport_id or "",
+         str(len(source.groups))],
+        ["destination", destination.describe(), destination.lport_id or "",
+         str(len(destination.groups))],
+        ["flow", "{}/{}".format(proto, port if port is not None else "any"),
+         "", ""],
+    ]
 
 
 # ==========================================================================
@@ -2414,7 +3373,8 @@ class ObjectChange:
         return self.provenance.get("_last_modified_time", "")
 
 
-def _fmt(value):
+def fmt_diff_value(value):
+    """One field value as a single line, for a table cell."""
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
@@ -2542,7 +3502,7 @@ def diff_rows(changes):
         for field in change.fields:
             rows.append([change.status, field.impact, change.kind,
                          change.manager, change.name, field.field,
-                         _fmt(field.before), _fmt(field.after),
+                         fmt_diff_value(field.before), fmt_diff_value(field.after),
                          change.changed_by, str(change.changed_at)])
     return rows
 
@@ -2554,6 +3514,458 @@ def at_impact(changes, level):
     if level == "security":
         return [c for c in changes if c.impact == "security"]
     return []
+
+
+# ==========================================================================
+# authoring.py  --  Creating and changing groups, policies and rules.
+# ==========================================================================
+
+# What a planned write does. `delete` carries a before-body and no after;
+# `create` carries an after and no before. Undo reads the direction off that
+# rather than a separate flag that could get out of step.
+OP_CREATE, OP_MODIFY, OP_DELETE = "create", "modify", "delete"
+
+KIND_GROUP, KIND_RULE, KIND_POLICY = "group", "rule", "policy"
+
+# NSX answers this when the _revision sent does not match the stored one.
+HTTP_PRECONDITION_FAILED = 412
+
+RULE_ACTIONS = ("ALLOW", "DROP", "REJECT", "JUMP_TO_APPLICATION")
+RULE_DIRECTIONS = ("IN", "OUT", "IN_OUT")
+
+
+# === CRITERIA MINI-LANGUAGE ===
+#   tag:env=prod                 Tag env equals prod
+#   tag:env~pro                  Tag env contains pro
+#   name=web-01                  VM name equals
+#   name~web                     VM name contains
+#   ip:10.0.0.0/8,10.1.2.3       an IP address set
+# joined by AND or OR.
+CRITERIA_HELP = (
+    "criteria syntax:\n"
+    "  tag:SCOPE=VALUE     tag equals          tag:env=prod\n"
+    "  tag:SCOPE~VALUE     tag contains        tag:owner~platform\n"
+    "  name=VALUE          VM name equals      name=web-prod-01\n"
+    "  name~VALUE          VM name contains    name~web-\n"
+    "  ip:A[,B...]         IP addresses/CIDRs  ip:10.0.0.0/8\n"
+    "joined with AND or OR, e.g.\n"
+    "  'tag:env=prod AND tag:tier=web'")
+
+OP_EQUALS, OP_CONTAINS = "EQUALS", "CONTAINS"
+MEMBER_VM = "VirtualMachine"
+
+
+def _condition(key, operator, value):
+    return {RT: RT_CONDITION, "member_type": MEMBER_VM, "key": key,
+            "operator": operator, "value": value}
+
+
+def _parse_term(term):
+    """One criteria term into an NSX expression element."""
+    text = term.strip()
+    if not text:
+        raise ConfigError("Empty criteria term.\n" + CRITERIA_HELP)
+    lowered = text.lower()
+
+    if lowered.startswith("ip:"):
+        addresses = [a.strip() for a in text[3:].split(",") if a.strip()]
+        if not addresses:
+            raise ConfigError("ip: needs at least one address.\n" + CRITERIA_HELP)
+        return {RT: RT_IPADDRESS, "ip_addresses": addresses}
+
+    if lowered.startswith("tag:"):
+        body = text[4:]
+        scope, operator, value = _split_operator(body, "tag:")
+        # NSX stores a scoped tag as "<scope>|<tag>" in a single Condition
+        # value, which is why the toolkit renders it that way everywhere.
+        return _condition(KEY_TAG, operator,
+                          "{}{}{}".format(scope, TAG_SCOPE_SEPARATOR, value))
+
+    if lowered.startswith("name"):
+        _, operator, value = _split_operator("name" + text[4:], "name")
+        return _condition("Name", operator, value)
+
+    raise ConfigError(
+        "Could not read criteria term '{}'.\n{}".format(term, CRITERIA_HELP))
+
+
+def _split_operator(body, label):
+    """('env', 'EQUALS', 'prod') from 'env=prod'."""
+    for token, operator in (("~", OP_CONTAINS), ("=", OP_EQUALS)):
+        if token in body:
+            left, _, right = body.partition(token)
+            left = left.strip()
+            right = right.strip()
+            if label == "name":
+                left = ""
+            if not right or (label != "name" and not left):
+                break
+            return left, operator, right
+    raise ConfigError(
+        "'{}' needs an = or ~ and a value.\n{}".format(body, CRITERIA_HELP))
+
+
+def _tokenise_criteria(text):
+    """Split on AND/OR, keeping the operators."""
+    tokens, current = [], []
+    for word in str(text).split():
+        if word.upper() in ("AND", "OR"):
+            tokens.append(" ".join(current).strip())
+            tokens.append(word.upper())
+            current = []
+        else:
+            current.append(word)
+    tokens.append(" ".join(current).strip())
+    return tokens
+
+
+def parse_criteria(text):
+    """A criteria string into an NSX `expression` list.
+
+    Refuses a mixed AND/OR expression rather than sending it: NSX evaluates a
+    single conjunction operator per expression level, and a silently
+    reinterpreted expression selects the wrong workloads -- which for a
+    firewall group is the whole ballgame.
+    """
+    if not str(text or "").strip():
+        raise ConfigError("No criteria given.\n" + CRITERIA_HELP)
+    tokens = _tokenise_criteria(text)
+    expression = []
+    conjunctions = set()
+    expect_term = True
+    for token in tokens:
+        if token in ("AND", "OR"):
+            if expect_term:
+                raise ConfigError(
+                    "'{}' where a criteria term was expected.\n{}".format(
+                        token, CRITERIA_HELP))
+            conjunctions.add(token)
+            expression.append({RT: RT_CONJUNCTION,
+                               "conjunction_operator": token})
+            expect_term = True
+            continue
+        if not expect_term:
+            raise ConfigError(
+                "Two criteria terms with no AND or OR between them, at "
+                "'{}'.\n{}".format(token, CRITERIA_HELP))
+        expression.append(_parse_term(token))
+        expect_term = False
+    if expect_term:
+        raise ConfigError("Criteria ends with a conjunction.\n" + CRITERIA_HELP)
+    if len(conjunctions) > 1:
+        raise ConfigError(
+            "Criteria mixes AND and OR. NSX applies one conjunction operator "
+            "per expression, so this would not mean what it reads as. Split "
+            "it into two groups, or use one operator throughout.")
+    return expression
+
+
+def describe_criteria(expression):
+    """The inverse, near enough for an echo of what was parsed."""
+    parts = []
+    for item in expression or []:
+        kind = item.get(RT)
+        if kind == RT_CONJUNCTION:
+            parts.append(item.get("conjunction_operator", "?"))
+        elif kind == RT_IPADDRESS:
+            parts.append("ip:" + ",".join(item.get("ip_addresses", [])))
+        elif kind == RT_CONDITION:
+            token = "~" if item.get("operator") == OP_CONTAINS else "="
+            value = str(item.get("value", ""))
+            if item.get("key") == KEY_TAG and TAG_SCOPE_SEPARATOR in value:
+                scope, _, tag = value.partition(TAG_SCOPE_SEPARATOR)
+                parts.append("tag:{}{}{}".format(scope, token, tag))
+            else:
+                parts.append("name{}{}".format(token, value))
+        else:
+            parts.append(str(kind))
+    return " ".join(parts)
+
+
+# === REFERENCE RESOLUTION ===
+def reference_index(objects):
+    """{name, id and path -> path} so a user can name a group any of those ways."""
+    index = {}
+    for path, body in objects.items():
+        for key in (body.get(F_DISPLAY_NAME), body.get(F_ID), path):
+            if key:
+                index.setdefault(str(key).lower(), path)
+    return index
+
+
+def resolve_reference(index, ref, what="group"):
+    """One user-supplied group or service name into an NSX path."""
+    text = str(ref).strip()
+    if text.upper() == ANY:
+        return ANY
+    hit = index.get(text.lower())
+    if hit:
+        return hit
+    raise NsxError(
+        "No {} called '{}'. Check the name, or pass its path.".format(
+            what, ref))
+
+
+def resolve_references(index, refs, what="group"):
+    if not refs:
+        return [ANY]
+    return [resolve_reference(index, ref, what) for ref in refs]
+
+
+def service_inventory(sessions, domain):
+    """{service path: service} across every manager, GM first."""
+    gm_sessions, lm_sessions = ordered_sessions(sessions)
+    index = {}
+    for nsx in gm_sessions + lm_sessions:
+        try:
+            for service in nsx.get_all(p_services(nsx.base(domain))):
+                path = service.get(F_PATH)
+                if path and path not in index:
+                    index[path] = service
+        except NsxError:
+            continue
+    return index
+
+
+# === BODY CONSTRUCTION ===
+def build_group_body(group_id, display_name, expression, description=None,
+                     existing=None):
+    """A group body, preserving whatever of the live object we do not set.
+
+    Starting from the live body rather than an empty dict is what stops a
+    modify from silently dropping fields this release does not know about --
+    a PUT replaces the object, so anything omitted is deleted.
+    """
+    body = dict(existing or {})
+    body[F_ID] = group_id
+    body[F_DISPLAY_NAME] = display_name or group_id
+    if expression is not None:
+        body[F_EXPRESSION] = expression
+    if description is not None:
+        body["description"] = description
+    return body
+
+
+def build_rule_body(rule_id, display_name=None, sources=None, destinations=None,
+                    services=None, action=None, scope=None, direction=None,
+                    disabled=None, logged=None, sequence_number=None,
+                    description=None, existing=None):
+    """A rule body, same preserve-what-we-do-not-set rule as groups."""
+    body = dict(existing or {})
+    body[F_ID] = rule_id
+    if display_name is not None or not body.get(F_DISPLAY_NAME):
+        body[F_DISPLAY_NAME] = display_name or rule_id
+    if sources is not None:
+        body[F_SOURCE_GROUPS] = list(sources)
+    if destinations is not None:
+        body[F_DEST_GROUPS] = list(destinations)
+    if services is not None:
+        body[F_SERVICES] = list(services)
+    if scope is not None:
+        body[F_SCOPE] = list(scope)
+    if action is not None:
+        body[F_ACTION_FIELD] = action
+    if direction is not None:
+        body["direction"] = direction
+    if disabled is not None:
+        body["disabled"] = bool(disabled)
+    if logged is not None:
+        body["logged"] = bool(logged)
+    if sequence_number is not None:
+        body[F_SEQUENCE_NUMBER] = int(sequence_number)
+    if description is not None:
+        body["description"] = description
+    body.setdefault(F_SOURCE_GROUPS, [ANY])
+    body.setdefault(F_DEST_GROUPS, [ANY])
+    body.setdefault(F_SERVICES, [ANY])
+    body.setdefault(F_SCOPE, [ANY])
+    body.setdefault(F_ACTION_FIELD, "ALLOW")
+    return body
+
+
+def validate_action(action):
+    if action and str(action).upper() not in RULE_ACTIONS:
+        raise ConfigError("action must be one of {} (got {!r}).".format(
+            " | ".join(RULE_ACTIONS), action))
+    return str(action).upper() if action else None
+
+
+def validate_direction(direction):
+    if direction and str(direction).upper() not in RULE_DIRECTIONS:
+        raise ConfigError("direction must be one of {} (got {!r}).".format(
+            " | ".join(RULE_DIRECTIONS), direction))
+    return str(direction).upper() if direction else None
+
+
+# === PLANNED WRITES ===
+class PlannedWrite:
+    """One create, modify or delete, with both sides of it."""
+
+    __slots__ = ("op", "kind", "nsx", "url", "path", "object_id", "policy_id",
+                 "name", "before", "after")
+
+    def __init__(self, op, kind, nsx, url, object_id, name, before=None,
+                 after=None, policy_id=None, path=""):
+        self.op = op
+        self.kind = kind
+        self.nsx = nsx
+        self.url = url
+        self.object_id = object_id
+        self.policy_id = policy_id
+        self.name = name
+        self.before = before
+        self.after = after
+        self.path = path or (before or after or {}).get(F_PATH, "")
+
+    @property
+    def manager(self):
+        return self.nsx.name if self.nsx is not None else ""
+
+    def describe(self):
+        return "{} {} '{}'".format(self.op, self.kind, self.name)
+
+
+def object_url(nsx, domain, kind, object_id, policy_id=None):
+    base = nsx.base(domain)
+    if kind == KIND_GROUP:
+        return p_group(base, domain, object_id)
+    if kind == KIND_POLICY:
+        return p_sec_policy(base, domain, object_id)
+    if kind == KIND_RULE:
+        return p_sec_rule(base, domain, policy_id, object_id)
+    raise NsxError("Unknown object kind '{}'.".format(kind))
+
+
+def read_object(nsx, domain, kind, object_id, policy_id=None):
+    """The live object, or None when it does not exist yet."""
+    try:
+        return nsx.get(object_url(nsx, domain, kind, object_id,
+                                  policy_id=policy_id))
+    except NsxHttpError as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def apply_write(change, domain, force=False):
+    """Execute one planned write, with NSX's own concurrency check.
+
+    The `_revision` read at plan time rides back with the body. NSX rejects a
+    stale one with 412, which is the difference between "your write failed"
+    and "somebody else changed this while you were looking at it" -- and only
+    the second one is worth a specific message.
+    """
+    nsx = change.nsx
+    if change.op == OP_DELETE:
+        nsx.delete(change.url)
+        return None
+    body = dict(change.after or {})
+    revision = (change.before or {}).get(F_REVISION)
+    if revision is not None and not force:
+        body[F_REVISION] = revision
+    else:
+        body.pop(F_REVISION, None)
+    try:
+        return nsx.put(change.url, body=body)
+    except NsxHttpError as e:
+        if e.status == HTTP_PRECONDITION_FAILED:
+            raise NsxError(
+                "{} changed on NSX since the plan was built, so the write was "
+                "refused rather than overwriting somebody else's change. "
+                "Re-run to plan against the current state, or pass --force to "
+                "write anyway.".format(change.describe())) from e
+        raise
+
+
+# === SEQUENCE NUMBERS ===
+def sequence_for_move(records, target, before=True):
+    """A sequence number that puts a rule immediately before or after another.
+
+    Refuses rather than renumbering the policy: rewriting every rule's
+    sequence number to make room is a much bigger change than the one that
+    was asked for, and on a shared policy it is other people's diff too.
+    """
+    ordered = sorted(records, key=rule_sequence)
+    index = next((i for i, r in enumerate(ordered)
+                  if r.rule_id == target.rule_id), None)
+    if index is None:
+        raise NsxError("'{}' is not in this policy.".format(target.rule_name))
+    target_seq = rule_sequence(target)
+    if before:
+        neighbour = rule_sequence(ordered[index - 1]) if index > 0 else \
+            target_seq - 20
+        low, high = neighbour, target_seq
+    else:
+        neighbour = (rule_sequence(ordered[index + 1])
+                     if index + 1 < len(ordered) else target_seq + 20)
+        low, high = target_seq, neighbour
+    candidate = (low + high) // 2
+    if candidate <= low or candidate >= high:
+        raise NsxError(
+            "No sequence number is free between {} and {}. The policy needs "
+            "renumbering first -- this will not rewrite every rule's sequence "
+            "to make room.".format(low, high))
+    return candidate
+
+
+# === DECLARATIVE CHANGE FILES ===
+CHANGE_SECTIONS = ("groups", "rules")
+STATE_PRESENT, STATE_ABSENT = "present", "absent"
+
+
+def load_change_file(path):
+    """A declarative change file. JSON always; YAML when PyYAML is installed.
+
+    Same rule as the taxonomy: JSON is used everywhere so nothing needs
+    installing, and YAML is accepted if it happens to be available.
+    """
+    if not os.path.isfile(path):
+        raise ConfigError("Not found: {}".format(path))
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    data = None
+    if path.lower().endswith((".yaml", ".yml")):
+        try:
+            import yaml
+        except ImportError:
+            raise ConfigError(
+                "{} is YAML and PyYAML is not installed. Convert it to JSON, "
+                "or pip install PyYAML.".format(path)) from None
+        try:
+            data = yaml.safe_load(text)
+        except Exception as e:
+            raise ConfigError("{} is not valid YAML: {}".format(path, e)) from e
+    else:
+        try:
+            data = json.loads(text)
+        except ValueError as e:
+            raise ConfigError("{} is not valid JSON: {}".format(path, e)) from e
+
+    if not isinstance(data, dict):
+        raise ConfigError(
+            "{} must be a mapping with 'groups' and/or 'rules'.".format(path))
+    unknown = set(data) - set(CHANGE_SECTIONS)
+    if unknown:
+        raise ConfigError("{}: unknown section(s) {}. Expected {}.".format(
+            path, ", ".join(sorted(unknown)), " and ".join(CHANGE_SECTIONS)))
+    for section in CHANGE_SECTIONS:
+        raw = data.get(section)
+        if raw is not None and not isinstance(raw, list):
+            raise ConfigError("{}: '{}' must be a list.".format(path, section))
+        entries = raw or []
+        for index, entry in enumerate(entries, 1):
+            if not isinstance(entry, dict):
+                raise ConfigError("{}: {}[{}] must be a mapping.".format(
+                    path, section, index))
+            if not entry.get("id"):
+                raise ConfigError("{}: {}[{}] has no 'id'.".format(
+                    path, section, index))
+            state = str(entry.get("state", STATE_PRESENT)).lower()
+            if state not in (STATE_PRESENT, STATE_ABSENT):
+                raise ConfigError(
+                    "{}: {}[{}] state must be {} or {}.".format(
+                        path, section, index, STATE_PRESENT, STATE_ABSENT))
+    return data
 
 
 # ==========================================================================
@@ -3750,93 +5162,6 @@ def act_change_ticket(sessions, csv_path, exporter, out_dir=None):
 
 
 # ==========================================================================
-# actions/audit_view.py  --  Audit log viewing and single-entry undo.
-# ==========================================================================
-
-AUDIT_HEADERS = ["timestamp", "user", "manager", "action", "vm_name",
-                  "added", "removed", "status"]
-
-
-def _pairs(entries):
-    return [(t.get("scope", ""), t.get("tag", "")) for t in (entries or [])]
-
-
-def act_audit_log(audit, sessions, write_enabled, exporter=None, limit=20):
-    entries = audit.last_n(limit)
-    if not entries:
-        say("  Audit log empty.")
-        if exporter is not None:
-            exporter.stage("audit_log", AUDIT_HEADERS, [])
-        return
-    say("\n  Last {} entries:".format(cC(str(len(entries)))))
-    hr()
-    rows = []
-    for i, e in enumerate(entries, 1):
-        before = _pairs(e.get("tags_before"))
-        after = _pairs(e.get("tags_after"))
-        added = [p for p in after if p not in before]
-        removed = [p for p in before if p not in after]
-        say("  {:5s} {}  {:30s}  [{}]".format(
-            cD(str(i) + "."), cD(str(e.get("timestamp", "?"))[:19]),
-            e.get("vm_display_name", "?"), cC(e.get("manager", "?"))))
-        if added:
-            say("        {}".format(cG("+ " + fmt_tags_plain(added))))
-        if removed:
-            say("        {}".format(cR("- " + fmt_tags_plain(removed))))
-        rows.append([e.get("timestamp", ""), e.get("user", ""),
-                     e.get("manager", ""), e.get("action", ""),
-                     e.get("vm_display_name", ""), fmt_tags_plain(added),
-                     fmt_tags_plain(removed), e.get("status", "")])
-    if exporter is not None:
-        exporter.stage("audit_log", AUDIT_HEADERS, rows)
-
-    if not write_enabled:
-        say("\n  {}.".format(cBY("Undo needs write mode")))
-        return
-    if not is_interactive():
-        return
-    hr()
-    choice = ask("  Undo entry # (or b): ")
-    if not choice.isdigit() or not (1 <= int(choice) <= len(entries)):
-        say("  Cancelled.")
-        return
-    target = entries[int(choice) - 1]
-    restore_to = _pairs(target.get("tags_before"))
-    vm_name = target.get("vm_display_name", "?")
-    mgr_name = target.get("manager", "?")
-    ext = target.get("vm_external_id", "?")
-
-    nsx = next((s for s in sessions if s.name == mgr_name), None)
-    if not nsx:
-        err("Manager '{}' is not in this session.".format(mgr_name))
-        return
-    vm = nsx.get_vm_by_external_id(ext)
-    if not vm:
-        err("VM '{}' (external_id {}) not found on {}.".format(
-            vm_name, ext, mgr_name))
-        return
-    current = sorted(tags_of(vm))
-    say("\n  Restore '{}' on [{}]".format(cB(vm_name), cC(mgr_name)))
-    say("    current : {}".format(fmt_tags_plain(current)))
-    say("    restore : {}".format(fmt_tags_plain(sorted(restore_to))))
-    if current == sorted(restore_to):
-        say("  Already in that state -- nothing to undo.")
-        return
-    if not confirm("  Apply undo? [y/N]: "):
-        say("  Cancelled.")
-        return
-    try:
-        fresh = nsx.refresh_vm(vm) or vm
-        nsx.update_vm_tags(fresh, restore_to)
-        audit.log("undo", nsx.name, vm_name, fresh.get(F_EXTERNAL_ID),
-                  current, restore_to, detail="undo of {}".format(
-                      target.get("timestamp", "?")))
-        ok_msg("Undo applied.")
-    except NsxError as e:
-        err(str(e))
-
-
-# ==========================================================================
 # actions/hygiene.py  --  DFW rule hygiene: the "is my policy sane" report.
 # ==========================================================================
 
@@ -3870,15 +5195,6 @@ class Finding:
 
 
 # === RULE SHAPE HELPERS ===
-def _listed(rule, field):
-    return [v for v in (rule.get(field) or []) if v]
-
-
-def _is_any(values):
-    """NSX writes the wildcard as ["ANY"]; an empty list means the same."""
-    return not values or list(values) == [ANY]
-
-
 def match_key(rule):
     """What makes two rules equivalent, without expanding services.
 
@@ -3887,10 +5203,10 @@ def match_key(rule):
     "unreachable" claims.
     """
     return (
-        tuple(sorted(_listed(rule, "source_groups"))),
-        tuple(sorted(_listed(rule, "destination_groups"))),
-        tuple(sorted(_listed(rule, F_SERVICES))),
-        tuple(sorted(_listed(rule, F_SCOPE))),
+        tuple(sorted(listed_values(rule, "source_groups"))),
+        tuple(sorted(listed_values(rule, "destination_groups"))),
+        tuple(sorted(listed_values(rule, F_SERVICES))),
+        tuple(sorted(listed_values(rule, F_SCOPE))),
         rule.get(F_ACTION_FIELD, ""),
         rule.get(F_DIRECTION, ""),
     )
@@ -3898,10 +5214,10 @@ def match_key(rule):
 
 def matches_everything(rule):
     """True when this rule matches all traffic in its policy."""
-    return (_is_any(_listed(rule, "source_groups"))
-            and _is_any(_listed(rule, "destination_groups"))
-            and _is_any(_listed(rule, F_SERVICES))
-            and _is_any(_listed(rule, F_SCOPE))
+    return (is_wildcard(listed_values(rule, "source_groups"))
+            and is_wildcard(listed_values(rule, "destination_groups"))
+            and is_wildcard(listed_values(rule, F_SERVICES))
+            and is_wildcard(listed_values(rule, F_SCOPE))
             and rule.get(F_ACTION_FIELD) in TERMINAL_ACTIONS
             and not rule.get(F_DISABLED))
 
@@ -4047,8 +5363,8 @@ class HygieneContext:
 # === CHECKS ===
 def check_any_any(record, ctx):
     rule = record.rule
-    if not (_is_any(_listed(rule, "source_groups"))
-            and _is_any(_listed(rule, "destination_groups"))):
+    if not (is_wildcard(listed_values(rule, "source_groups"))
+            and is_wildcard(listed_values(rule, "destination_groups"))):
         return []
     if rule.get(F_DISABLED):
         return []
@@ -4066,7 +5382,7 @@ def check_broad_applied_to(record, ctx):
     rule = record.rule
     if rule.get(F_DISABLED):
         return []
-    if _is_any(_listed(rule, F_SCOPE)):
+    if is_wildcard(listed_values(rule, F_SCOPE)):
         return [Finding("broad_applied_to", "high", record,
                         "applied-to is ANY -- enforced on every workload, "
                         "not a scoped set")]
@@ -4270,6 +5586,1093 @@ def at_or_above(findings, threshold):
         return []
     limit = SEVERITIES.index(threshold)
     return [f for f in findings if SEVERITIES.index(f.severity) <= limit]
+
+
+# ==========================================================================
+# actions/author.py  --  Authoring groups and rules: plan, preflight, confirm, write, audit.
+# ==========================================================================
+
+AUTHOR_HEADERS = ["op", "kind", "manager", "object", "field", "before",
+                  "after", "impact"]
+
+OBJECT_TYPE_FOR_KIND = {KIND_GROUP: OBJ_GROUP, KIND_RULE: OBJ_RULE}
+
+
+class PlanCache:
+    """One read of NSX per plan, not one per planned object.
+
+    Planning a rule needs the rule sweep, the group inventory and the service
+    inventory. Planning fifty of them from a change file needs those exactly
+    once -- doing it per entry is the same N+1 that made bulk tagging sweep
+    the VM inventory once per CSV row before Phase 1 fixed it.
+    """
+
+    __slots__ = ("sessions", "domain", "_records", "_groups", "_services",
+                 "_policies", "planned_paths")
+
+    def __init__(self, sessions, domain):
+        self.sessions = sessions
+        self.domain = domain
+        self._records = None
+        self._groups = None
+        self._services = None
+        self._policies = None
+        # Objects an earlier entry in the same plan will create. A change
+        # file that creates a group and a rule referencing it is the central
+        # use case, and the group does not exist to be looked up yet.
+        self.planned_paths = {}
+
+    @property
+    def records(self):
+        if self._records is None:
+            self._records = sweep_rules(self.sessions, self.domain)
+        return self._records
+
+    @property
+    def groups(self):
+        if self._groups is None:
+            self._groups = group_inventory(self.sessions, self.domain)
+        return self._groups
+
+    @property
+    def policies(self):
+        """[(nsx, policy)] across every manager, GM first."""
+        if self._policies is None:
+            gm_sessions, lm_sessions = ordered_sessions(self.sessions)
+            self._policies = [(nsx, policy)
+                              for nsx in gm_sessions + lm_sessions
+                              for policy in policies_for(nsx, self.domain)]
+        return self._policies
+
+    @property
+    def services(self):
+        if self._services is None:
+            self._services = service_inventory(self.sessions, self.domain)
+        return self._services
+
+    def group_index(self):
+        index = reference_index({p: g for p, (_n, g) in self.groups.items()})
+        index.update(self.planned_paths)
+        return index
+
+    def service_index(self):
+        return reference_index(self.services)
+
+    def will_create(self, key, path):
+        for alias in key:
+            if alias:
+                self.planned_paths[str(alias).lower()] = path
+
+
+class AuthorResult:
+    __slots__ = ("planned", "applied", "failed", "blocked", "changes")
+
+    def __init__(self):
+        self.planned = 0
+        self.applied = 0
+        self.failed = 0
+        self.blocked = 0
+        self.changes = []
+
+
+# === LOCATING THINGS ===
+def find_policy(sessions, domain, ref, cache=None):
+    """(nsx, policy) for a security policy named by id or display name."""
+    if cache is None:
+        cache = PlanCache(sessions, domain)
+    needle = str(ref).strip().lower()
+    for nsx, policy in cache.policies:
+        if needle in (str(policy.get(F_ID, "")).lower(),
+                      str(policy.get(F_DISPLAY_NAME, "")).lower()):
+            return nsx, policy
+    raise NsxError(
+        "No security policy called '{}' in domain {}.".format(ref, domain))
+
+
+def find_rule(sessions, domain, ref, policy_ref=None, cache=None):
+    """The RuleRecord for a rule named by id or display name."""
+    needle = str(ref).strip().lower()
+    records = cache.records if cache is not None else sweep_rules(sessions,
+                                                                  domain)
+    hits = []
+    for record in records:
+        if needle not in (str(record.rule_id).lower(),
+                          str(record.rule_name).lower()):
+            continue
+        if policy_ref and str(policy_ref).lower() not in (
+                str(record.policy_id).lower(),
+                str(record.policy_name).lower()):
+            continue
+        hits.append(record)
+    if not hits:
+        raise NsxError("No rule called '{}' in domain {}.".format(ref, domain))
+    if len(hits) > 1:
+        raise NsxError(
+            "'{}' matches {} rules ({}). Narrow it with --policy.".format(
+                ref, len(hits),
+                ", ".join(sorted({r.policy_name for r in hits}))))
+    return hits[0]
+
+
+def _author_writable(nsx, path, what):
+    """Refuse a write to a GM-authored object through a Local Manager.
+
+    NSX realizes Global Manager objects read-only onto each LM. Writing there
+    fails inside NSX with a message about realization that reads like a bug in
+    this tool, so it is caught here with the reason.
+    """
+    if path and origin_of_path(path) == "GM" and nsx.role == ROLE_LM:
+        raise NsxError(
+            "{} was authored on the Global Manager and is realized read-only "
+            "onto {}. Change it on the GM, not here.".format(what, nsx.name))
+
+
+# === PLAN RENDERING ===
+def plan_rows(changes):
+    """Export rows: one per changed field, one per create/delete."""
+    rows = []
+    for change in changes:
+        if change.op == OP_MODIFY:
+            for field in diff_objects(change.before or {}, change.after or {}):
+                rows.append([change.op, change.kind, change.manager,
+                             change.name, field.field,
+                             fmt_diff_value(field.before),
+                             fmt_diff_value(field.after), field.impact])
+            continue
+        rows.append([change.op, change.kind, change.manager, change.name, "",
+                     "", "", "security"])
+    return rows
+
+
+def _author_op_colour(op):
+    return {OP_CREATE: cG, OP_MODIFY: cBY, OP_DELETE: cR}.get(op, cD)
+
+
+def print_plan(changes):
+    """The preview, rendered exactly the way `nsxctl drift` renders a change."""
+    for change in changes:
+        say("  {} {} {}   [{}]".format(
+            _author_op_colour(change.op)(change.op.upper()),
+            cD(change.kind), cB(str(change.name)), cC(change.manager)))
+        if change.op == OP_MODIFY:
+            fields = diff_objects(change.before or {}, change.after or {})
+            fields = [f for f in fields if _author_is_real_change(f)]
+            if not fields:
+                say("      {}".format(cD("no change")))
+                continue
+            for field in fields:
+                marker = cBR("[security]") if field.impact == "security" \
+                    else cD("[cosmetic]")
+                say("      {} {}: {} -> {}".format(
+                    marker, field.field,
+                    fmt_diff_value(field.before) or cD("(unset)"),
+                    fmt_diff_value(field.after) or cD("(unset)")))
+        elif change.op == OP_CREATE:
+            for line in _author_body_lines(change.kind, change.after or {}):
+                say("      {}".format(line))
+        else:
+            for line in _author_body_lines(change.kind, change.before or {}):
+                say("      {}".format(cD(line)))
+
+
+def _author_is_real_change(field):
+    """Volatile NSX bookkeeping is not a change worth showing in a plan."""
+    root = field.field.split(".", 1)[0].split("[", 1)[0]
+    return not root.startswith("_") and root not in (
+        "realization_id", "unique_id", "parent_path", "relative_path",
+        "marked_for_delete", "overridden", "path", "resource_type")
+
+
+def _author_body_lines(kind, body):
+    if kind == KIND_GROUP:
+        return ["criteria: {}".format(
+            describe_criteria(body.get(F_EXPRESSION)) or "(none)")]
+    return [
+        "source      : {}".format(", ".join(body.get(F_SOURCE_GROUPS) or [ANY])),
+        "destination : {}".format(", ".join(body.get(F_DEST_GROUPS) or [ANY])),
+        "services    : {}".format(", ".join(body.get(F_SERVICES) or [ANY])),
+        "applied to  : {}".format(", ".join(body.get(F_SCOPE) or [ANY])),
+        "action      : {}  seq {}".format(body.get(F_ACTION_FIELD, "?"),
+                                          body.get(F_SEQUENCE_NUMBER, "?")),
+    ]
+
+
+# === PREFLIGHT ===
+def preflight_findings(change, sessions, domain, cache=None):
+    """The 2B hygiene checks, run against a rule before it is written.
+
+    A HygieneContext is assembled from the proposed rule plus its real
+    siblings, so shadowing and duplicate detection work against what the
+    policy will actually look like -- not just against the rule in isolation.
+    Statistics are marked unsupported because there are none for a rule that
+    does not exist yet; every static check still runs.
+    """
+    if change.kind != KIND_RULE or change.op == OP_DELETE:
+        return []
+    if cache is None:
+        cache = PlanCache(sessions, domain)
+    policy = {F_ID: change.policy_id, F_DISPLAY_NAME: change.policy_id}
+    siblings = []
+    for record in cache.records:
+        if record.policy_id != change.policy_id:
+            continue
+        if record.rule_id == change.object_id:
+            policy = record.policy
+            continue
+        siblings.append(record)
+        policy = record.policy
+    proposed = RuleRecord(change.nsx, policy, change.after or {},
+                          origin_of_path(change.path))
+    ctx = HygieneContext(siblings + [proposed], cache.groups, {}, False, {})
+    return [f for f in evaluate(ctx) if f.record is proposed]
+
+
+def print_preflight(findings):
+    if not findings:
+        return
+    say("\n  {} the proposed change would be reported by "
+        "`nsxctl rule hygiene`:".format(cBY("PREFLIGHT:")))
+    for finding in findings:
+        say("    {} {}".format(
+            cBR(finding.severity) if finding.severity in ("critical", "high")
+            else cBY(finding.severity), cD(finding.check)))
+        say("      {}".format(finding.detail))
+
+
+# === EXECUTION ===
+def execute_plan(changes, audit, write_enabled, dry_run=True, force=False,
+                 sessions=None, domain="default", exporter=None,
+                 preflight=True, cache=None):
+    """Preview, confirm and apply a set of planned writes."""
+    result = AuthorResult()
+    result.changes = list(changes)
+    result.planned = len(changes)
+
+    label = cBY("DRY RUN") if dry_run else cBG("APPLYING")
+    say("\n  {} -- {} change(s)".format(label, len(changes)))
+    hr()
+    if not changes:
+        say("  {}".format(cD("Nothing to do: NSX already matches.")))
+        if exporter is not None:
+            exporter.stage("authoring", AUTHOR_HEADERS, [])
+        return result
+    print_plan(changes)
+
+    if preflight and sessions:
+        # One cache for every change: preflighting fifty rules must not sweep
+        # the estate fifty times.
+        cache = cache or PlanCache(sessions, domain)
+        for change in changes:
+            print_preflight(preflight_findings(change, sessions, domain,
+                                               cache=cache))
+
+    if exporter is not None:
+        exporter.stage("authoring", AUTHOR_HEADERS, plan_rows(changes))
+
+    if dry_run:
+        hr()
+        say("  {} nothing was written. Re-run with {} to apply.".format(
+            cD("Dry run:"), cC("--enable-writes")))
+        return result
+    if not write_enabled:
+        say("  {}. Re-run with --enable-writes.".format(cBY("Writes disabled")))
+        result.blocked = len(changes)
+        return result
+    if not confirm("\n  {} [y/N]: ".format(cB("Apply these changes?"))):
+        say("  Cancelled.")
+        result.blocked = len(changes)
+        return result
+
+    hr()
+    for change in changes:
+        try:
+            after = apply_write(change, domain, force=force)
+            audit.log_change(
+                "author_" + change.op, change.manager,
+                OBJECT_TYPE_FOR_KIND.get(change.kind, change.kind),
+                change.path or change.url, str(change.name),
+                change.before, after if change.op != OP_DELETE else None,
+                detail=change.describe())
+            ok_msg("{}  [{}]".format(change.describe(), change.manager))
+            result.applied += 1
+        except NsxError as e:
+            say("  {} {}".format(cBR("FAILED"), change.describe()))
+            say("      {}".format(cD(str(e)[:400])))
+            audit.log_change(
+                "author_" + change.op, change.manager,
+                OBJECT_TYPE_FOR_KIND.get(change.kind, change.kind),
+                change.path or change.url, str(change.name),
+                change.before, None, status="failed", detail=str(e)[:400])
+            result.failed += 1
+    hr()
+    say("  Complete: {} applied, {} failed.".format(
+        cG(str(result.applied)), cR(str(result.failed))))
+    return result
+
+
+# === TAXONOMY ===
+def warn_off_taxonomy(expression, taxonomy):
+    """Criteria that names a tag your taxonomy does not allow."""
+    if not taxonomy:
+        return
+    for item in expression or []:
+        if item.get(RT) != RT_CONDITION or item.get("key") != KEY_TAG:
+            continue
+        value = str(item.get("value", ""))
+        if TAG_SCOPE_SEPARATOR not in value:
+            continue
+        scope, _, tag = value.partition(TAG_SCOPE_SEPARATOR)
+        for message in taxonomy.validate_tag(scope, tag):
+            warn(message)
+
+
+# === GROUP ACTIONS ===
+def plan_group(sessions, domain, group_id, criteria=None, display_name=None,
+               description=None, delete=False, manager=None, taxonomy=None,
+               cache=None):
+    """One planned write for a group."""
+    cache = cache or PlanCache(sessions, domain)
+    groups = cache.groups
+    index = cache.group_index()
+    existing_path = index.get(str(group_id).lower())
+    nsx = None
+    existing = None
+    if existing_path:
+        nsx, existing = groups[existing_path]
+        group_id = existing.get(F_ID, group_id)
+        _author_writable(nsx, existing_path, "Group '{}'".format(group_id))
+    if manager:
+        nsx = next((s for s in sessions if s.name == manager), None)
+        if nsx is None:
+            raise NsxError("'{}' is not a connected manager.".format(manager))
+    if nsx is None:
+        gm_sessions, lm_sessions = ordered_sessions(sessions)
+        nsx = (gm_sessions + lm_sessions)[0]
+
+    url = object_url(nsx, domain, KIND_GROUP, group_id)
+    if delete:
+        if existing is None:
+            raise NsxError("No group called '{}' to delete.".format(group_id))
+        return [PlannedWrite(OP_DELETE, KIND_GROUP, nsx, url, group_id,
+                             existing.get(F_DISPLAY_NAME, group_id),
+                             before=existing, path=existing_path)]
+
+    expression = parse_criteria(criteria) if criteria is not None else None
+    if expression is not None:
+        warn_off_taxonomy(expression, taxonomy)
+    if existing is None and expression is None:
+        raise NsxError(
+            "Creating a group needs --criteria. See `nsxctl group create "
+            "--help` for the syntax.")
+    after = build_group_body(group_id, display_name or (
+        existing or {}).get(F_DISPLAY_NAME) or group_id, expression,
+        description=description, existing=existing)
+    op = OP_MODIFY if existing is not None else OP_CREATE
+    if op == OP_MODIFY and not [
+            f for f in diff_objects(existing, after)
+            if _author_is_real_change(f)]:
+        return []
+    path = existing_path or "{}/domains/{}/groups/{}".format(
+        policy_path_prefix(nsx.base(domain)), domain, group_id)
+    if op == OP_CREATE:
+        # A rule later in the same plan may reference this group by any of
+        # its names, and it does not exist to be looked up yet.
+        cache.will_create((group_id, after.get(F_DISPLAY_NAME)), path)
+    return [PlannedWrite(op, KIND_GROUP, nsx, url, group_id,
+                         after.get(F_DISPLAY_NAME, group_id), before=existing,
+                         after=after, path=path)]
+
+
+# === RULE ACTIONS ===
+def plan_rule(sessions, domain, rule_id, policy_ref=None, sources=None,
+              destinations=None, services=None, action=None, scope=None,
+              direction=None, display_name=None, description=None,
+              disabled=None, logged=None, sequence_number=None, delete=False,
+              move_before=None, move_after=None, cache=None):
+    """One planned write for a DFW rule."""
+    cache = cache or PlanCache(sessions, domain)
+    record = None
+    if policy_ref is None or not delete:
+        try:
+            record = find_rule(sessions, domain, rule_id,
+                               policy_ref=policy_ref, cache=cache)
+        except NsxError:
+            record = None
+    if record is None and delete:
+        raise NsxError("No rule called '{}' to delete.".format(rule_id))
+
+    if record is not None:
+        nsx, policy = record.nsx, record.policy
+        existing = record.rule
+        rule_id = existing.get(F_ID, rule_id)
+        _author_writable(nsx, record.path, "Rule '{}'".format(rule_id))
+    else:
+        if not policy_ref:
+            raise NsxError(
+                "Creating a rule needs --policy to say where it goes.")
+        nsx, policy = find_policy(sessions, domain, policy_ref, cache=cache)
+        existing = None
+        _author_writable(nsx, policy.get(F_PATH, ""),
+                         "Policy '{}'".format(policy.get(F_DISPLAY_NAME)))
+
+    policy_id = policy.get(F_ID, policy_ref)
+    url = object_url(nsx, domain, KIND_RULE, rule_id, policy_id=policy_id)
+    if delete:
+        return [PlannedWrite(OP_DELETE, KIND_RULE, nsx, url, rule_id,
+                             existing.get(F_DISPLAY_NAME, rule_id),
+                             before=existing, policy_id=policy_id,
+                             path=record.path)]
+
+    siblings = [r for r in cache.records if r.policy_id == policy_id]
+    if move_before or move_after:
+        target = find_rule(sessions, domain, move_before or move_after,
+                           policy_ref=policy_id, cache=cache)
+        sequence_number = sequence_for_move(siblings, target,
+                                            before=bool(move_before))
+    elif existing is None and sequence_number is None:
+        highest = max([int(r.rule.get(F_SEQUENCE_NUMBER) or 0)
+                       for r in siblings] or [0])
+        sequence_number = highest + 10
+
+    group_index = cache.group_index()
+    service_index = cache.service_index()
+
+    after = build_rule_body(
+        rule_id, display_name=display_name,
+        sources=resolve_references(group_index, sources) if sources else None,
+        destinations=(resolve_references(group_index, destinations)
+                      if destinations else None),
+        services=(resolve_references(service_index, services, what="service")
+                  if services else None),
+        scope=resolve_references(group_index, scope) if scope else None,
+        action=validate_action(action), direction=validate_direction(direction),
+        disabled=disabled, logged=logged, sequence_number=sequence_number,
+        description=description, existing=existing)
+
+    op = OP_MODIFY if existing is not None else OP_CREATE
+    if op == OP_MODIFY and not [
+            f for f in diff_objects(existing, after)
+            if _author_is_real_change(f)]:
+        return []
+    return [PlannedWrite(op, KIND_RULE, nsx, url, rule_id,
+                         after.get(F_DISPLAY_NAME, rule_id), before=existing,
+                         after=after, policy_id=policy_id,
+                         path=record.path if record else "")]
+
+
+# === DECLARATIVE APPLY ===
+def plan_change_file(sessions, domain, path, taxonomy=None, cache=None):
+    """Every planned write a declarative change file asks for.
+
+    Groups are planned before rules, and share one cache, so a rule may
+    reference a group the same file creates -- which is the whole reason to
+    write one file instead of two commands.
+    """
+    data = load_change_file(path)
+    cache = cache or PlanCache(sessions, domain)
+    changes = []
+    for entry in (data.get("groups") or []):
+        absent = str(entry.get("state", "")).lower() == STATE_ABSENT
+        changes.extend(plan_group(
+            sessions, domain, entry["id"], criteria=entry.get("criteria"),
+            display_name=entry.get("display_name"),
+            description=entry.get("description"), delete=absent,
+            manager=entry.get("manager"), taxonomy=taxonomy, cache=cache))
+    for entry in (data.get("rules") or []):
+        absent = str(entry.get("state", "")).lower() == STATE_ABSENT
+        changes.extend(plan_rule(
+            sessions, domain, entry["id"], policy_ref=entry.get("policy"),
+            sources=_author_as_list(entry.get("source")),
+            destinations=_author_as_list(entry.get("destination")),
+            services=_author_as_list(entry.get("services")),
+            scope=_author_as_list(entry.get("applied_to")),
+            action=entry.get("action"), direction=entry.get("direction"),
+            display_name=entry.get("display_name"),
+            description=entry.get("description"),
+            disabled=entry.get("disabled"), logged=entry.get("logged"),
+            sequence_number=entry.get("sequence_number"), delete=absent,
+            cache=cache))
+    return changes
+
+
+def _author_as_list(value):
+    if value is None:
+        return None
+    return [value] if isinstance(value, str) else list(value)
+
+
+# === TOP-LEVEL ACTIONS ===
+def act_group_write(ctx, group_id, criteria=None, display_name=None,
+                    description=None, delete=False, dry_run=True, force=False):
+    section("GROUP {}".format("DELETE" if delete else "WRITE"))
+    cache = PlanCache(ctx.sessions, ctx.domain)
+    changes = plan_group(ctx.sessions, ctx.domain, group_id, criteria=criteria,
+                         display_name=display_name, description=description,
+                         delete=delete, taxonomy=ctx.taxonomy, cache=cache)
+    return execute_plan(changes, ctx.audit, ctx.write_enabled, dry_run=dry_run,
+                        force=force, sessions=ctx.sessions, domain=ctx.domain,
+                        exporter=ctx.exporter, cache=cache)
+
+
+def act_rule_write(ctx, rule_id, dry_run=True, force=False, **kwargs):
+    section("RULE {}".format("DELETE" if kwargs.get("delete") else "WRITE"))
+    cache = PlanCache(ctx.sessions, ctx.domain)
+    changes = plan_rule(ctx.sessions, ctx.domain, rule_id, cache=cache,
+                        **kwargs)
+    return execute_plan(changes, ctx.audit, ctx.write_enabled, dry_run=dry_run,
+                        force=force, sessions=ctx.sessions, domain=ctx.domain,
+                        exporter=ctx.exporter, cache=cache)
+
+
+def act_apply_file(ctx, path, dry_run=True, force=False):
+    section("APPLY {}".format(path))
+    cache = PlanCache(ctx.sessions, ctx.domain)
+    changes = plan_change_file(ctx.sessions, ctx.domain, path,
+                               taxonomy=ctx.taxonomy, cache=cache)
+    return execute_plan(changes, ctx.audit, ctx.write_enabled, dry_run=dry_run,
+                        force=force, sessions=ctx.sessions, domain=ctx.domain,
+                        exporter=ctx.exporter, cache=cache)
+
+
+# === UNDO ===
+def undo_object_entry(entry, sessions, domain, audit, force=False):
+    """Reverse one audited object write.
+
+    Asymmetric on purpose, and the messages say which case they are in:
+    undoing a create is a delete and undoing a modify is a PUT of the
+    before-body, both exact; undoing a delete recreates an object whose
+    references may have been cleaned up underneath it, which cannot be
+    guaranteed and says so.
+    """
+    kind = KIND_GROUP if entry["object_type"] == OBJ_GROUP else KIND_RULE
+    path = entry.get("object_path") or ""
+    nsx = next((s for s in sessions if s.name == entry.get("manager")), None)
+    if nsx is None:
+        raise NsxError("Manager '{}' is not in this session.".format(
+            entry.get("manager")))
+
+    object_id = path.rsplit("/", 1)[-1]
+    policy_id = None
+    if kind == KIND_RULE:
+        policy_id = policy_id_from_rule_path(path)
+    url = object_url(nsx, domain, kind, object_id, policy_id=policy_id)
+    live = read_object(nsx, domain, kind, object_id, policy_id=policy_id)
+
+    before, after = entry.get("before"), entry.get("after")
+    if before is None and after is not None:
+        if live is None:
+            raise NsxError("Already gone -- nothing to undo.")
+        change = PlannedWrite(OP_DELETE, kind, nsx, url, object_id,
+                              entry.get("object_name", object_id),
+                              before=live, policy_id=policy_id, path=path)
+    elif before is not None and after is None:
+        say("  {} recreating a deleted object cannot be guaranteed: anything "
+            "that referenced it may have been cleaned up in the "
+            "meantime.".format(cBY("note:")))
+        say("  {}".format(cD(
+            "A snapshot restore is the reliable way back from a delete.")))
+        change = PlannedWrite(OP_CREATE, kind, nsx, url, object_id,
+                              entry.get("object_name", object_id),
+                              after=before, policy_id=policy_id, path=path)
+    else:
+        if live is None:
+            raise NsxError(
+                "The object no longer exists on {}, so a modify cannot be "
+                "reversed. Recreate it, or restore from a snapshot.".format(
+                    nsx.name))
+        change = PlannedWrite(OP_MODIFY, kind, nsx, url, object_id,
+                              entry.get("object_name", object_id),
+                              before=live, after=before, policy_id=policy_id,
+                              path=path)
+    print_plan([change])
+    if not confirm("\n  {} [y/N]: ".format(cB("Apply this undo?"))):
+        say("  Cancelled.")
+        return False
+    result = apply_write(change, domain, force=force)
+    audit.log_change("undo_" + change.op, nsx.name, entry["object_type"],
+                     path, str(change.name), change.before,
+                     result if change.op != OP_DELETE else None,
+                     detail="undo of {}".format(entry.get("timestamp", "?")))
+    ok_msg("Undo applied.")
+    return True
+
+
+def author_menu(ctx):
+    """Interactive entry: menu 18.
+
+    Deliberately narrow. Authoring has far more surface than a numbered menu
+    can carry safely, so this covers the two everyday shapes and points at
+    the command line for the rest.
+    """
+    say("\n  1. Create or edit a group")
+    say("  2. Apply a declarative change file")
+    choice = ask("  Choice: ")
+    try:
+        if choice == "1":
+            group_id = ask("  Group id: ")
+            if not group_id:
+                return
+            say("  {}".format(cD(CRITERIA_HELP)))
+            criteria = ask("  Criteria: ")
+            if not criteria:
+                return
+            act_group_write(ctx, group_id, criteria=criteria,
+                            dry_run=not ctx.write_enabled)
+        elif choice == "2":
+            path = ask("  Change file path: ")
+            if path:
+                act_apply_file(ctx, path, dry_run=not ctx.write_enabled)
+        else:
+            say("  Not a valid choice.")
+    except (NsxError, ConfigError) as e:
+        err(str(e))
+
+
+# ==========================================================================
+# actions/audit_view.py  --  Audit log viewing and single-entry undo.
+# ==========================================================================
+
+AUDIT_HEADERS = ["timestamp", "user", "manager", "action", "object_type",
+                 "object", "added", "removed", "status"]
+
+UNDOABLE_OBJECTS = (OBJ_GROUP, OBJ_RULE)
+
+
+def _entry_row(entry, added, removed):
+    return [entry["timestamp"], entry["user"], entry["manager"],
+            entry["action"], entry["object_type"], entry["object_name"],
+            fmt_tags_plain(added) if added else "",
+            fmt_tags_plain(removed) if removed else "",
+            entry["status"]]
+
+
+def _print_entry(index, entry):
+    say("  {:5s} {}  {:28s}  {}  [{}]".format(
+        cD(str(index) + "."), cD(str(entry["timestamp"])[:19]),
+        str(entry["object_name"])[:28], cD(entry["object_type"]),
+        cC(entry["manager"])))
+    if entry["object_type"] == OBJ_VM_TAGS:
+        added, removed = summarise_entry(entry)
+        if added:
+            say("        {}".format(cG("+ " + fmt_tags_plain(added))))
+        if removed:
+            say("        {}".format(cR("- " + fmt_tags_plain(removed))))
+        return
+    if entry["before"] is None:
+        say("        {}".format(cG("created")))
+    elif entry["after"] is None:
+        say("        {}".format(cR("deleted")))
+    else:
+        say("        {}".format(cBY("modified")))
+    if entry["status"] and entry["status"] != "success":
+        say("        {} {}".format(cR(entry["status"]), cD(entry["detail"])))
+
+
+def act_audit_log(audit, sessions, write_enabled, exporter=None, limit=20,
+                  domain="default"):
+    entries = audit.last_n_normalised(limit)
+    if not entries:
+        say("  Audit log empty.")
+        if exporter is not None:
+            exporter.stage("audit_log", AUDIT_HEADERS, [])
+        return
+    say("\n  Last {} entries:".format(cC(str(len(entries)))))
+    hr()
+    rows = []
+    for index, entry in enumerate(entries, 1):
+        _print_entry(index, entry)
+        added, removed = summarise_entry(entry)
+        rows.append(_entry_row(entry, added, removed))
+    if exporter is not None:
+        exporter.stage("audit_log", AUDIT_HEADERS, rows)
+
+    if not write_enabled:
+        say("\n  {}.".format(cBY("Undo needs write mode")))
+        return
+    if not is_interactive():
+        return
+    hr()
+    choice = ask("  Undo entry # (or b): ")
+    if not choice.isdigit() or not (1 <= int(choice) <= len(entries)):
+        say("  Cancelled.")
+        return
+    target = entries[int(choice) - 1]
+    try:
+        if target["object_type"] == OBJ_VM_TAGS:
+            _undo_vm_tags(target, sessions, audit)
+        elif target["object_type"] in UNDOABLE_OBJECTS:
+            undo_object_entry(target, sessions, domain, audit)
+        else:
+            err("Entries of type '{}' cannot be undone.".format(
+                target["object_type"]))
+    except NsxError as e:
+        err(str(e))
+
+
+def _undo_vm_tags(target, sessions, audit):
+    """The original tag undo, unchanged in behaviour.
+
+    Reads `before`/`after` off the normalised entry, which for a tag entry
+    comes from `tags_before`/`tags_after` whether it was written this release
+    or three releases ago.
+    """
+    restore_to = target["before"] or []
+    raw = target["raw"]
+    vm_name = raw.get("vm_display_name", target["object_name"])
+    mgr_name = target["manager"]
+    ext = raw.get("vm_external_id", "?")
+
+    nsx = next((s for s in sessions if s.name == mgr_name), None)
+    if not nsx:
+        err("Manager '{}' is not in this session.".format(mgr_name))
+        return
+    vm = nsx.get_vm_by_external_id(ext)
+    if not vm:
+        err("VM '{}' (external_id {}) not found on {}.".format(
+            vm_name, ext, mgr_name))
+        return
+    current = sorted(tags_of(vm))
+    say("\n  Restore '{}' on [{}]".format(cB(vm_name), cC(mgr_name)))
+    say("    current : {}".format(fmt_tags_plain(current)))
+    say("    restore : {}".format(fmt_tags_plain(sorted(restore_to))))
+    if current == sorted(restore_to):
+        say("  Already in that state -- nothing to undo.")
+        return
+    if not confirm("  Apply undo? [y/N]: "):
+        say("  Cancelled.")
+        return
+    fresh = nsx.refresh_vm(vm) or vm
+    nsx.update_vm_tags(fresh, restore_to)
+    audit.log("undo", nsx.name, vm_name, fresh.get(F_EXTERNAL_ID),
+              current, restore_to, detail="undo of {}".format(
+                  target.get("timestamp", "?")))
+    ok_msg("Undo applied.")
+
+
+# ==========================================================================
+# actions/trace.py  --  Connectivity trace: can A reach B, and which rule decided it.
+# ==========================================================================
+
+TRACE_HEADERS = ["engine", "verdict", "rule", "policy", "manager", "detail"]
+TRACE_PATH_HEADERS = ["step", "observation", "component", "node", "detail"]
+
+UNDECIDED_CONSOLE_LIMIT = 5
+
+
+class TraceOutcome:
+    """What the command produced, so the caller can pick an exit code."""
+
+    __slots__ = ("static", "live", "agree", "live_skipped")
+
+    def __init__(self, static=None, live=None, agree=None, live_skipped=""):
+        self.static = static
+        self.live = live
+        self.agree = agree
+        self.live_skipped = live_skipped
+
+    @property
+    def has_verdict(self):
+        if self.live is not None and self.live.conclusive:
+            return True
+        return bool(self.static and self.static.record)
+
+
+def _action_colour(action):
+    return {"ALLOW": cG, "DROP": cR, "REJECT": cR}.get(action, cBY)
+
+
+def _rule_label(record):
+    seq = record.rule.get(F_SEQUENCE_NUMBER)
+    category = record.policy.get(F_CATEGORY)
+    bits = []
+    if seq is not None:
+        bits.append("seq {}".format(seq))
+    if category:
+        bits.append(str(category))
+    suffix = "  [{}]".format(", ".join(bits)) if bits else ""
+    return "rule '{}' in policy '{}'{}".format(
+        cB(record.rule_name), record.policy_name, cD(suffix))
+
+
+# === STATIC HALF ===
+def _print_static(verdict, proto, port):
+    say("\n  {}   {}".format(cB("WHAT THE POLICY SAYS"),
+                             cD("(evaluated here -- no packet sent)")))
+    hr()
+    if verdict.record is None:
+        say("    {} no rule in this domain matches {}/{}.".format(
+            cBY("NO MATCH:"), proto, port if port is not None else "any"))
+        say("    {}".format(cD(
+            "NSX's own default applies. If the default section is in another "
+            "domain it was not swept.")))
+    else:
+        colour = _action_colour(verdict.action)
+        say("    {}  by {}".format(colour(verdict.action),
+                                   _rule_label(verdict.record)))
+        say("    {}".format(cD("on {}  ({} rule(s) evaluated)".format(
+            verdict.record.nsx.name, verdict.evaluated))))
+
+    if verdict.undecided:
+        say("\n    {} {} rule(s) ahead of this one could not be "
+            "decided:".format(cBY("UNCERTAIN:"), len(verdict.undecided)))
+        for record, reason in verdict.undecided[:UNDECIDED_CONSOLE_LIMIT]:
+            say("      {} / {}".format(cB(record.policy_name), record.rule_name))
+            say("        {}".format(cD(reason)))
+        if len(verdict.undecided) > UNDECIDED_CONSOLE_LIMIT:
+            say("      {}".format(cD("... +{} more".format(
+                len(verdict.undecided) - UNDECIDED_CONSOLE_LIMIT))))
+        say("    {}".format(cD(
+            "Any of them may be the real match, so the verdict above is the "
+            "first rule this can prove -- not necessarily the first rule NSX "
+            "hits.")))
+
+
+# === LIVE HALF ===
+def _print_live(live):
+    say("\n  {}   {}".format(cB("WHAT THE DATA PLANE DID"),
+                             cD("(traceflow -- a synthetic packet was sent)")))
+    hr()
+    if live.state != TF_FINISHED:
+        say("    {} traceflow ended in state {}.".format(cBY("NO VERDICT:"),
+                                                         live.state))
+        say("    {}".format(cD(
+            "No observation came back, so nothing is claimed about this "
+            "flow either way.")))
+        return
+    if not live.conclusive:
+        say("    {} the packet was neither delivered nor dropped in the "
+            "observations returned.".format(cBY("NO VERDICT:")))
+        return
+
+    obs = live.verdict_obs
+    if live.delivered:
+        say("    {}  at {}".format(
+            cBG("DELIVERED"), obs.get("transport_node_name", "?")))
+    else:
+        say("    {}  at {} on {}".format(
+            cBR("DROPPED"), obs.get("component_type", "?"),
+            obs.get("transport_node_name", "?")))
+        if live.record is not None:
+            say("    by {}".format(_rule_label(live.record)))
+            say("    {}".format(cD("acl_rule_id {}".format(live.acl_rule_id))))
+        elif live.acl_rule_id:
+            say("    by DFW rule id {} -- {}".format(
+                cB(str(live.acl_rule_id)),
+                cD("no rule in this domain carries that id")))
+        elif obs.get("reason"):
+            say("    reason: {}".format(obs.get("reason")))
+
+    if live.observations:
+        say("\n    {}".format(cD("path:")))
+        for entry in live.observations:
+            say("      {}".format(cD(observation_line(entry))))
+
+
+# === AGREEMENT ===
+def _print_agreement(outcome):
+    if outcome.live_skipped:
+        say("\n  {} {}".format(cBY("Live trace not run:"), outcome.live_skipped))
+        return
+    if outcome.agree is None:
+        return
+    hr()
+    if outcome.agree:
+        say("  {} the policy and the data plane tell the same story.".format(
+            cBG("Agreed:")))
+        return
+    say("  {} the policy and the data plane disagree.".format(
+        cBR("DISAGREEMENT:")))
+    say("    policy says   : {}".format(
+        _action_colour(outcome.static.action)(outcome.static.action or "?")))
+    say("    data plane did: {}".format(
+        _action_colour(outcome.live.action)(outcome.live.action or "?")))
+    say("\n    {}".format(cD("This is a finding, not an error. Causes, most "
+                             "likely first:")))
+    for reason in disagreement_reasons(outcome.static, outcome.live):
+        say("      - {}".format(cD(reason)))
+
+
+# === ROWS ===
+def _rows_for(outcome):
+    rows = []
+    static = outcome.static
+    if static is not None:
+        record = static.record
+        rows.append([
+            "policy", static.action or "no_match",
+            record.rule_name if record else "",
+            record.policy_name if record else "",
+            record.nsx.name if record else "",
+            "certain" if static.certain else "{} rule(s) undecided".format(
+                len(static.undecided))])
+    live = outcome.live
+    if live is not None:
+        rows.append([
+            "data_plane", live.action or live.state,
+            live.record.rule_name if live.record else (
+                str(live.acl_rule_id) if live.acl_rule_id else ""),
+            live.record.policy_name if live.record else "",
+            live.record.nsx.name if live.record else "",
+            "state {}".format(live.state)])
+    return rows
+
+
+def _path_rows(live):
+    rows = []
+    for index, obs in enumerate((live.observations if live else []), 1):
+        rows.append([str(index),
+                     str(obs.get("resource_type", "")).replace(
+                         "TraceflowObservation", ""),
+                     obs.get("component_type", ""),
+                     obs.get("transport_node_name", ""),
+                     obs.get("reason", "")])
+    return rows
+
+
+# === ACTION ===
+def act_trace(sessions, source_name, target_name=None, domain="default",
+              exporter=None, port=None, proto=DEFAULT_PROTO, to_address=None,
+              static_only=False, nic=None, timeout=TRACE_DEFAULT_TIMEOUT):
+    """Trace one flow. Returns a TraceOutcome; prints the whole report.
+
+    Static evaluation always runs: it is nearly free once the rule sweep has
+    happened (and the sweep has to happen anyway, to turn a numeric
+    acl_rule_id into a rule name), it needs no packet, and it is the only
+    answer available on a Global Manager or a powered-off VM.
+    """
+    section("CONNECTIVITY TRACE")
+
+    want_live = not static_only
+    live_skipped = ""
+    if want_live and not local_managers(sessions):
+        want_live = False
+        live_skipped = (
+            "traceflow is a Local Manager API -- the Global Manager does not "
+            "serve it, and this inventory has no LM connected.")
+
+    source = resolve_vm_endpoint(sessions, source_name, domain, nic=nic,
+                                 need_port=want_live)
+    destination = _resolve_destination(sessions, target_name, to_address,
+                                       domain)
+
+    if want_live and not source.powered_on:
+        want_live = False
+        live_skipped = (
+            "{} is not powered on, so it has no live port to inject a packet "
+            "at.".format(source.label))
+    elif want_live and not source.lport_id:
+        want_live = False
+        live_skipped = (
+            "{}'s NIC has no realized logical port on {} -- there is nothing "
+            "to inject at.".format(source.label, source.nsx.name))
+    elif want_live and not destination.ip:
+        want_live = False
+        live_skipped = (
+            "no address resolved for the destination. Give one explicitly "
+            "with --to ADDRESS.")
+
+    say("  source      : {}".format(cC(source.describe())))
+    say("  destination : {}".format(cC(destination.describe())))
+    say("  flow        : {}/{}".format(proto,
+                                       port if port is not None else "any"))
+    if source.groups or destination.groups:
+        say("  groups      : source {}, destination {}".format(
+            len(source.groups), len(destination.groups)))
+
+    records = sweep_rules(sessions, domain)
+    services = load_service_index(sessions, domain)
+    static = static_evaluate(records, source, destination, services,
+                             proto=proto, port=port)
+    _print_static(static, proto, port)
+
+    live = None
+    if want_live:
+        live, live_skipped = _run_live(source, destination, records,
+                                       proto, port, timeout)
+        if live is not None:
+            _print_live(live)
+
+    outcome = TraceOutcome(static=static, live=live,
+                           agree=verdicts_agree(static, live),
+                           live_skipped=live_skipped)
+    _print_agreement(outcome)
+    hr()
+
+    if exporter is not None:
+        exporter.stage("trace", TRACE_HEADERS, _rows_for(outcome))
+        exporter.stage("trace_path", TRACE_PATH_HEADERS, _path_rows(live))
+    return outcome
+
+
+def _resolve_destination(sessions, target_name, to_address, domain):
+    """A VM by name, or a bare address."""
+    if to_address:
+        groups = group_inventory(sessions, domain)
+        return TraceEndpoint(ip=to_address, label=to_address,
+                             groups=groups_containing_address(groups,
+                                                              to_address))
+    if not target_name:
+        raise NsxError("Give a destination VM, or an address with --to.")
+    return resolve_vm_endpoint(sessions, target_name, domain, need_port=False)
+
+
+def _run_live(source, destination, records, proto, port, timeout):
+    """(LiveVerdict or None, reason it was skipped).
+
+    The packet is synthetic and harmless, but it is real traffic on somebody's
+    data plane, so it is confirmed like a write rather than assumed like a
+    read.
+    """
+    prompt = "\n  {} inject a synthetic {}/{} packet at {} on {}? [y/N]: ".format(
+        cB("Traceflow:"), proto, port if port is not None else "any",
+        source.label, source.nsx.name)
+    if not confirm(prompt):
+        if not is_interactive():
+            return None, ("injecting a packet needs consent. Pass --yes for a "
+                          "script, or --static for policy evaluation only.")
+        return None, "declined at the prompt."
+
+    request = build_traceflow_request(
+        source.lport_id, source.ip, destination.ip, source.mac,
+        destination.mac, proto=proto, port=port)
+    try:
+        _tid, state, observations = run_traceflow(source.nsx, request,
+                                                  timeout=timeout)
+    except NsxError as e:
+        return None, "traceflow failed on {}: {}".format(source.nsx.name, e)
+    return interpret_observations(state, observations,
+                                  rules_by_realized_id(records)), ""
+
+
+def report_ambiguous_nic(error):
+    """Print the NIC list a multi-NIC VM needs the operator to choose from."""
+    warn(str(error))
+    say("  {} has these NICs:".format(cB(error.vm_name)))
+    for index, vif in enumerate(error.vifs):
+        say("    {}".format(describe_vif(vif, index)))
+    say("\n  {}".format(cD("Re-run with --nic 1, or --nic 'Network adapter 2'.")))
+
+
+def trace_menu(ctx):
+    """Interactive entry: menu 17."""
+    source = ask("  Source VM: ")
+    if not source:
+        return
+    target = ask("  Destination VM (blank to give an address): ", default="")
+    address = "" if target else ask("  Destination address: ", default="")
+    if not target and not address:
+        say("  Need a destination.")
+        return
+    port = ask("  Destination port (blank = any): ", default="")
+    proto = ask("  Protocol [tcp]: ", default=DEFAULT_PROTO)
+    live = confirm("  Send a real traceflow packet? [y/N]: ")
+    try:
+        act_trace(ctx.sessions, source, target or None, ctx.domain,
+                  ctx.exporter, port=int(port) if port.strip().isdigit() else None,
+                  proto=proto or DEFAULT_PROTO, to_address=address or None,
+                  static_only=not live)
+    except AmbiguousNic as e:
+        report_ambiguous_nic(e)
 
 
 # ==========================================================================
@@ -4579,6 +6982,8 @@ def menu_text(mode_str):
     9.  Compliance dashboard
    15.  DFW rule hygiene                       {hyg}
    16.  Drift since last snapshot              {dft}
+   17.  Trace a flow: can A reach B?             {trc}
+   18.  Create / edit groups and rules            {aut}
 
   {ops}
   {d}
@@ -4597,7 +7002,9 @@ def menu_text(mode_str):
            audit=cD("(audit logged)"), dry=cD("(dry-run first)"),
            rl=cD("(any member type, deduped)"),
            hyg=cD("(any-any, shadowed, unused, broken refs)"),
-           dft=cD("(what changed, and who changed it)"))
+           dft=cD("(what changed, and who changed it)"),
+           trc=cD("(policy verdict, and the data plane's)"),
+           aut=cD("(dry-run first, audited, undoable)"))
 
 
 def select_managers(sessions, allow_roles, allow_all=False, label=""):
@@ -4751,6 +7158,14 @@ def interactive(ctx):
                 act_drift_menu(ctx)
                 offer_export(ctx.exporter)
 
+            elif c == "17":
+                trace_menu(ctx)
+                offer_export(ctx.exporter)
+
+            elif c == "18":
+                author_menu(ctx)
+                offer_export(ctx.exporter)
+
             elif c == "10":
                 tgt = select_managers(ctx.sessions, (ROLE_GM, ROLE_LM),
                                       allow_all=True, label="verification")
@@ -4759,7 +7174,7 @@ def interactive(ctx):
 
             elif c == "11":
                 act_audit_log(ctx.audit, ctx.sessions, ctx.write_enabled,
-                              ctx.exporter)
+                              ctx.exporter, domain=ctx.domain)
                 offer_export(ctx.exporter)
 
             elif c == "12":
@@ -4831,8 +7246,14 @@ everyday:
   nsxctl compliance                 tagging posture across every Local Manager
   nsxctl tag find --scope env --tag prod
   nsxctl impact web-prod-01         what breaks if I retag this VM
+  nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
+
+authoring (dry run unless --enable-writes):
+  nsxctl group create g-web --criteria 'tag:env=prod AND tag:tier=web'
+  nsxctl rule create allow-web-db --policy app-tier --from g-web --to g-db
+  nsxctl apply changes.yaml         a declarative file of groups and rules
 
 Run `nsxctl <command> --help` for a command's options and examples.
 """
@@ -4904,6 +7325,8 @@ def build_parser():
     pass
     pass
     pass
+    pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -4921,10 +7344,20 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     parents = [global_parent]
     for register in (register_setup, register_group, register_tag,
-                     register_rule, register_analysis, register_snapshot,
+                     register_rule, register_analysis, register_trace,
+                     register_snapshot, register_apply,
                      register_shell):
         register(sub, parents)
     return parser
+
+
+def add_action(sub, parents, name, help_text, description=None, epilog=None):
+    """A second-level subparser (`nsxctl group create`), with the same raw
+    formatter as a top-level command so a syntax table survives --help."""
+    return sub.add_parser(
+        name, parents=parents, help=help_text,
+        description=description or help_text, epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
 
 
 def add_command(sub, parents, name, help_text, description=None, epilog=None):
@@ -5100,7 +7533,7 @@ def cmd_config_validate(args, ctx):
 
 
 # ==========================================================================
-# commands/group.py  --  Group inspection: `nsxctl group list|show`.
+# commands/group.py  --  Groups: `nsxctl group list|show|create|edit|delete`.
 # ==========================================================================
 
 def register_group(sub, parents):
@@ -5108,8 +7541,8 @@ def register_group(sub, parents):
         sub, parents, "group", "Search and inspect security groups.")
     gsub = p.add_subparsers(dest="group_action", metavar="<action>")
 
-    ls = gsub.add_parser(
-        "list", parents=parents, help="List groups and their criteria.",
+    ls = add_action(
+        gsub, parents, "list", "List groups and their criteria.",
         description="List groups on the Global Manager and Local Managers, "
                     "with their membership criteria.",
         epilog="examples:\n"
@@ -5122,19 +7555,58 @@ def register_group(sub, parents):
                     help="Also resolve and list VM members.")
     ls.set_defaults(func=cmd_group_list)
 
-    sh = gsub.add_parser(
-        "show", parents=parents, help="Show one group in full.",
+    sh = add_action(
+        gsub, parents, "show", "Show one group in full.",
         description="Show a single group's criteria and members.",
         epilog="example:\n  nsxctl group show web-prod")
     sh.add_argument("name", help="Group name or id.")
     sh.set_defaults(func=cmd_group_show)
 
+    cr = add_action(
+        gsub, parents, "create", "Create a group from criteria.",
+        description="Create a dynamic security group.\n\n" + CRITERIA_HELP +
+                    "\n\nDry run by default: nothing is written without "
+                    "--enable-writes.",
+        epilog="examples:\n"
+               "  nsxctl group create g-web --criteria 'tag:env=prod AND "
+               "tag:tier=web'\n"
+               "  nsxctl group create g-web --criteria 'tag:env=prod' "
+               "--enable-writes --yes")
+    cr.add_argument("name", help="Group id to create.")
+    cr.add_argument("--criteria", required=True,
+                    help="Membership criteria. See the syntax above.")
+    cr.add_argument("--display-name", help="Human-readable name.")
+    cr.add_argument("--description", help="Free-text description.")
+    cr.set_defaults(func=cmd_group_create)
+
+    ed = add_action(
+        gsub, parents, "edit", "Change an existing group.",
+        description="Change a group's criteria, name or description. The plan "
+                    "is shown as a field-level diff before anything is "
+                    "written.\n\n" + CRITERIA_HELP,
+        epilog="example:\n"
+               "  nsxctl group edit g-web --criteria 'tag:env=prod OR "
+               "tag:env=staging'")
+    ed.add_argument("name", help="Group name or id.")
+    ed.add_argument("--criteria", help="Replacement membership criteria.")
+    ed.add_argument("--display-name", help="New human-readable name.")
+    ed.add_argument("--description", help="New description.")
+    ed.set_defaults(func=cmd_group_edit)
+
+    dl = add_action(
+        gsub, parents, "delete", "Delete a group.",
+        description="Delete a group. Rules referencing it are NOT rewritten -- "
+                    "run `nsxctl rule hygiene` afterwards to find any left "
+                    "pointing at nothing.",
+        epilog="example:\n  nsxctl group delete g-old --enable-writes")
+    dl.add_argument("name", help="Group name or id.")
+    dl.set_defaults(func=cmd_group_delete)
+
     p.set_defaults(func=_group_needs_action)
 
 
 def _group_needs_action(args, ctx):
-    pass
-    err("Specify what to do: nsxctl group list  |  nsxctl group show NAME")
+    err("Specify what to do: nsxctl group list | show | create | edit | delete")
     return 2
 
 
@@ -5153,6 +7625,38 @@ def cmd_group_show(args, ctx):
     act_groups(_targets(ctx), args.domain, args.name,
                show_members=True, exporter=ctx.exporter)
     return 0
+
+
+def _group_write(args, ctx, **kwargs):
+    """Shared plumbing: dry run unless writes are enabled."""
+    try:
+        result = act_group_write(
+            ctx, args.name, dry_run=not ctx.write_enabled,
+            force=args.force, **kwargs)
+    except (NsxError, ConfigError) as e:
+        err(str(e))
+        return 2
+    return 1 if result.failed else 0
+
+
+def cmd_group_create(args, ctx):
+    return _group_write(args, ctx, criteria=args.criteria,
+                        display_name=args.display_name,
+                        description=args.description)
+
+
+def cmd_group_edit(args, ctx):
+    if not any((args.criteria, args.display_name, args.description)):
+        err("Nothing to change. Give --criteria, --display-name or "
+            "--description.")
+        return 2
+    return _group_write(args, ctx, criteria=args.criteria,
+                        display_name=args.display_name,
+                        description=args.description)
+
+
+def cmd_group_delete(args, ctx):
+    return _group_write(args, ctx, delete=True)
 
 
 # ==========================================================================
@@ -5288,7 +7792,7 @@ def cmd_tag_ticket(args, ctx):
 
 
 # ==========================================================================
-# commands/rule.py  --  DFW rule commands: `nsxctl rule hygiene|baseline`.
+# commands/rule.py  --  DFW rules: `nsxctl rule hygiene|baseline|create|edit|move|delete`.
 # ==========================================================================
 
 def register_rule(sub, parents):
@@ -5296,8 +7800,8 @@ def register_rule(sub, parents):
         sub, parents, "rule", "Inspect distributed firewall rules.")
     rsub = p.add_subparsers(dest="rule_action", metavar="<action>")
 
-    hy = rsub.add_parser(
-        "hygiene", parents=parents, help="Report rule hygiene problems.",
+    hy = add_action(
+        rsub, parents, "hygiene", "Report rule hygiene problems.",
         description="Find any-any rules, overly broad applied-to scopes, "
                     "rules referencing missing or inert groups, duplicates, "
                     "rules shadowed by an any-any above them, disabled rules, "
@@ -5317,9 +7821,9 @@ def register_rule(sub, parents):
                          "estates; drops the empty-group check.")
     hy.set_defaults(func=cmd_rule_hygiene)
 
-    bl = rsub.add_parser(
-        "baseline", parents=parents,
-        help="Save or compare rule hit counts.",
+    bl = add_action(
+        rsub, parents, "baseline",
+        "Save or compare rule hit counts.",
         description="NSX hit counters are cumulative since the last reset, so "
                     "a single read cannot prove a rule is unused. Save a "
                     "baseline, wait, then compare: a counter that did not "
@@ -5338,11 +7842,143 @@ def register_rule(sub, parents):
                          "(required for compare).")
     bl.set_defaults(func=cmd_rule_baseline)
 
+    cr = add_action(
+        rsub, parents, "create", "Create a DFW rule.",
+        description="Create a rule in an existing security policy.\n\n"
+                    "Before anything is written the proposed rule is run "
+                    "through the same checks as `nsxctl rule hygiene`, so an "
+                    "any-any ALLOW is caught here rather than in tomorrow's "
+                    "report. Dry run by default.",
+        epilog="examples:\n"
+               "  nsxctl rule create allow-web-db --policy app-tier \\\n"
+               "      --from g-web --to g-db --service MySQL --action ALLOW\n"
+               "  nsxctl rule create deny-all --policy app-tier "
+               "--action DROP --enable-writes")
+    cr.add_argument("name", help="Rule id to create.")
+    _add_rule_body_args(cr, require_policy=True)
+    cr.set_defaults(func=cmd_rule_create)
+
+    ed = add_action(
+        rsub, parents, "edit", "Change an existing rule.",
+        description="Change a rule. The plan is a field-level diff, "
+                    "classified security or cosmetic by the same engine "
+                    "`nsxctl drift` uses.",
+        epilog="example:\n  nsxctl rule edit allow-web-db --action DROP")
+    ed.add_argument("name", help="Rule name or id.")
+    _add_rule_body_args(ed)
+    ed.set_defaults(func=cmd_rule_edit)
+
+    mv = add_action(
+        rsub, parents, "move", "Reorder a rule within its policy.",
+        description="Move a rule before or after another in the same policy, "
+                    "by giving it a sequence number in the gap. If there is "
+                    "no free number in that gap it refuses rather than "
+                    "renumbering every rule in the policy.",
+        epilog="example:\n  nsxctl rule move allow-web-db --before deny-all")
+    mv.add_argument("name", help="Rule name or id.")
+    mv.add_argument("--policy", help="Policy the rule is in.")
+    group = mv.add_mutually_exclusive_group(required=True)
+    group.add_argument("--before", metavar="RULE",
+                       help="Put it immediately before this rule.")
+    group.add_argument("--after", metavar="RULE",
+                       help="Put it immediately after this rule.")
+    mv.set_defaults(func=cmd_rule_move)
+
+    dl = add_action(
+        rsub, parents, "delete", "Delete a rule.",
+        description="Delete a rule. Undo can restore it from the audit log, "
+                    "but recreating a deleted object is the one undo this "
+                    "tool will not promise -- take a snapshot first.",
+        epilog="example:\n  nsxctl rule delete old-rule --enable-writes")
+    dl.add_argument("name", help="Rule name or id.")
+    dl.add_argument("--policy", help="Policy the rule is in.")
+    dl.set_defaults(func=cmd_rule_delete)
+
     p.set_defaults(func=_rule_needs_action)
 
 
+def _add_rule_body_args(parser, require_policy=False):
+    parser.add_argument("--policy", required=require_policy,
+                        help="Security policy the rule belongs to.")
+    parser.add_argument("--from", dest="sources", action="append",
+                        metavar="GROUP",
+                        help="Source group. Repeatable. Default ANY.")
+    parser.add_argument("--to", dest="destinations", action="append",
+                        metavar="GROUP",
+                        help="Destination group. Repeatable. Default ANY.")
+    parser.add_argument("--service", dest="services", action="append",
+                        metavar="SERVICE",
+                        help="Service. Repeatable. Default ANY.")
+    parser.add_argument("--applied-to", dest="scope", action="append",
+                        metavar="GROUP",
+                        help="Enforce only on these groups. Default ANY, "
+                             "which means every workload.")
+    parser.add_argument("--action", choices=RULE_ACTIONS, metavar="ACTION",
+                        help="One of {}.".format(" | ".join(RULE_ACTIONS)))
+    parser.add_argument("--direction", choices=RULE_DIRECTIONS,
+                        metavar="DIRECTION",
+                        help="One of {}.".format(" | ".join(RULE_DIRECTIONS)))
+    parser.add_argument("--display-name", help="Human-readable name.")
+    parser.add_argument("--description", help="Free-text description.")
+    parser.add_argument("--sequence", type=int, metavar="N",
+                        help="Evaluation position within the policy.")
+    logging = parser.add_mutually_exclusive_group()
+    logging.add_argument("--log", dest="logged", action="store_true",
+                         default=None, help="Turn rule logging on.")
+    logging.add_argument("--no-log", dest="logged", action="store_false",
+                         default=None, help="Turn rule logging off.")
+    state = parser.add_mutually_exclusive_group()
+    state.add_argument("--disable", dest="disabled", action="store_true",
+                       default=None, help="Disable the rule.")
+    state.add_argument("--enable", dest="disabled", action="store_false",
+                       default=None, help="Enable the rule.")
+
+
+def _rule_write(args, ctx, **kwargs):
+    try:
+        result = act_rule_write(ctx, args.name, dry_run=not ctx.write_enabled,
+                                force=args.force, **kwargs)
+    except (NsxError, ConfigError) as e:
+        err(str(e))
+        return 2
+    return 1 if result.failed else 0
+
+
+def _rule_body_kwargs(args):
+    return {"policy_ref": args.policy, "sources": args.sources,
+            "destinations": args.destinations, "services": args.services,
+            "scope": args.scope, "action": args.action,
+            "direction": args.direction, "display_name": args.display_name,
+            "description": args.description, "disabled": args.disabled,
+            "logged": args.logged, "sequence_number": args.sequence}
+
+
+def cmd_rule_create(args, ctx):
+    return _rule_write(args, ctx, **_rule_body_kwargs(args))
+
+
+def cmd_rule_edit(args, ctx):
+    kwargs = _rule_body_kwargs(args)
+    if not any(v is not None for k, v in kwargs.items() if k != "policy_ref"):
+        err("Nothing to change. Give at least one of --from, --to, --service, "
+            "--applied-to, --action, --direction, --display-name, "
+            "--description, --sequence, --log/--no-log, --enable/--disable.")
+        return 2
+    return _rule_write(args, ctx, **kwargs)
+
+
+def cmd_rule_move(args, ctx):
+    return _rule_write(args, ctx, policy_ref=args.policy,
+                       move_before=args.before, move_after=args.after)
+
+
+def cmd_rule_delete(args, ctx):
+    return _rule_write(args, ctx, policy_ref=args.policy, delete=True)
+
+
 def _rule_needs_action(args, ctx):
-    err("Specify what to do: nsxctl rule hygiene  |  nsxctl rule baseline")
+    err("Specify what to do: nsxctl rule hygiene | baseline | create | edit "
+        "| move | delete")
     return 2
 
 
@@ -5536,7 +8172,17 @@ def register_analysis(sub, parents):
                "  nsxctl compliance --out-csv posture.csv")
     p.set_defaults(func=cmd_compliance)
 
-    p = add_command(sub, parents, "audit", "Review and undo audited writes.")
+    p = add_command(
+        sub, parents, "audit", "Review and undo audited writes.",
+        description="Every write the toolkit makes -- tags, groups and rules "
+                    "alike -- is logged with both sides of it, and one entry "
+                    "at a time can be reversed.\n\n"
+                    "Undo is asymmetric: reversing a create is a delete and "
+                    "reversing a modify is a write of the before-body, both "
+                    "exact. Reversing a delete recreates an object whose "
+                    "references may have been cleaned up in the meantime, "
+                    "which cannot be guaranteed -- a snapshot restore is the "
+                    "reliable way back from a delete.")
     asub = p.add_subparsers(dest="audit_action", metavar="<action>")
     ls = asub.add_parser("list", parents=parents,
                          help="Show recent audited writes.")
@@ -5544,7 +8190,7 @@ def register_analysis(sub, parents):
                     help="How many entries (default 20).")
     ls.set_defaults(func=cmd_audit_list)
     un = asub.add_parser("undo", parents=parents,
-                         help="Restore a VM's tags from an audit entry.")
+                         help="Reverse one audited write.")
     un.add_argument("-n", "--limit", type=int, default=20,
                     help="How many entries to choose from (default 20).")
     un.set_defaults(func=cmd_audit_undo)
@@ -5571,17 +8217,147 @@ def cmd_compliance(args, ctx):
 
 def cmd_audit_list(args, ctx):
     act_audit_log(ctx.audit, ctx.sessions, write_enabled=False,
-                  exporter=ctx.exporter, limit=args.limit)
+                  exporter=ctx.exporter, limit=args.limit, domain=args.domain)
     return 0
 
 
 def cmd_audit_undo(args, ctx):
     if not ctx.write_enabled:
-        err("Undo changes tags. Re-run with --enable-writes.")
+        err("Undo writes to NSX. Re-run with --enable-writes.")
         return 2
     act_audit_log(ctx.audit, ctx.sessions, write_enabled=True,
-                  exporter=ctx.exporter, limit=args.limit)
+                  exporter=ctx.exporter, limit=args.limit, domain=args.domain)
     return 0
+
+
+# ==========================================================================
+# commands/trace.py  --  Connectivity trace: `nsxctl trace A B --port 3306`.
+# ==========================================================================
+
+def register_trace(sub, parents):
+    p = add_command(
+        sub, parents, "trace",
+        "Can A reach B, and which rule decided it.",
+        description="Evaluates the policy, and -- unless --static is given --"
+                    " injects a synthetic packet at the source VM's logical "
+                    "port and reports what the data plane actually did with "
+                    "it.\n\n"
+                    "The two answers are printed separately and compared, "
+                    "because they answer different questions and can "
+                    "legitimately differ. NAT, a partial realization, or a "
+                    "rule not yet pushed to a host will all make them "
+                    "disagree, and that disagreement is the finding.\n\n"
+                    "Traceflow is a Local Manager API: the Global Manager "
+                    "does not serve it. With no LM connected, or a "
+                    "powered-off source, --static is the only half that can "
+                    "run and the report says so.",
+        epilog="examples:\n"
+               "  nsxctl trace web-prod-01 db-prod-01 --port 3306\n"
+               "  nsxctl trace web-prod-01 --to 10.20.30.40 --port 443\n"
+               "  nsxctl trace web-prod-01 db-prod-01 --port 3306 --static\n"
+               "  nsxctl trace web-prod-01 db-prod-01 --port 22 --yes"
+               "        # unattended\n"
+               "  nsxctl trace web-prod-01 db-prod-01 --nic 2 --timeout 30s")
+    p.add_argument("source", help="Source VM name, or part of one.")
+    p.add_argument("destination", nargs="?",
+                   help="Destination VM name. Omit when using --to.")
+    p.add_argument("--to", metavar="ADDRESS", dest="to_address",
+                   help="Trace to an IP address instead of a VM.")
+    p.add_argument("--port", type=int, metavar="N",
+                   help="Destination port. Without it, rules restricted to a "
+                        "service cannot be decided and are reported as such.")
+    p.add_argument("--proto", default=DEFAULT_PROTO,
+                   choices=("tcp", "udp", "icmp"),
+                   help="Transport protocol (default: {}).".format(DEFAULT_PROTO))
+    p.add_argument("--nic", metavar="NIC",
+                   help="Which NIC to trace from on a multi-NIC VM: a 1-based "
+                        "index, a device name, or a MAC.")
+    p.add_argument("--timeout", metavar="DURATION", default=None,
+                   help="How long to wait for observations (15s, 2m). "
+                        "Default 15s.")
+    p.add_argument("--static", action="store_true",
+                   help="Evaluate the policy only. Sends no packet, needs no "
+                        "confirmation, and works on a GM or a powered-off VM.")
+    p.set_defaults(func=cmd_trace)
+
+
+def cmd_trace(args, ctx):
+    if not args.destination and not args.to_address:
+        err("Give a destination VM, or an address with --to.")
+        return 2
+    try:
+        timeout = parse_duration(args.timeout)
+        outcome = act_trace(
+            ctx.sessions, args.source, args.destination, args.domain,
+            ctx.exporter, port=args.port, proto=args.proto,
+            to_address=args.to_address, static_only=args.static,
+            nic=args.nic, timeout=timeout)
+    except AmbiguousNic as e:
+        report_ambiguous_nic(e)
+        return 2
+    except NsxError as e:
+        # Nothing ran: an endpoint could not be resolved. That is a "could not
+        # start" failure, not a finding about the flow.
+        err(str(e))
+        return 2
+    return 0 if outcome.has_verdict else 1
+
+
+# ==========================================================================
+# commands/apply.py  --  Declarative batch: `nsxctl apply changes.yaml`.
+# ==========================================================================
+
+APPLY_EXAMPLE = """file format (JSON always; YAML if PyYAML is installed):
+
+  groups:
+    - id: g-web
+      display_name: Web tier
+      criteria: 'tag:env=prod AND tag:tier=web'
+    - id: g-retired
+      state: absent
+
+  rules:
+    - id: allow-web-db
+      policy: app-tier
+      source: [g-web]
+      destination: [g-db]
+      services: [MySQL]
+      action: ALLOW
+
+Every entry needs an id. `state: absent` deletes; the default is present,
+which creates the object or brings it into line if it already exists.
+"""
+
+
+def register_apply(sub, parents):
+    p = add_command(
+        sub, parents, "apply",
+        "Apply a declarative file of groups and rules.",
+        description="Bring NSX into line with a file describing the groups "
+                    "and rules that should exist.\n\n"
+                    "Dry run by default: the whole plan is printed as a "
+                    "field-level diff, proposed rules are run through the "
+                    "hygiene checks, and nothing is written without "
+                    "--enable-writes. An entry that already matches NSX "
+                    "produces no change at all.\n\n" + APPLY_EXAMPLE,
+        epilog="examples:\n"
+               "  nsxctl apply changes.yaml\n"
+               "  nsxctl apply changes.json --enable-writes --yes")
+    p.add_argument("file", help="Change file (JSON, or YAML with PyYAML).")
+    p.set_defaults(func=cmd_apply)
+
+
+def cmd_apply(args, ctx):
+    try:
+        result = act_apply_file(ctx, args.file, dry_run=not ctx.write_enabled,
+                                force=args.force)
+    except ConfigError as e:
+        err(str(e))
+        return 2
+    except NsxError as e:
+        err(str(e))
+        return 2
+    return 1 if result.failed else 0
 
 
 # ==========================================================================

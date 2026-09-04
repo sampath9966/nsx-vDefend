@@ -35,6 +35,8 @@ nsxctl config show | path | validate    what config is in effect, and from where
 
 nsxctl group list [--contains X] [--members]
 nsxctl group show NAME
+nsxctl group create NAME --criteria 'tag:env=prod AND tag:tier=web'
+nsxctl group edit NAME | group delete NAME
 
 nsxctl tag list VM                      every tag on a VM, checked against your taxonomy
 nsxctl tag find --scope S --tag T       every VM carrying a tag
@@ -47,6 +49,11 @@ nsxctl snapshot list | show NAME
 nsxctl snapshot diff BEFORE AFTER       compare two snapshots
 nsxctl drift [NAME]                     what changed since the snapshot, and who
 
+nsxctl rule create NAME --policy P --from G1 --to G2 --service S --action ALLOW
+nsxctl rule edit NAME | rule move NAME --before OTHER | rule delete NAME
+nsxctl apply FILE.yaml                  declarative batch (dry run by default)
+
+nsxctl trace VM_A VM_B [--port N]       can A reach B, and what decided it
 nsxctl impact VM                        what breaks if I change this VM
 nsxctl parity STATIC DYNAMIC            static vs dynamic group migration progress
 nsxctl compliance                       tagging posture across every Local Manager
@@ -174,6 +181,168 @@ window proves nothing. That reports as `counter_reset`, never as unused;
 claiming no traffic when the evidence was wiped is how a live firewall rule
 gets deleted.
 
+### Can A reach B, and what stopped it
+
+```bash
+nsxctl trace web-prod-01 db-prod-01 --port 3306
+nsxctl trace web-prod-01 --to 10.20.30.40 --port 443
+nsxctl trace web-prod-01 db-prod-01 --port 3306 --static   # no packet
+```
+
+**Two engines answer that, and they answer different questions**, so the
+report never blends them:
+
+```
+  WHAT THE POLICY SAYS   (evaluated here -- no packet sent)
+  ----------------------------------------------------------------
+    DROP  by rule 'block-legacy-db' in policy 'app-tier'  [seq 40, Application]
+
+  WHAT THE DATA PLANE DID   (traceflow -- a synthetic packet was sent)
+  ----------------------------------------------------------------
+    DROPPED  at FIREWALL on esx-01
+    by rule 'block-legacy-db' in policy 'app-tier'   acl_rule_id 4130
+
+  Agreed: the policy and the data plane tell the same story.
+```
+
+When they disagree, that disagreement *is* the finding -- NAT, a partial
+realization, or a rule not yet pushed to a host will each produce it -- and
+the report lists the likely causes rather than picking a winner.
+
+Four things the command handles rather than papers over:
+
+- **Traceflow is a Manager API and the Global Manager does not serve it.** The
+  command finds the Local Manager that actually hosts the source VM and targets
+  that one. With no LM connected it says so and runs the static half.
+- **It needs a logical port, not a VM.** VM → VIF → logical switch port is the
+  real chain. A multi-NIC VM is ambiguous, so the NICs are listed and you pick
+  with `--nic`; it will not choose for you. A powered-off VM or an unrealized
+  port each get their own message.
+- **It injects a real packet.** Synthetic and harmless, but real, so it sits
+  behind the same confirmation as a write: `--yes` for scripts, `--static` to
+  send nothing. The traceflow object is always deleted afterwards, including
+  on timeout.
+- **The verdict comes back as a number.** An observation says `acl_rule_id
+  4130`. The policy rule's `rule_id` carries the same integer, so the
+  deduplicated sweep turns it into a rule and policy name. An id no rule in the
+  domain carries is reported as the raw number, never hidden.
+
+Static evaluation walks rules in NSX's real order -- **category first**
+(Ethernet → Emergency → Infrastructure → Environment → Application), then
+policy and rule sequence -- because a per-policy ordering answers the wrong
+question. Where it cannot decide a rule it says so instead of guessing:
+
+```
+    UNCERTAIN: 1 rule(s) ahead of this one could not be decided:
+      app-tier / icmp-rule
+        service Ping is not a plain L4 port set
+```
+
+Only `L4PortSetServiceEntry` reduces to a port comparison. ICMP, ALG and
+IP-protocol services are left undecided, and without `--port` a rule limited
+to any service is undecided too -- calling one a non-match is how a trace
+names the wrong rule.
+
+### Creating and changing rules
+
+```bash
+nsxctl group create g-web --criteria 'tag:env=prod AND tag:tier=web'
+nsxctl rule create allow-web-db --policy app-tier \
+    --from g-web --to g-db --service MySQL --action ALLOW
+nsxctl rule move allow-web-db --before deny-all
+nsxctl apply changes.yaml
+```
+
+**Dry run by default.** Nothing is written without `--enable-writes`, and the
+plan is rendered by the same diff engine `nsxctl drift` uses, so a preview of a
+change looks exactly like the drift report of that change:
+
+```
+  MODIFY rule allow-web-db   [lm-london]
+      [security] action: ALLOW -> DROP
+      [cosmetic] display_name: allow-web-db -> Allow web to db
+```
+
+**The proposed rule is run through `rule hygiene` before it is written:**
+
+```
+  PREFLIGHT: the proposed change would be reported by `nsxctl rule hygiene`:
+    critical any_any_allow
+      source and destination are both ANY with ALLOW -- permits all traffic
+```
+
+**Concurrent edits are refused by NSX itself.** Every write carries back the
+`_revision` it read; NSX answers 412 if anything changed in between, so two
+operators editing the same rule cannot silently clobber each other:
+
+```
+$ nsxctl rule edit allow-web-db --action DROP --enable-writes
+  FAILED modify rule 'allow-web-db'
+      modify rule 'allow-web-db' changed on NSX since the plan was built, so
+      the write was refused rather than overwriting somebody else's change.
+```
+
+`--force` overrides it. A GM-authored object is never written through a Local
+Manager -- NSX realizes those read-only, and the refusal names the reason.
+
+#### Criteria syntax
+
+```
+tag:SCOPE=VALUE     tag equals          tag:env=prod
+tag:SCOPE~VALUE     tag contains        tag:owner~platform
+name=VALUE          VM name equals      name=web-prod-01
+name~VALUE          VM name contains    name~web-
+ip:A[,B...]         IP addresses/CIDRs  ip:10.0.0.0/8
+```
+
+Joined with `AND` or `OR`. **Mixing the two is refused rather than sent**: NSX
+applies one conjunction operator per expression, so a mixed expression would
+not select what it reads as -- which for a firewall group is the whole
+ballgame.
+
+#### Declarative batches
+
+```yaml
+groups:
+  - id: g-web
+    display_name: Web tier
+    criteria: 'tag:env=prod AND tag:tier=web'
+  - id: g-retired
+    state: absent
+
+rules:
+  - id: allow-web-db
+    policy: app-tier
+    source: [g-web]
+    destination: [g-db]
+    services: [MySQL]
+    action: ALLOW
+```
+
+`nsxctl apply changes.yaml` plans every entry, prints one combined diff, and
+writes nothing that already matches NSX. JSON is always accepted; YAML needs
+PyYAML.
+
+#### Undo is asymmetric, and says so
+
+`nsxctl audit undo` reverses one entry. Every write -- tags, groups and rules
+alike -- is logged with both sides of it.
+
+| Undoing a | Becomes | Reliable? |
+|---|---|---|
+| create | a delete | yes |
+| modify | a write of the before-body | yes |
+| delete | recreating the object | **no** |
+
+Recreating a deleted object cannot be guaranteed: anything that referenced it
+may have been cleaned up in the meantime. Snapshots are the real backstop
+there, which is also why `snapshot restore` is deliberately *not* part of this
+-- restoring a whole DFW is a different class of risk from undoing one rule.
+
+Audit entries written before authoring existed still list and still undo. The
+tag fields were kept and the general ones added alongside, with one reader
+mapping both shapes.
+
 ### The three you'll actually use daily
 
 ```bash
@@ -188,6 +357,9 @@ nsxctl tag find --scope env --tag prod --out-csv prod.csv
 
 # What is wrong with my firewall policy?
 nsxctl rule hygiene
+
+# Why can't web01 reach db01?
+nsxctl trace web-prod-01 db-prod-01 --port 3306
 ```
 
 `--debug` logs every HTTP method, URL, status and timing to stderr. It is the
@@ -297,14 +469,20 @@ keyring, you are asked whether to write them to a file — never done silently.
 
 ## Safety
 
-- **Read-only by default.** Changes need `--enable-writes`.
+- **Read-only by default.** Changes need `--enable-writes`. That includes
+  every authoring command: `group create`, `rule edit` and `apply` all print a
+  plan and stop.
+- **`nsxctl trace` injects a packet, and asks first.** It is the one read in
+  the toolkit that touches the data plane. `--static` sends nothing.
 - **Dry run always runs first.** `nsxctl tag apply` prints the full plan before
   anything is written.
 - **Non-interactive writes need `--yes`.** Without a terminal and without
   `--yes`, it refuses rather than assuming consent.
 - **Concurrent edits are detected.** Each VM is re-read immediately before it is
   written; if its tags changed since the plan was computed, that row fails
-  instead of overwriting someone else's change. `--force` overrides.
+  instead of overwriting someone else's change. `--force` overrides. Group and
+  rule writes get this from NSX itself: the `_revision` read at plan time rides
+  back with the write, and NSX rejects a stale one with 412.
 - **Every write is audited.** `~/.nsx_toolkit/audit.log` records who, when,
   which manager, and full before/after state. `nsxctl audit list` reviews it;
   `nsxctl audit undo` reverts an entry.
@@ -391,6 +569,8 @@ src/nsx_toolkit/
   http.py                                   transport, retry, auth, VM index
   audit.py export.py render.py              cross-cutting services
   policy.py snapshot.py diff.py             traversal, capture, comparison
+  trace.py                                  traceflow + static path evaluation
+  authoring.py                              criteria parsing, planned writes
   actions/                                  one module per operation
   commands/                                 the nsxctl command tree
   legacy.py                                 pre-4.0 flag translation

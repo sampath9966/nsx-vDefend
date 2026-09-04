@@ -7,6 +7,7 @@ full menu back on demand.
 """
 
 from .actions.audit_view import act_audit_log
+from .actions.author import author_menu
 from .actions.bulk import act_bulk_tag
 from .actions.change_ticket import act_change_ticket
 from .actions.dashboard import act_dashboard
@@ -16,6 +17,7 @@ from .actions.hygiene import act_hygiene
 from .actions.parity import act_parity
 from .actions.reverse import act_reverse_lookup
 from .actions.tags import act_manage_tags, act_vm_tags, act_vms_by_tag
+from .actions.trace import trace_menu
 from .actions.verify import act_verify
 from .api import DEFAULT_DOMAIN, ROLE_GM, ROLE_LABEL, ROLE_LM
 from .errors import NsxError, UserAbort
@@ -84,6 +86,8 @@ def menu_text(mode_str):
     9.  Compliance dashboard
    15.  DFW rule hygiene                       {hyg}
    16.  Drift since last snapshot              {dft}
+   17.  Trace a flow: can A reach B?             {trc}
+   18.  Create / edit groups and rules            {aut}
 
   {ops}
   {d}
@@ -102,7 +106,9 @@ def menu_text(mode_str):
            audit=cD("(audit logged)"), dry=cD("(dry-run first)"),
            rl=cD("(any member type, deduped)"),
            hyg=cD("(any-any, shadowed, unused, broken refs)"),
-           dft=cD("(what changed, and who changed it)"))
+           dft=cD("(what changed, and who changed it)"),
+           trc=cD("(policy verdict, and the data plane's)"),
+           aut=cD("(dry-run first, audited, undoable)"))
 
 
 def select_managers(sessions, allow_roles, allow_all=False, label=""):
@@ -256,6 +262,14 @@ def interactive(ctx):
                 act_drift_menu(ctx)
                 offer_export(ctx.exporter)
 
+            elif c == "17":
+                trace_menu(ctx)
+                offer_export(ctx.exporter)
+
+            elif c == "18":
+                author_menu(ctx)
+                offer_export(ctx.exporter)
+
             elif c == "10":
                 tgt = select_managers(ctx.sessions, (ROLE_GM, ROLE_LM),
                                       allow_all=True, label="verification")
@@ -264,7 +278,7 @@ def interactive(ctx):
 
             elif c == "11":
                 act_audit_log(ctx.audit, ctx.sessions, ctx.write_enabled,
-                              ctx.exporter)
+                              ctx.exporter, domain=ctx.domain)
                 offer_export(ctx.exporter)
 
             elif c == "12":

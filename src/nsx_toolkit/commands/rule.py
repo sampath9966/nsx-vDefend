@@ -1,5 +1,11 @@
-"""DFW rule commands: `nsxctl rule hygiene|baseline`."""
+"""DFW rules: `nsxctl rule hygiene|baseline|create|edit|move|delete`.
 
+Reporting and authoring share a command tree, and share machinery: a rule
+about to be created is run through the same hygiene checks that would report
+it tomorrow, before it is written.
+"""
+
+from ..actions.author import act_rule_write
 from ..actions.hygiene import (
     HYGIENE_HEADERS,
     SEVERITIES,
@@ -7,6 +13,7 @@ from ..actions.hygiene import (
     at_or_above,
     fetch_hit_counts,
 )
+from ..authoring import RULE_ACTIONS, RULE_DIRECTIONS
 from ..baseline import (
     BASELINE_HEADERS,
     build_hit_baseline,
@@ -16,7 +23,7 @@ from ..baseline import (
     load_hit_baseline,
     save_hit_baseline,
 )
-from ..errors import NsxError
+from ..errors import ConfigError, NsxError
 from ..output import (
     cB,
     cBG,
@@ -34,7 +41,7 @@ from ..output import (
 )
 from ..policy import sweep_rules
 from ..report import write_report
-from . import add_command
+from . import add_action, add_command
 
 
 def register_rule(sub, parents):
@@ -42,8 +49,8 @@ def register_rule(sub, parents):
         sub, parents, "rule", "Inspect distributed firewall rules.")
     rsub = p.add_subparsers(dest="rule_action", metavar="<action>")
 
-    hy = rsub.add_parser(
-        "hygiene", parents=parents, help="Report rule hygiene problems.",
+    hy = add_action(
+        rsub, parents, "hygiene", "Report rule hygiene problems.",
         description="Find any-any rules, overly broad applied-to scopes, "
                     "rules referencing missing or inert groups, duplicates, "
                     "rules shadowed by an any-any above them, disabled rules, "
@@ -63,9 +70,9 @@ def register_rule(sub, parents):
                          "estates; drops the empty-group check.")
     hy.set_defaults(func=cmd_rule_hygiene)
 
-    bl = rsub.add_parser(
-        "baseline", parents=parents,
-        help="Save or compare rule hit counts.",
+    bl = add_action(
+        rsub, parents, "baseline",
+        "Save or compare rule hit counts.",
         description="NSX hit counters are cumulative since the last reset, so "
                     "a single read cannot prove a rule is unused. Save a "
                     "baseline, wait, then compare: a counter that did not "
@@ -84,11 +91,143 @@ def register_rule(sub, parents):
                          "(required for compare).")
     bl.set_defaults(func=cmd_rule_baseline)
 
+    cr = add_action(
+        rsub, parents, "create", "Create a DFW rule.",
+        description="Create a rule in an existing security policy.\n\n"
+                    "Before anything is written the proposed rule is run "
+                    "through the same checks as `nsxctl rule hygiene`, so an "
+                    "any-any ALLOW is caught here rather than in tomorrow's "
+                    "report. Dry run by default.",
+        epilog="examples:\n"
+               "  nsxctl rule create allow-web-db --policy app-tier \\\n"
+               "      --from g-web --to g-db --service MySQL --action ALLOW\n"
+               "  nsxctl rule create deny-all --policy app-tier "
+               "--action DROP --enable-writes")
+    cr.add_argument("name", help="Rule id to create.")
+    _add_rule_body_args(cr, require_policy=True)
+    cr.set_defaults(func=cmd_rule_create)
+
+    ed = add_action(
+        rsub, parents, "edit", "Change an existing rule.",
+        description="Change a rule. The plan is a field-level diff, "
+                    "classified security or cosmetic by the same engine "
+                    "`nsxctl drift` uses.",
+        epilog="example:\n  nsxctl rule edit allow-web-db --action DROP")
+    ed.add_argument("name", help="Rule name or id.")
+    _add_rule_body_args(ed)
+    ed.set_defaults(func=cmd_rule_edit)
+
+    mv = add_action(
+        rsub, parents, "move", "Reorder a rule within its policy.",
+        description="Move a rule before or after another in the same policy, "
+                    "by giving it a sequence number in the gap. If there is "
+                    "no free number in that gap it refuses rather than "
+                    "renumbering every rule in the policy.",
+        epilog="example:\n  nsxctl rule move allow-web-db --before deny-all")
+    mv.add_argument("name", help="Rule name or id.")
+    mv.add_argument("--policy", help="Policy the rule is in.")
+    group = mv.add_mutually_exclusive_group(required=True)
+    group.add_argument("--before", metavar="RULE",
+                       help="Put it immediately before this rule.")
+    group.add_argument("--after", metavar="RULE",
+                       help="Put it immediately after this rule.")
+    mv.set_defaults(func=cmd_rule_move)
+
+    dl = add_action(
+        rsub, parents, "delete", "Delete a rule.",
+        description="Delete a rule. Undo can restore it from the audit log, "
+                    "but recreating a deleted object is the one undo this "
+                    "tool will not promise -- take a snapshot first.",
+        epilog="example:\n  nsxctl rule delete old-rule --enable-writes")
+    dl.add_argument("name", help="Rule name or id.")
+    dl.add_argument("--policy", help="Policy the rule is in.")
+    dl.set_defaults(func=cmd_rule_delete)
+
     p.set_defaults(func=_rule_needs_action)
 
 
+def _add_rule_body_args(parser, require_policy=False):
+    parser.add_argument("--policy", required=require_policy,
+                        help="Security policy the rule belongs to.")
+    parser.add_argument("--from", dest="sources", action="append",
+                        metavar="GROUP",
+                        help="Source group. Repeatable. Default ANY.")
+    parser.add_argument("--to", dest="destinations", action="append",
+                        metavar="GROUP",
+                        help="Destination group. Repeatable. Default ANY.")
+    parser.add_argument("--service", dest="services", action="append",
+                        metavar="SERVICE",
+                        help="Service. Repeatable. Default ANY.")
+    parser.add_argument("--applied-to", dest="scope", action="append",
+                        metavar="GROUP",
+                        help="Enforce only on these groups. Default ANY, "
+                             "which means every workload.")
+    parser.add_argument("--action", choices=RULE_ACTIONS, metavar="ACTION",
+                        help="One of {}.".format(" | ".join(RULE_ACTIONS)))
+    parser.add_argument("--direction", choices=RULE_DIRECTIONS,
+                        metavar="DIRECTION",
+                        help="One of {}.".format(" | ".join(RULE_DIRECTIONS)))
+    parser.add_argument("--display-name", help="Human-readable name.")
+    parser.add_argument("--description", help="Free-text description.")
+    parser.add_argument("--sequence", type=int, metavar="N",
+                        help="Evaluation position within the policy.")
+    logging = parser.add_mutually_exclusive_group()
+    logging.add_argument("--log", dest="logged", action="store_true",
+                         default=None, help="Turn rule logging on.")
+    logging.add_argument("--no-log", dest="logged", action="store_false",
+                         default=None, help="Turn rule logging off.")
+    state = parser.add_mutually_exclusive_group()
+    state.add_argument("--disable", dest="disabled", action="store_true",
+                       default=None, help="Disable the rule.")
+    state.add_argument("--enable", dest="disabled", action="store_false",
+                       default=None, help="Enable the rule.")
+
+
+def _rule_write(args, ctx, **kwargs):
+    try:
+        result = act_rule_write(ctx, args.name, dry_run=not ctx.write_enabled,
+                                force=args.force, **kwargs)
+    except (NsxError, ConfigError) as e:
+        err(str(e))
+        return 2
+    return 1 if result.failed else 0
+
+
+def _rule_body_kwargs(args):
+    return {"policy_ref": args.policy, "sources": args.sources,
+            "destinations": args.destinations, "services": args.services,
+            "scope": args.scope, "action": args.action,
+            "direction": args.direction, "display_name": args.display_name,
+            "description": args.description, "disabled": args.disabled,
+            "logged": args.logged, "sequence_number": args.sequence}
+
+
+def cmd_rule_create(args, ctx):
+    return _rule_write(args, ctx, **_rule_body_kwargs(args))
+
+
+def cmd_rule_edit(args, ctx):
+    kwargs = _rule_body_kwargs(args)
+    if not any(v is not None for k, v in kwargs.items() if k != "policy_ref"):
+        err("Nothing to change. Give at least one of --from, --to, --service, "
+            "--applied-to, --action, --direction, --display-name, "
+            "--description, --sequence, --log/--no-log, --enable/--disable.")
+        return 2
+    return _rule_write(args, ctx, **kwargs)
+
+
+def cmd_rule_move(args, ctx):
+    return _rule_write(args, ctx, policy_ref=args.policy,
+                       move_before=args.before, move_after=args.after)
+
+
+def cmd_rule_delete(args, ctx):
+    return _rule_write(args, ctx, policy_ref=args.policy, delete=True)
+
+
 def _rule_needs_action(args, ctx):
-    err("Specify what to do: nsxctl rule hygiene  |  nsxctl rule baseline")
+    err("Specify what to do: nsxctl rule hygiene | baseline | create | edit "
+        "| move | delete")
     return 2
 
 

@@ -51,8 +51,14 @@ everyday:
   nsxctl compliance                 tagging posture across every Local Manager
   nsxctl tag find --scope env --tag prod
   nsxctl impact web-prod-01         what breaks if I retag this VM
+  nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
+
+authoring (dry run unless --enable-writes):
+  nsxctl group create g-web --criteria 'tag:env=prod AND tag:tier=web'
+  nsxctl rule create allow-web-db --policy app-tier --from g-web --to g-db
+  nsxctl apply changes.yaml         a declarative file of groups and rules
 
 Run `nsxctl <command> --help` for a command's options and examples.
 """
@@ -118,12 +124,14 @@ def apply_global_defaults(args):
 
 def build_parser():
     from .analysis import register_analysis
+    from .apply import register_apply
     from .group import register_group
     from .rule import register_rule
     from .setup import register_setup
     from .shell import register_shell
     from .snapshot import register_snapshot
     from .tag import register_tag
+    from .trace import register_trace
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -141,10 +149,20 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", metavar="<command>")
     parents = [global_parent]
     for register in (register_setup, register_group, register_tag,
-                     register_rule, register_analysis, register_snapshot,
+                     register_rule, register_analysis, register_trace,
+                     register_snapshot, register_apply,
                      register_shell):
         register(sub, parents)
     return parser
+
+
+def add_action(sub, parents, name, help_text, description=None, epilog=None):
+    """A second-level subparser (`nsxctl group create`), with the same raw
+    formatter as a top-level command so a syntax table survives --help."""
+    return sub.add_parser(
+        name, parents=parents, help=help_text,
+        description=description or help_text, epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
 
 
 def add_command(sub, parents, name, help_text, description=None, epilog=None):
