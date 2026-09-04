@@ -64,7 +64,13 @@ from ..output import (
     section,
     table,
 )
-from ..policy import group_inventory, rule_sequence, sweep_rules
+from ..policy import (
+    group_inventory,
+    is_wildcard,
+    listed_values,
+    rule_sequence,
+    sweep_rules,
+)
 
 HYGIENE_CONSOLE_LIMIT = 40
 
@@ -96,15 +102,6 @@ class Finding:
 
 
 # === RULE SHAPE HELPERS ===
-def _listed(rule, field):
-    return [v for v in (rule.get(field) or []) if v]
-
-
-def _is_any(values):
-    """NSX writes the wildcard as ["ANY"]; an empty list means the same."""
-    return not values or list(values) == [ANY]
-
-
 def match_key(rule):
     """What makes two rules equivalent, without expanding services.
 
@@ -113,10 +110,10 @@ def match_key(rule):
     "unreachable" claims.
     """
     return (
-        tuple(sorted(_listed(rule, "source_groups"))),
-        tuple(sorted(_listed(rule, "destination_groups"))),
-        tuple(sorted(_listed(rule, F_SERVICES))),
-        tuple(sorted(_listed(rule, F_SCOPE))),
+        tuple(sorted(listed_values(rule, "source_groups"))),
+        tuple(sorted(listed_values(rule, "destination_groups"))),
+        tuple(sorted(listed_values(rule, F_SERVICES))),
+        tuple(sorted(listed_values(rule, F_SCOPE))),
         rule.get(F_ACTION_FIELD, ""),
         rule.get(F_DIRECTION, ""),
     )
@@ -124,10 +121,10 @@ def match_key(rule):
 
 def matches_everything(rule):
     """True when this rule matches all traffic in its policy."""
-    return (_is_any(_listed(rule, "source_groups"))
-            and _is_any(_listed(rule, "destination_groups"))
-            and _is_any(_listed(rule, F_SERVICES))
-            and _is_any(_listed(rule, F_SCOPE))
+    return (is_wildcard(listed_values(rule, "source_groups"))
+            and is_wildcard(listed_values(rule, "destination_groups"))
+            and is_wildcard(listed_values(rule, F_SERVICES))
+            and is_wildcard(listed_values(rule, F_SCOPE))
             and rule.get(F_ACTION_FIELD) in TERMINAL_ACTIONS
             and not rule.get(F_DISABLED))
 
@@ -273,8 +270,8 @@ class HygieneContext:
 # === CHECKS ===
 def check_any_any(record, ctx):
     rule = record.rule
-    if not (_is_any(_listed(rule, "source_groups"))
-            and _is_any(_listed(rule, "destination_groups"))):
+    if not (is_wildcard(listed_values(rule, "source_groups"))
+            and is_wildcard(listed_values(rule, "destination_groups"))):
         return []
     if rule.get(F_DISABLED):
         return []
@@ -292,7 +289,7 @@ def check_broad_applied_to(record, ctx):
     rule = record.rule
     if rule.get(F_DISABLED):
         return []
-    if _is_any(_listed(rule, F_SCOPE)):
+    if is_wildcard(listed_values(rule, F_SCOPE)):
         return [Finding("broad_applied_to", "high", record,
                         "applied-to is ANY -- enforced on every workload, "
                         "not a scoped set")]

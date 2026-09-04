@@ -89,7 +89,8 @@ class ObjectChange:
         return self.provenance.get("_last_modified_time", "")
 
 
-def _fmt(value):
+def fmt_diff_value(value):
+    """One field value as a single line, for a table cell."""
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
@@ -217,7 +218,7 @@ def diff_rows(changes):
         for field in change.fields:
             rows.append([change.status, field.impact, change.kind,
                          change.manager, change.name, field.field,
-                         _fmt(field.before), _fmt(field.after),
+                         fmt_diff_value(field.before), fmt_diff_value(field.after),
                          change.changed_by, str(change.changed_at)])
     return rows
 
