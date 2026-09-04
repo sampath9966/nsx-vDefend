@@ -27,6 +27,7 @@ from .api import (
     API_BASE_GM_CANDIDATES,
     API_BASE_LM,
     DEFAULT_DOMAIN,
+    DEFAULT_ORG,
     F_CURSOR,
     F_DISPLAY_NAME,
     F_EXTERNAL_ID,
@@ -47,6 +48,7 @@ from .api import (
     ROLE_GM,
     p_groups,
     parse_version,
+    project_base,
 )
 from .errors import NsxError, NsxHttpError
 from .output import cG, debug, say
@@ -223,6 +225,10 @@ class Nsx:
         self.auth_mode = (entry.get("auth") or "session").lower()
         self._user, self._pwd = user, pwd
         self._base = entry.get("policy_base")
+        # NSX Project scoping. Set, every policy path hangs off the project's
+        # own infra tree instead of the default one.
+        self.project = entry.get("project")
+        self.org = entry.get("org") or DEFAULT_ORG
         self._version = None
         self._vm_index = None
         self._vm_lock = threading.Lock()
@@ -398,6 +404,12 @@ class Nsx:
             return self._base
         with self._base_lock:
             if self._base:
+                return self._base
+            if self.project:
+                # A project's tree is the same on either role, so no probe.
+                self._base = project_base(self.project, self.org)
+                if verbose:
+                    say("    project scope: {}".format(cG(self._base)))
                 return self._base
             if self.role != ROLE_GM:
                 self._base = API_BASE_LM

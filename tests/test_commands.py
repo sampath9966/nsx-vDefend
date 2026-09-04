@@ -155,7 +155,11 @@ def test_completion_is_generated_from_the_live_parser():
     # parser rather than maintaining a second list.
     assert "--criteria" in tree["group"]["subcommands"]["create"]
     assert set(tree["rule"]["subcommands"]) == {
-        "hygiene", "baseline", "create", "edit", "move", "delete"}
+        "list", "show", "hygiene", "baseline", "create", "edit", "move",
+        "delete"}
+    assert set(tree["service"]["subcommands"]) == {"list", "show"}
+    assert "--fail-on-missing" in tree["doctor"]["options"]
+    assert "--profile" in tree["doctor"]["options"]
     assert "--static" in tree["trace"]["options"]
     assert "apply" in tree
 

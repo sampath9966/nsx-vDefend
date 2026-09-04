@@ -40,6 +40,12 @@ _interactive = sys.stdin.isatty()
 _assume_yes = False
 _debug = False
 
+# When buffering, say() collects instead of printing, so a caller that later
+# discovers the run found nothing new can drop the whole report before it
+# reaches stdout. That is what makes a nightly cron job silent on a quiet
+# night -- and errors are deliberately never buffered.
+_buffer = None
+
 
 def set_color(enabled):
     global _color_enabled
@@ -84,6 +90,32 @@ def set_debug(enabled):
 
 def is_debug():
     return _debug
+
+
+def start_buffering():
+    """Collect console output instead of printing it."""
+    global _buffer
+    _buffer = []
+
+
+def is_buffering():
+    return _buffer is not None
+
+
+def flush_buffered():
+    """Print everything collected, and stop buffering."""
+    global _buffer
+    lines, _buffer = _buffer, None
+    for line in (lines or []):
+        print(line, flush=True)
+    return len(lines or [])
+
+
+def drop_buffered():
+    """Discard everything collected, and stop buffering."""
+    global _buffer
+    dropped, _buffer = _buffer, None
+    return len(dropped or [])
 
 
 # === COLOR ===
@@ -137,8 +169,12 @@ def strip_ansi(text):
 
 # === MESSAGES ===
 def say(msg=""):
-    if not _json_mode:
-        print(msg, flush=True)
+    if _json_mode:
+        return
+    if _buffer is not None:
+        _buffer.append(msg)
+        return
+    print(msg, flush=True)
 
 
 def err(msg):

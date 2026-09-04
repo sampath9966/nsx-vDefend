@@ -5,7 +5,13 @@ option 16 does not need the argparse namespace the command handlers expect.
 """
 
 
-from ..diff import DRIFT_HEADERS, diff_rows, diff_snapshots, summarise_diff
+from ..diff import (
+    DRIFT_HEADERS,
+    diff_rows,
+    diff_snapshots,
+    drift_findings,
+    summarise_diff,
+)
 from ..errors import NsxError
 from ..output import cB, cBG, cBR, cBY, cC, cD, err, hr, say, section, table
 from ..snapshot import capture_snapshot, list_snapshots, load_snapshot
@@ -35,6 +41,7 @@ def act_drift_menu(ctx):
 
     changes = diff_snapshots(before, after)
     ctx.exporter.stage("drift", DRIFT_HEADERS, diff_rows(changes))
+    ctx.exporter.stage_findings("config_drift", drift_findings(changes))
     hr()
     if not changes:
         say("  {} configuration matches the snapshot exactly.".format(

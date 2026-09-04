@@ -15,6 +15,15 @@ API_BASE_GM_CANDIDATES = [
     "/policy/api/v1/global-infra",
 ]
 
+# NSX Projects (multi-tenancy). A project has its own infra tree, so every
+# policy path the toolkit builds hangs off a different base -- which is why
+# scoping is a base swap here rather than a filter at each call site. Objects
+# in the default infra are simply not visible from inside a project, and vice
+# versa, so `--project` genuinely changes what the tool can see.
+DEFAULT_ORG = "default"
+API_BASE_PROJECT = "/policy/api/v1/orgs/{org}/projects/{project}/infra"
+PATH_PROJECTS = "/policy/api/v1/orgs/{org}/projects"
+
 # --- Policy paths (relative to a base) -------------------------------------
 PATH_GROUPS = "/domains/{domain}/groups"
 PATH_GROUP = "/domains/{domain}/groups/{gid}"
@@ -229,6 +238,14 @@ def p_sec_rule(base, domain, pid, rid):
 
 def p_services(base):
     return base + PATH_SERVICES
+
+
+def project_base(project, org=DEFAULT_ORG):
+    return API_BASE_PROJECT.format(org=org, project=project)
+
+
+def p_projects(org=DEFAULT_ORG):
+    return PATH_PROJECTS.format(org=org)
 
 
 def p_traceflow_one(tid):

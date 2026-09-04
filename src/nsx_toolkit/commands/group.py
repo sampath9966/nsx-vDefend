@@ -95,13 +95,15 @@ def _targets(ctx):
 
 def cmd_group_list(args, ctx):
     act_groups(_targets(ctx), args.domain, args.contains,
-               show_members=args.members, exporter=ctx.exporter)
+               show_members=args.members, exporter=ctx.exporter,
+               cache_key=ctx.cache_key())
     return 0
 
 
 def cmd_group_show(args, ctx):
     act_groups(_targets(ctx), args.domain, args.name,
-               show_members=True, exporter=ctx.exporter)
+               show_members=True, exporter=ctx.exporter,
+               cache_key=ctx.cache_key())
     return 0
 
 

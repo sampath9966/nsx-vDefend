@@ -52,6 +52,8 @@ class FakeState:
         self.stats = {}              # policy id -> {rule id: stats dict}
         self.stats_unsupported = False   # 404 the statistics route
         self.services = []           # policy service definitions
+        self.projects = []           # NSX Projects (multi-tenancy)
+        self.projects_unsupported = False
         self.vifs = {}               # owner vm external_id -> [vif dicts]
         self.logical_ports = {}      # attachment id -> logical port dict
         self.traceflows = {}         # traceflow id -> request body
@@ -113,6 +115,14 @@ class FakeState:
                 "display_name": "{}-nic{}".format(vm["display_name"], index),
                 "attachment": {"id": attachment_id}}
         return vif
+
+    def add_project(self, pid, display_name=None):
+        """An NSX Project. Its infra tree is served as an alternate base, so a
+        --project run really does see a different object set."""
+        project = {"id": pid, "display_name": display_name or pid,
+                   "path": "/orgs/default/projects/{}".format(pid)}
+        self.projects.append(project)
+        return project
 
     def add_service(self, sid, protocol="TCP", ports=("443",),
                     display_name=None, entries=None):
@@ -546,6 +556,14 @@ class _Handler(BaseHTTPRequestHandler):
                            else list(st.logical_ports.values())))
             return self._send(200, _page(ports, query))
 
+        if path == "/api/v1/traceflow":
+            # Listing, not running. `nsxctl doctor` probes the surface this
+            # way precisely so a capability check never injects a packet.
+            if st.role == "gm" or st.traceflow_unsupported:
+                return self._send(404, {"error_message": "no traceflow here"})
+            return self._send(200, _page(
+                [{"id": tid} for tid in sorted(st.traceflows)], query))
+
         if path.startswith("/api/v1/traceflow/"):
             if st.role == "gm" or st.traceflow_unsupported:
                 return self._send(404, {"error_message": "no traceflow here"})
@@ -563,6 +581,14 @@ class _Handler(BaseHTTPRequestHandler):
                             len(st.traceflow_states) - 1)
                 state = st.traceflow_states[index]
             return self._send(200, {"id": tid, "operation_state": state})
+
+        if path.startswith("/policy/api/v1/orgs/") and \
+                path.endswith("/projects"):
+            # Projects hang off the org, not off any infra base, which is why
+            # this is matched before the base check below.
+            if st.projects_unsupported:
+                return self._send(404, {"error_message": "no project API"})
+            return self._send(200, _page(st.projects, query))
 
         if path == "/api/v1/fabric/virtual-machines":
             if st.role == "gm":
@@ -588,6 +614,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if rel == "/services":
             return self._send(200, _page(st.services, query))
+
 
         parts = [p for p in rel.split("/") if p]
         # domains/{domain}/groups[/{gid}[/members/virtual-machines]]

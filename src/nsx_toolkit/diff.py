@@ -22,6 +22,7 @@ for the same reason the list default is order-sensitive.
 """
 
 from .api import F_DISPLAY_NAME
+from .sinks import make_finding
 
 # Membership matters; order does not.
 SET_LIKE_FIELDS = frozenset({
@@ -221,6 +222,27 @@ def diff_rows(changes):
                          fmt_diff_value(field.before), fmt_diff_value(field.after),
                          change.changed_by, str(change.changed_at)])
     return rows
+
+
+def drift_findings(changes):
+    """Object changes as machine-readable findings.
+
+    Severity is the impact the diff engine already computed, so a scheduled
+    drift check reports a new any-any rule as an error and a rename as a note
+    without a second classification anybody could get out of step.
+    """
+    out = []
+    for change in changes:
+        fields = ", ".join(sorted({f.field for f in change.fields})) or \
+            change.status
+        out.append(make_finding(
+            "drift_{}".format(change.status), change.impact,
+            "{} {} {}".format(change.status, change.kind, change.name),
+            where="{}/{}".format(change.manager, change.name),
+            detail="{}  changed by {} {}".format(
+                fields, change.changed_by or "unknown",
+                change.changed_at or "")))
+    return out
 
 
 def at_impact(changes, level):

@@ -41,8 +41,11 @@ MODULES = [
     "trace.py",
     "baseline.py",
     "snapshot.py",
+    "sinks.py",
     "diff.py",
     "authoring.py",
+    "flows.py",
+    "namecache.py",
     "report.py",
     "actions/groups.py",
     "actions/verify.py",
@@ -54,6 +57,9 @@ MODULES = [
     "actions/change_ticket.py",
     "actions/hygiene.py",
     "actions/author.py",
+    "actions/inspect.py",
+    "actions/doctor.py",
+    "actions/recommend.py",
     "actions/audit_view.py",
     "actions/trace.py",
     "actions/drift.py",
@@ -64,9 +70,11 @@ MODULES = [
     "commands/group.py",
     "commands/tag.py",
     "commands/rule.py",
+    "commands/inspect.py",
     "commands/analysis.py",
     "commands/trace.py",
     "commands/apply.py",
+    "commands/recommend.py",
     "commands/snapshot.py",
     "commands/shell.py",
     "legacy.py",
@@ -211,6 +219,29 @@ def top_level_names(path):
     return names
 
 
+def check_unlisted():
+    """Package modules nobody added to MODULES.
+
+    The build already fails loudly when a LISTED module is missing. The
+    reverse -- a module that exists but was never listed -- was silent, and
+    silently produces a single file with a NameError in it the first time
+    anything touches the missing code. Caught here, with the fix, because
+    that is exactly how it bit: two new action modules were added to the
+    package and the build cheerfully left them out.
+    """
+    listed = set(MODULES)
+    found = set()
+    for dirpath, _dirs, files in os.walk(PKG):
+        for name in files:
+            if not name.endswith(".py") or name in ("__init__.py",
+                                                    "__main__.py"):
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, name), PKG)
+            found.add(rel.replace(os.sep, "/"))
+    # commands/__init__.py carries the parser and IS listed deliberately.
+    return sorted(found - listed)
+
+
 def check_collisions():
     """Two modules defining the same top-level name is invisible in the
     package (separate namespaces) and silently wrong in the single file, where
@@ -226,6 +257,15 @@ def check_collisions():
 
 
 def build():
+    unlisted = check_unlisted()
+    if unlisted:
+        raise SystemExit(
+            "Package modules missing from MODULES in {}:\n  {}\n"
+            "Add each one, in dependency order -- anything referenced at "
+            "module level must appear after what it reads.\n"
+            "Left out, the single file builds fine and raises NameError the "
+            "moment that code is reached.".format(
+                os.path.basename(__file__), "\n  ".join(unlisted)))
     clashes = check_collisions()
     if clashes:
         lines = ["Top-level name collisions between modules:"]
