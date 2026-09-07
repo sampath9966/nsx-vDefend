@@ -743,7 +743,17 @@ pytest -q                                  # full suite, no NSX required
 ruff check src tests tools
 python3 tools/build_single_file.py         # regenerate nsx-toolkit.py
 python3 tools/build_single_file.py --check # CI runs this
+python3 tools/verify_install.py            # build, install, drive the command
 ```
+
+`verify_install.py` is the one that answers "does `pip install nsxctl`
+actually give someone a working command". It builds the wheel, installs it
+into a clean virtualenv with nothing else in it, and drives the console
+script that lands on PATH against a fake NSX as a subprocess — reads,
+tracing, an authoring dry run and a committed write, the audit trail, the
+JUnit/SARIF/metrics sinks, and shell completion. The virtualenv has no
+`requests` on purpose, so the stdlib transport is what gets exercised. The
+release workflow runs it before anything is published.
 
 ```
 src/nsx_toolkit/

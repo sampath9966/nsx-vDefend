@@ -78,6 +78,12 @@ jobs:
           python-version: "3.11"
       - run: pip install build
       - run: python -m build
+      # Nothing is published until the wheel has been installed into a clean
+      # virtualenv and the console script it puts on PATH has been driven
+      # against a fake NSX. A wheel that builds is not the same as a wheel
+      # that installs into something a user can run.
+      - name: The built wheel must install and run
+        run: python tools/verify_install.py --wheel dist/*.whl
       - uses: actions/upload-artifact@v4
         with:
           name: python-distributions
