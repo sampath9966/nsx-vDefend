@@ -47,6 +47,7 @@ MODULES = [
     "flows.py",
     "namecache.py",
     "report.py",
+    "launcher.py",
     "actions/groups.py",
     "actions/verify.py",
     "actions/dashboard.py",
