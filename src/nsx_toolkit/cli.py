@@ -188,7 +188,7 @@ def _apply_modes(args):
 def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
 
-    # --- pre-4.0 flags: translate, warn, continue -------------------------
+    # --- old flag interface: translate, warn, continue -------------------------
     legacy_warnings = []
     argv_list = [raw]
     if uses_legacy(raw):

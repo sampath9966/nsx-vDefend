@@ -52,8 +52,8 @@ import xml.sax.saxutils as saxutils
 # version.py  --  Tool identity. Single source of truth for name and version strings.
 # ==========================================================================
 
-VERSION = "4.0.0"
-VERSION_DATE = "2026-09-03"
+VERSION = "1.0.0"
+VERSION_DATE = "2026-09-08"
 TOOL_NAME = "NSX Toolkit"
 TOOL_TAGLINE = "Zero Trust Segmentation · Groups, Tags & DFW"
 
@@ -11186,7 +11186,7 @@ def cmd_completion_cache(args, ctx):
 
 
 # ==========================================================================
-# legacy.py  --  Translation from the pre-4.0 flag interface to `nsxctl <noun> <verb>`.
+# legacy.py  --  Translation from the old flag interface to `nsxctl <noun> <verb>`.
 # ==========================================================================
 
 # old flag -> (subcommand words, how to consume its value)
@@ -11262,7 +11262,7 @@ LEGACY_FLAGS = frozenset(REPLACEMENT) | {
 
 
 def uses_legacy(argv):
-    """True when argv contains any pre-4.0 flag."""
+    """True when argv contains any of the old flags."""
     for token in argv:
         head = token.split("=", 1)[0]
         if head in LEGACY_FLAGS:
@@ -11290,7 +11290,7 @@ def translate_legacy_argv(argv):
         replacement = REPLACEMENT.get(flag)
         if replacement:
             warnings.append(
-                "{} is deprecated and will be removed in 5.0. "
+                "{} is deprecated and will be removed in 2.0. "
                 "use: {}".format(flag, replacement))
 
     for key in ORDER:
@@ -11476,7 +11476,7 @@ def _apply_modes(args):
 def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
 
-    # --- pre-4.0 flags: translate, warn, continue -------------------------
+    # --- old flag interface: translate, warn, continue -------------------------
     legacy_warnings = []
     argv_list = [raw]
     if uses_legacy(raw):

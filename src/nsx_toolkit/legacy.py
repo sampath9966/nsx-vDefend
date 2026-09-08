@@ -1,4 +1,4 @@
-"""Translation from the pre-4.0 flag interface to `nsxctl <noun> <verb>`.
+"""Translation from the old flag interface to `nsxctl <noun> <verb>`.
 
 Old flags keep working. Each one is rewritten to its subcommand, a single
 warning naming the replacement goes to **stderr** -- never stdout, so piping
@@ -86,7 +86,7 @@ LEGACY_FLAGS = frozenset(REPLACEMENT) | {
 
 
 def uses_legacy(argv):
-    """True when argv contains any pre-4.0 flag."""
+    """True when argv contains any of the old flags."""
     for token in argv:
         head = token.split("=", 1)[0]
         if head in LEGACY_FLAGS:
@@ -114,7 +114,7 @@ def translate_legacy_argv(argv):
         replacement = REPLACEMENT.get(flag)
         if replacement:
             warnings.append(
-                "{} is deprecated and will be removed in 5.0. "
+                "{} is deprecated and will be removed in 2.0. "
                 "use: {}".format(flag, replacement))
 
     for key in ORDER:

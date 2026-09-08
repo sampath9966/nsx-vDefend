@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nsxctl"
-version = "4.0.0"
+version = "1.0.0"
 description = "NSX groups, tags and distributed firewall from the command line, across a Global Manager and every Local Manager"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -46,7 +46,8 @@ Issues = "https://github.com/sampath9966/nsx-vDefend/issues"
 
 [project.scripts]
 nsxctl = "nsx_toolkit.cli:entry"
-# Continuity alias for anyone who installed the 3.x package.
+# Continuity alias: the tool shipped for years as a single file called
+# nsx-toolkit.py, and scripts still invoke it by that name.
 nsx-toolkit = "nsx_toolkit.cli:entry"
 
 [tool.setuptools.packages.find]

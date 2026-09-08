@@ -1,4 +1,4 @@
-"""The pre-4.0 flag interface must keep working, and mean the same thing.
+"""The old flag interface must keep working, and mean the same thing.
 
 A deprecation shim nobody tests is just a second code path that quietly drifts
 away from the real one. Each test here asserts the old flag and its documented
@@ -158,7 +158,8 @@ def test_warning_goes_to_stderr_so_json_stays_parseable(env, capsys):
 
 
 def test_multi_action_run_still_exports_both_sets(env, tmp_path):
-    """`--groups --dashboard --out-csv` wrote two files before 4.0; it still
+    """`--groups --dashboard --out-csv` wrote two files under the old
+    interface; it still
     must, or someone's report silently loses half its content."""
     inv, fakes = env(("lm", "lm1"))
     fakes[0].state.add_vm("web1", tags=[("env", "prod")])
