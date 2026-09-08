@@ -73,9 +73,9 @@ def test_console_scripts_are_declared():
     """The whole point of the package: `nsxctl` on PATH after an install."""
     scripts = _declared_scripts()
     assert "nsxctl" in scripts, "pyproject declares no nsxctl command"
-    # The 3.x name kept working on purpose; dropping it silently would break
-    # anyone's existing scripts.
-    assert "nsx-toolkit" in scripts, "the 3.x continuity alias was dropped"
+    # The single-file name kept working on purpose; dropping it silently
+    # would break anyone's existing scripts.
+    assert "nsx-toolkit" in scripts, "the nsx-toolkit continuity alias was dropped"
 
 
 @pytest.mark.parametrize("command", sorted(_declared_scripts()))
@@ -120,3 +120,29 @@ def test_the_package_declares_no_mandatory_dependencies():
     assert body.startswith("[]"), (
         "a mandatory dependency was added; the toolkit is meant to install "
         "and run with the standard library alone")
+
+
+def test_the_declared_version_matches_the_shipped_one():
+    """pyproject decides what PyPI records; version.py decides what the tool
+    prints. A mismatch ships a package whose own `--version` disagrees with
+    the index it came from, and nothing else catches it.
+    """
+    with open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8") as f:
+        declared = None
+        for line in f:
+            if line.startswith("version = "):
+                declared = line.partition("=")[2].strip().strip('"')
+                break
+    assert declared, "pyproject declares no version"
+
+    source = os.path.join(PKG, "version.py")
+    with open(source, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=source)
+    shipped = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "VERSION":
+                    shipped = node.value.value
+    assert shipped == declared, (
+        "pyproject says {} but version.py says {}".format(declared, shipped))

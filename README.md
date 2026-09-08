@@ -699,13 +699,13 @@ per site; rules are deduped by their NSX path and attributed to the GM once.
 
 ---
 
-## Upgrading from 3.x
+## Upgrading from the old flag interface
 
 Every old flag still works and prints the replacement:
 
 ```
 $ nsx-toolkit.py --dashboard
-warning: --dashboard is deprecated and will be removed in 5.0.
+warning: --dashboard is deprecated and will be removed in 2.0.
          use: nsxctl compliance
 ```
 
@@ -770,7 +770,7 @@ src/nsx_toolkit/
   namecache.py                              names for completion, never live
   actions/                                  one module per operation
   commands/                                 the nsxctl command tree
-  legacy.py                                 pre-4.0 flag translation
+  legacy.py                                 old flag translation
   wizard.py menu.py cli.py                  entry points
 tools/build_single_file.py                  amalgamator
 tests/fake_nsx.py                           in-process fake NSX manager
