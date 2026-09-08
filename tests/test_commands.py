@@ -147,8 +147,21 @@ def test_completion_is_generated_from_the_live_parser():
     tree = command_tree(build_parser())
     assert set(tree["tag"]["subcommands"]) == {
         "list", "find", "edit", "apply", "ticket"}
-    assert set(tree["group"]["subcommands"]) == {"list", "show"}
+    assert set(tree["group"]["subcommands"]) == {
+        "list", "show", "create", "edit", "delete"}
     assert "--contains" in tree["group"]["subcommands"]["list"]
+    # The authoring verbs and the trace command came for free when they were
+    # registered -- which is the whole point of generating this from the
+    # parser rather than maintaining a second list.
+    assert "--criteria" in tree["group"]["subcommands"]["create"]
+    assert set(tree["rule"]["subcommands"]) == {
+        "list", "show", "hygiene", "baseline", "create", "edit", "move",
+        "delete"}
+    assert set(tree["service"]["subcommands"]) == {"list", "show"}
+    assert "--fail-on-missing" in tree["doctor"]["options"]
+    assert "--profile" in tree["doctor"]["options"]
+    assert "--static" in tree["trace"]["options"]
+    assert "apply" in tree
 
 
 def test_completion_needs_no_inventory(tmp_path, monkeypatch, capsys):

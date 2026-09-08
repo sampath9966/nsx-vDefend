@@ -15,6 +15,7 @@ attributed to the GM exactly once and never re-listed per LM.
 """
 
 from .api import (
+    ANY,
     F_DEST_GROUPS,
     F_DISPLAY_NAME,
     F_ID,
@@ -117,6 +118,21 @@ def policies_for(nsx, domain):
             return nsx.get_all(p_sec_policies(base, domain))
         except NsxError:
             return []
+
+
+def listed_values(rule, field):
+    """A rule's list-valued field with empties dropped."""
+    return [v for v in (rule.get(field) or []) if v]
+
+
+def is_wildcard(values):
+    """NSX writes the wildcard as ["ANY"]; an empty list means the same.
+
+    Shared rather than duplicated: rule hygiene and trace evaluation both turn
+    on this exact question, and two copies would eventually disagree about
+    what "matches everything" means.
+    """
+    return not values or list(values) == [ANY]
 
 
 def rule_sequence(record):

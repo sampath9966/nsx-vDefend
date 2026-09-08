@@ -11,8 +11,10 @@ from ..api import (
     p_groups,
 )
 from ..errors import NsxError
+from ..namecache import KIND_GROUP
 from ..output import Spinner, cB, cBY, cC, cD, cR, err, hr, more_note, say, section
 from ..render import criteria_summary, describe_expression
+from .inspect import remember_names
 
 CONSOLE_MEMBER_LIMIT = 30
 
@@ -20,7 +22,8 @@ GROUPS_HEADERS = ["manager", "group_id", "display_name", "path", "criteria",
                   "members"]
 
 
-def act_groups(sessions, domain, needle, show_members, exporter):
+def act_groups(sessions, domain, needle, show_members, exporter,
+               cache_key=None):
     rows = []
     for nsx in sessions:
         try:
@@ -73,3 +76,6 @@ def act_groups(sessions, domain, needle, show_members, exporter):
                          criteria_summary(g.get(F_EXPRESSION)), member_count])
     hr()
     exporter.stage("groups", GROUPS_HEADERS, rows)
+    # Keep TAB completion warm off a listing somebody ran anyway.
+    remember_names(KIND_GROUP, [r[1] for r in rows] + [r[2] for r in rows],
+                   cache_key)

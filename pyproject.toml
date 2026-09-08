@@ -1,14 +1,19 @@
 [build-system]
-requires = ["setuptools>=61"]
+# 77 is the floor for the SPDX `license` string below. Older setuptools
+# rejects it outright, so this is a real requirement rather than a preference.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nsxctl"
-version = "4.0.0"
+version = "1.0.0"
 description = "NSX groups, tags and distributed firewall from the command line, across a Global Manager and every Local Manager"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
+# An SPDX expression, not a table: setuptools deprecated the table form and
+# stops supporting it in February 2027. license-files still ships the text.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 keywords = ["nsx", "vmware", "firewall", "dfw", "segmentation", "networking"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -41,7 +46,8 @@ Issues = "https://github.com/sampath9966/nsx-vDefend/issues"
 
 [project.scripts]
 nsxctl = "nsx_toolkit.cli:entry"
-# Continuity alias for anyone who installed the 3.x package.
+# Continuity alias: the tool shipped for years as a single file called
+# nsx-toolkit.py, and scripts still invoke it by that name.
 nsx-toolkit = "nsx_toolkit.cli:entry"
 
 [tool.setuptools.packages.find]
