@@ -94,9 +94,14 @@ def test_audit_view_exports_added_and_removed(lm, make_session, audit):
               [("env", "dev")], [("env", "prod")])
     exp = Exporter()
     act_audit_log(audit, [make_session(lm)], write_enabled=False, exporter=exp)
-    row = exp.sets[0].rows[0]
-    assert row[5] == "env=prod"     # added
-    assert row[6] == "env=dev"      # removed
+    # The export gained an object_type column when the audit log grew to
+    # cover groups and rules as well as tags, so index by header name rather
+    # than by position.
+    columns = dict(zip(exp.sets[0].headers, exp.sets[0].rows[0]))
+    assert columns["object_type"] == "vm_tags"
+    assert columns["object"] == "web1"
+    assert columns["added"] == "env=prod"
+    assert columns["removed"] == "env=dev"
 
 
 def test_empty_audit_log_reads_cleanly(tmp_path, lm, make_session):
