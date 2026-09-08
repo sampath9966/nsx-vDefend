@@ -54,6 +54,7 @@ getting started:
   nsxctl status                     can I reach and authenticate everywhere?
   nsxctl doctor                     what does this NSX actually serve?
   nsxctl                            interactive menu
+  nsxctl setup-path                 make `nsxctl` runnable from any terminal
 
 everyday:
   nsxctl compliance                 tagging posture across every Local Manager

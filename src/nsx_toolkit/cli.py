@@ -18,6 +18,7 @@ from .creds import credentials_for, set_store_policy
 from .errors import ConfigError, NsxError, UserAbort
 from .export import Exporter
 from .http import Nsx, have_requests, make_transport
+from .launcher import module_command, path_status
 from .legacy import translate_legacy_argv, uses_legacy
 from .menu import AppContext, interactive
 from .output import (
@@ -185,8 +186,34 @@ def _apply_modes(args):
     set_store_policy(args.store)
 
 
-def main(argv=None):
+def _module_launch_hint(raw):
+    """Point a stranded install at the one command that repairs it.
+
+    Reaching us through `python -m` is itself the signal: nearly everyone who
+    does it got here because `nsxctl` was not found. Printed before parsing so
+    it still appears alongside `--help`, which is the first thing that gets
+    tried; on stderr so it can never land in piped output; and only on a
+    terminal, so a script sees nothing.
+    """
+    if "--json" in raw or not sys.stderr.isatty():
+        return
+    try:
+        if path_status().reachable:
+            return
+    except Exception:  # noqa: BLE001 - a hint must never break the run
+        return
+    # Not err(): this is not an error, and the run continues normally. Not
+    # warn() either -- that prints to stdout, which is the one place a hint
+    # must never appear.
+    print("  {} `nsxctl` is installed but not on your PATH. Fix it with:"
+          "\n          {} setup-path".format(cBY("[hint]"), module_command()),
+          file=sys.stderr, flush=True)
+
+
+def main(argv=None, via_module=False):
     raw = list(sys.argv[1:] if argv is None else argv)
+    if via_module:
+        _module_launch_hint(raw)
 
     # --- old flag interface: translate, warn, continue -------------------------
     legacy_warnings = []
