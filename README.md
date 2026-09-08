@@ -35,6 +35,7 @@ nsxctl profiles                         estates this inventory defines
 nsxctl projects                         NSX Projects on each manager
 nsxctl login [NAME]                     set or replace stored credentials
 nsxctl config show | path | validate    what config is in effect, and from where
+nsxctl setup-path                       make `nsxctl` runnable from any terminal
 
 nsxctl group list [--contains X] [--members]
 nsxctl group show NAME
@@ -550,6 +551,35 @@ first thing to reach for when an API behaves differently on your NSX version.
 | Single file | download `nsx-toolkit.py` | No install possible. No dependencies. |
 | Binary | download from [Releases](https://github.com/sampath9966/nsx-vDefend/releases) | No Python at all. |
 | Module | `python -m nsx_toolkit` | Console scripts awkward to reach. |
+
+### If `nsxctl` is not found after installing
+
+`pip` puts the launcher in your Python installation's `Scripts` (Windows) or
+`bin` (Linux, macOS) directory. If that directory is not on your `PATH`, the
+install succeeds and the command is still not found -- most often on Windows,
+where the python.org installer's **"Add Python to PATH"** box was left
+unchecked. pip warns about it, and the warning scrolls past.
+
+A wheel cannot fix this at install time; there is no install hook to fix it
+from. So the toolkit fixes it on request:
+
+```bash
+py -m nsx_toolkit setup-path      # Windows
+python3 -m nsx_toolkit setup-path # Linux, macOS
+```
+
+That reports where the launcher is, whether the shell can see it, and offers
+to add the one directory to your **user** PATH -- never the system one, and
+saving the previous value first. Open a new terminal afterwards: a running
+shell keeps the environment it started with.
+
+`nsxctl setup-path --check` reports without changing anything and exits 1 if
+the command is unreachable, which is the form to put in a build or a support
+script. Running the toolkit as `python -m nsx_toolkit` always works regardless,
+and is the right answer on a machine whose PATH you would rather not touch.
+
+`pipx install nsxctl` avoids the problem entirely -- it manages PATH itself --
+which is why it is the recommendation above.
 
 Shell completion:
 
