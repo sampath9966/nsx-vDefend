@@ -8562,15 +8562,18 @@ CAP_HEADERS  = ["manager", "resource", "used", "limit", "pct", "status"]
 
 def _ts_ms_to_date(ms):
     try:
-        return datetime.datetime.utcfromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d")
+        return datetime.datetime.fromtimestamp(
+            int(ms) / 1000, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%d")
     except Exception:
         return ""
 
 
 def _days_until_ms(ms):
     try:
-        exp = datetime.datetime.utcfromtimestamp(int(ms) / 1000)
-        return (exp - datetime.datetime.utcnow()).days
+        exp = datetime.datetime.fromtimestamp(int(ms) / 1000, tz=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (exp - now).days
     except Exception:
         return None
 
