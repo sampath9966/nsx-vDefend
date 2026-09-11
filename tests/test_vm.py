@@ -1,6 +1,5 @@
 """Tests for `nsxctl vm groups` -- VM-centric group membership views."""
 
-import pytest
 from fake_nsx import FakeNsx
 
 from nsx_toolkit.actions.vm import act_vm_groups

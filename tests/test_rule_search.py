@@ -1,8 +1,5 @@
 """Tests for `nsxctl rule search --ip` -- IP-based rule search."""
 
-import pytest
-from fake_nsx import FakeNsx
-
 from nsx_toolkit.actions.inspect import act_rule_search
 from nsx_toolkit.export import Exporter
 
