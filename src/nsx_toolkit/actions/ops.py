@@ -2,7 +2,6 @@
 import datetime
 
 from ..api import (
-    F_ALARM_STATUS,
     F_CAPACITY_USAGE_DATA,
     F_CURRENT_USAGE_COUNT,
     F_DISPLAY_NAME,
@@ -20,8 +19,7 @@ from ..api import (
     F_USAGE_TYPE,
     F_USED_BY_LINKS,
 )
-from ..errors import NsxError
-from ..output import cBG, cBR, cBY, cD, parallel_run, section, say, table
+from ..output import cBG, cBR, cBY, cD, parallel_run, say, section, table
 
 ALARM_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 ALARM_HEADERS = [

@@ -173,6 +173,7 @@ def build_parser():
     from .apply import register_apply
     from .group import register_group
     from .inspect import register_inspect
+    from .ops import register_ops
     from .recommend import register_recommend
     from .rule import register_rule
     from .setup import register_setup
@@ -180,7 +181,6 @@ def build_parser():
     from .snapshot import register_snapshot
     from .tag import register_tag
     from .trace import register_trace
-    from .ops import register_ops
     from .vm import register_vm
 
     global_parent = argparse.ArgumentParser(add_help=False)
