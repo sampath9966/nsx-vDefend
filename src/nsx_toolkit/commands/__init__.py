@@ -62,6 +62,8 @@ everyday:
   nsxctl impact web-prod-01         what breaks if I retag this VM
   nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
   nsxctl rule list --policy app-tier
+  nsxctl rule search --ip 10.1.2.3  find every rule that could touch this IP
+  nsxctl vm groups web-prod-01      every group this VM belongs to
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
 
@@ -173,6 +175,7 @@ def build_parser():
     from .snapshot import register_snapshot
     from .tag import register_tag
     from .trace import register_trace
+    from .vm import register_vm
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -193,7 +196,7 @@ def build_parser():
                      register_rule, register_inspect,
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
-                     register_recommend,
+                     register_recommend, register_vm,
                      register_shell):
         register(sub, parents)
     return parser

@@ -54,8 +54,8 @@ import xml.sax.saxutils as saxutils
 # version.py  --  Tool identity. Single source of truth for name and version strings.
 # ==========================================================================
 
-VERSION = "1.1.0"
-VERSION_DATE = "2026-09-08"
+VERSION = "1.2.0"
+VERSION_DATE = "2026-09-11"
 TOOL_NAME = "NSX Toolkit"
 TOOL_TAGLINE = "Zero Trust Segmentation · Groups, Tags & DFW"
 
@@ -6177,6 +6177,123 @@ def act_reverse_lookup(all_sessions, needle, domain, exporter):
 
 
 # ==========================================================================
+# actions/vm.py  --  VM-centric views: groups a VM is a member of, and the rules that reference them.
+# ==========================================================================
+
+VM_GROUP_HEADERS = ["vm", "manager", "group_id", "group_name", "origin",
+                    "criteria", "rule_count"]
+
+
+def act_vm_groups(all_sessions, needle, domain, exporter):
+    """Groups this VM belongs to (any member type) and how many DFW rules reference them.
+
+    Uses NSX's own virtual-machine-group-associations reverse index, which is
+    member-type agnostic -- it works for tag-matched, segment-matched, VIF-matched
+    and IP-set groups equally, unlike the /members/virtual-machines sub-resource
+    which silently returns nothing for non-VM-typed groups.
+    """
+    lm_sessions = [s for s in all_sessions if s.role == ROLE_LM]
+    gm_sessions = [s for s in all_sessions if s.role == ROLE_GM]
+
+    # VMs are LM-local objects -- find the VM on whichever LM has it.
+    found = None
+    for nsx in lm_sessions:
+        try:
+            hits = nsx.find_vms(needle)
+            if hits:
+                found = (nsx, hits[0])
+                break
+        except NsxError:
+            continue
+    if not found:
+        say("  No VM matching '{}' on any Local Manager.".format(needle))
+        exporter.stage("vm_groups", VM_GROUP_HEADERS, [])
+        return
+
+    nsx_lm, vm = found
+    vname = vm.get(F_DISPLAY_NAME, "?")
+    ext_id = vm.get(F_EXTERNAL_ID)
+    section("VM GROUPS")
+    say("  VM       : {}".format(cB(vname)))
+    say("  Found on : {}".format(cC(nsx_lm.name)))
+
+    if not ext_id:
+        say("  {} VM has no external_id -- cannot resolve group associations.".format(
+            cBR("[error]")))
+        exporter.stage("vm_groups", VM_GROUP_HEADERS, [])
+        return
+
+    # --- Group membership via reverse-association index ---
+    matched = {}  # group_id -> (path, display_name, origin)
+    with Spinner("Association lookup on {}".format(nsx_lm.name)):
+        try:
+            for a in nsx_lm.get_all(p_vm_group_assoc(nsx_lm.base(domain)),
+                                    params={PARAM_VM_EXTERNAL_ID: ext_id}):
+                gpath = a.get(F_PATH, "")
+                gid = a.get(F_TARGET_ID) or (group_id_from_path(gpath) if gpath else "?")
+                matched[gid] = (gpath, a.get(F_TARGET_DISPLAY_NAME, gid),
+                                origin_of_path(gpath))
+        except NsxError as e:
+            err("association lookup failed: {}".format(e))
+
+    # Best-effort GM supplement -- catches Global Groups not yet realized here.
+    for nsx_gm in gm_sessions:
+        try:
+            for a in nsx_gm.get_all(p_vm_group_assoc(nsx_gm.base(domain)),
+                                    params={PARAM_VM_EXTERNAL_ID: ext_id}):
+                gpath = a.get(F_PATH, "")
+                gid = a.get(F_TARGET_ID) or (group_id_from_path(gpath) if gpath else "?")
+                if gid not in matched:
+                    matched[gid] = (gpath, a.get(F_TARGET_DISPLAY_NAME, gid),
+                                    origin_of_path(gpath))
+        except NsxError:
+            pass
+
+    if not matched:
+        say("  {}".format(cD("Not a member of any group.")))
+        exporter.stage("vm_groups", VM_GROUP_HEADERS, [])
+        return
+
+    say("  Member of: {} group(s)".format(cC(str(len(matched)))))
+    hr()
+
+    # Count how many DFW rules reference each group
+    group_paths = {gp for gp, _, _ in matched.values() if gp}
+    rule_counts = {}
+    for record in sweep_rules(all_sessions, domain):
+        for gp in record.group_refs() & group_paths:
+            rule_counts[gp] = rule_counts.get(gp, 0) + 1
+
+    # Fetch group expressions for the criteria column
+    rows = []
+    display_rows = []
+    for gid, (gpath, gname, origin) in sorted(matched.items(),
+                                               key=lambda kv: kv[1][1].lower()):
+        criteria = ""
+        for nsx in (lm_sessions + gm_sessions):
+            try:
+                g = nsx.get(p_group(nsx.base(domain), domain, gid))
+                criteria = criteria_summary(g.get(F_EXPRESSION))
+                break
+            except NsxError:
+                continue
+        rc = rule_counts.get(gpath, 0)
+        origin_lbl = cC("GM") if origin == "GM" else cD("LM")
+        rows.append([vname, nsx_lm.name, gid, gname, origin, criteria, str(rc)])
+        display_rows.append([origin_lbl, cB(gname), cD(gid),
+                             criteria[:48] if criteria else cD("(unknown)"),
+                             cBG(str(rc)) if rc else cD("0")])
+
+    table(["Origin", "Group", "Id", "Criteria", "DFW Rules"],
+          display_rows, indent=4)
+    hr()
+    say("  {}  {}".format(
+        cD("next:"),
+        cC("nsxctl rule search --ip <IP>   # find rules by IP address")))
+    exporter.stage("vm_groups", VM_GROUP_HEADERS, rows)
+
+
+# ==========================================================================
 # actions/parity.py  --  Static vs dynamic group parity -- the core migration progress check.
 # ==========================================================================
 
@@ -7974,6 +8091,214 @@ def act_service_show(sessions, domain, exporter, ref):
     return rows
 
 
+# ── rule search ──────────────────────────────────────────────────────────────
+
+RULE_SEARCH_HEADERS = ["manager", "origin", "policy", "rule", "action",
+                       "direction", "source_match", "dest_match"]
+
+# Match verdicts (higher = more certain)
+_MATCH_NONE = 0
+_MATCH_POSSIBLE = 1   # tag/condition-based group; can't evaluate statically
+_MATCH_ANY = 2        # ANY wildcard — always matches
+_MATCH_EXACT = 3      # confirmed via IPAddressExpression
+
+
+def _net(cidr):
+    """Parse CIDR or host IP; return ip_network or None."""
+    try:
+        return ipaddress.ip_network(str(cidr).strip(), strict=False)
+    except ValueError:
+        return None
+
+
+def _ip_in_entries(query_net, entries):
+    """Check whether query_net is covered by any IPAddressExpression in entries."""
+    for entry in entries or []:
+        if entry.get(RT) != RT_IPADDRESS:
+            continue
+        for addr in entry.get(F_IP_ADDRESSES) or []:
+            candidate = _net(addr)
+            if candidate is None:
+                continue
+            try:
+                if query_net.subnet_of(candidate) or candidate.subnet_of(query_net):
+                    return True
+            except TypeError:
+                # mixed v4/v6
+                pass
+    return False
+
+
+def _group_match_basis(query_net, expression):
+    """Return (_MATCH_EXACT | _MATCH_POSSIBLE | _MATCH_NONE) for a group expression."""
+    if not expression:
+        return _MATCH_NONE
+    # Flatten nested and conjunction types to a single list of leaf entries.
+    leaves = []
+    queue = list(expression) if isinstance(expression, list) else [expression]
+    while queue:
+        item = queue.pop()
+        if not isinstance(item, dict):
+            continue
+        rt = item.get(RT, "")
+        if rt in (RT_CONJUNCTION, RT_NESTED):
+            queue.extend(item.get(F_EXPRESSION) or [])
+        else:
+            leaves.append(item)
+
+    has_ip = any(e.get(RT) == RT_IPADDRESS for e in leaves)
+    has_condition = any(e.get(RT) in (RT_CONDITION, RT_PATHEXPR) for e in leaves)
+
+    if has_ip and _ip_in_entries(query_net, leaves):
+        return _MATCH_EXACT
+    if has_condition or (has_ip and not _ip_in_entries(query_net, leaves)):
+        # Tag/segment-based groups may still match the IP at runtime.
+        return _MATCH_POSSIBLE if has_condition else _MATCH_NONE
+    return _MATCH_NONE
+
+
+def _build_group_index(sessions, domain, group_paths):
+    """Map group_path -> match basis for as many groups as we can fetch."""
+    index = {}
+    for nsx in sessions:
+        for gpath in list(group_paths):
+            if gpath in index:
+                continue
+            gid = group_id_from_path(gpath)
+            if not gid:
+                continue
+            try:
+                g = nsx.get(p_group(nsx.base(domain), domain, gid))
+                index[gpath] = g.get(F_EXPRESSION)
+            except Exception:  # noqa: BLE001
+                pass
+    return index
+
+
+def _refs_match(paths, query_net, group_expr_index, certain_only):
+    """Best match verdict for a list of group paths."""
+    values = [p for p in (paths or []) if p]
+    if not values or values == [ANY]:
+        return _MATCH_ANY, "ANY"
+    best = _MATCH_NONE
+    best_label = ""
+    for path in values:
+        expr = group_expr_index.get(path)
+        basis = _group_match_basis(query_net, expr)
+        if expr is None and not certain_only:
+            basis = max(basis, _MATCH_POSSIBLE)
+        if basis > best:
+            best = basis
+            gid = group_id_from_path(path) or path
+            if basis == _MATCH_EXACT:
+                best_label = "exact: {}".format(gid)
+            elif basis == _MATCH_POSSIBLE:
+                best_label = "possible: {}".format(gid)
+    return best, best_label
+
+
+def act_rule_search(sessions, domain, exporter, ip, certain_only=False,
+                    policy_ref=None, cache_key=None):
+    """Find DFW rules whose source or destination groups could apply to an IP."""
+    section("RULE SEARCH")
+    query_net = _net(ip)
+    if query_net is None:
+        err("  Not a valid IP or CIDR: '{}'".format(ip))
+        exporter.stage("rule_search", RULE_SEARCH_HEADERS, [])
+        return []
+
+    say("  Searching for rules that could apply to {}".format(cB(str(query_net))))
+    if certain_only:
+        say("  {}".format(cD("(--certain: hiding 'possible' matches)")))
+    hr()
+
+    records = evaluation_order(sweep_rules(sessions, domain))
+    policy_needle = (policy_ref or "").lower() or None
+    if policy_needle:
+        records = [r for r in records
+                   if policy_needle in "{} {}".format(
+                       r.policy_name, r.policy_id).lower()]
+
+    # Collect all unique group paths referenced by any candidate rule.
+    all_paths = set()
+    for record in records:
+        for path in (record.rule.get(F_SOURCE_GROUPS) or []):
+            if path and path != ANY:
+                all_paths.add(path)
+        for path in (record.rule.get(F_DEST_GROUPS) or []):
+            if path and path != ANY:
+                all_paths.add(path)
+
+    group_expr_index = _build_group_index(sessions, domain, all_paths)
+
+    rows = []
+    display_rows = []
+    for record in records:
+        rule = record.rule
+        src_basis, src_label = _refs_match(
+            rule.get(F_SOURCE_GROUPS), query_net, group_expr_index, certain_only)
+        dst_basis, dst_label = _refs_match(
+            rule.get(F_DEST_GROUPS), query_net, group_expr_index, certain_only)
+
+        # A rule matches when either direction hits.
+        direction = str(rule.get(F_DIRECTION, "IN_OUT")).upper()
+        if direction == "IN":
+            # only destination matters for inbound
+            effective = dst_basis
+        elif direction == "OUT":
+            effective = src_basis
+        else:
+            effective = max(src_basis, dst_basis)
+
+        if effective == _MATCH_NONE:
+            continue
+        # --certain: hide any rule where either side is merely "possible"
+        if certain_only and (src_basis == _MATCH_POSSIBLE
+                             or dst_basis == _MATCH_POSSIBLE):
+            continue
+
+        action = str(rule.get(F_ACTION_FIELD, "?"))
+        rows.append([record.nsx.name, record.origin, record.policy_name,
+                     record.rule_name, action, direction,
+                     src_label or "-", dst_label or "-"])
+        src_colour = (cBG if src_basis == _MATCH_EXACT
+                      else (cBY if src_basis == _MATCH_ANY else cD))
+        dst_colour = (cBG if dst_basis == _MATCH_EXACT
+                      else (cBY if dst_basis == _MATCH_ANY else cD))
+        display_rows.append([
+            _rule_action_colour(action)(action),
+            cB(record.rule_name),
+            record.policy_name,
+            src_colour(src_label or "-"),
+            dst_colour(dst_label or "-"),
+            cD(direction),
+        ])
+
+    say("  {} rule(s) could apply to {}{}".format(
+        cC(str(len(rows))), cB(str(query_net)),
+        cD("  (exact + possible)") if not certain_only else ""))
+    if not rows:
+        say("  {}".format(cD("(no matches)")))
+        exporter.stage("rule_search", RULE_SEARCH_HEADERS, [])
+        return []
+
+    table(["Action", "Rule", "Policy", "Source match", "Dest match", "Dir"],
+          display_rows, indent=4)
+    hr()
+    say("  {}  {}".format(
+        cD("legend:"),
+        cD("exact = IP in group's IPAddressExpression  |  "
+           "possible = tag/segment-based (check at runtime)")))
+    say("  {}  {}".format(
+        cD("next:"),
+        cC("nsxctl trace VM_A VM_B --port N   # confirm what actually decides")))
+
+    remember_names(KIND_RULE, [r.rule_name for r in records]
+                   + [r.rule_id for r in records], cache_key)
+    exporter.stage("rule_search", RULE_SEARCH_HEADERS, rows)
+    return rows
+
+
 # ==========================================================================
 # actions/doctor.py  --  What does THIS NSX actually serve.
 # ==========================================================================
@@ -9350,6 +9675,8 @@ everyday:
   nsxctl impact web-prod-01         what breaks if I retag this VM
   nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
   nsxctl rule list --policy app-tier
+  nsxctl rule search --ip 10.1.2.3  find every rule that could touch this IP
+  nsxctl vm groups web-prod-01      every group this VM belongs to
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
 
@@ -9461,6 +9788,7 @@ def build_parser():
     pass
     pass
     pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -9481,7 +9809,7 @@ def build_parser():
                      register_rule, register_inspect,
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
-                     register_recommend,
+                     register_recommend, register_vm,
                      register_shell):
         register(sub, parents)
     return parser
@@ -10258,6 +10586,28 @@ def register_rule(sub, parents):
     dl.add_argument("--policy", help="Policy the rule is in.")
     dl.set_defaults(func=cmd_rule_delete)
 
+    sr = add_action(
+        rsub, parents, "search", "Find rules that could apply to an IP.",
+        description="Find every DFW rule whose source or destination group "
+                    "could apply to a given IP address or CIDR.\n\n"
+                    "Groups are evaluated statically: a group whose criteria "
+                    "is an explicit IPAddressExpression is checked exactly; a "
+                    "tag- or segment-based group is reported as 'possible' "
+                    "because its membership can only be confirmed at runtime. "
+                    "Use --certain to hide 'possible' rows.",
+        epilog="examples:\n"
+               "  nsxctl rule search --ip 10.1.2.3\n"
+               "  nsxctl rule search --ip 10.0.0.0/8 --certain\n"
+               "  nsxctl rule search --ip 192.168.1.1 --policy app-tier")
+    sr.add_argument("--ip", required=True, metavar="IP/CIDR",
+                    help="IP address or CIDR to search for.")
+    sr.add_argument("--certain", action="store_true",
+                    help="Hide 'possible' matches; show only rules with an "
+                         "exact IP match or ANY.")
+    sr.add_argument("--policy", metavar="NAME",
+                    help="Limit to rules in policies matching NAME.")
+    sr.set_defaults(func=cmd_rule_search)
+
     p.set_defaults(func=_rule_needs_action)
 
 
@@ -10358,9 +10708,16 @@ def cmd_rule_delete(args, ctx):
     return _rule_write(args, ctx, policy_ref=args.policy, delete=True)
 
 
+def cmd_rule_search(args, ctx):
+    act_rule_search(ctx.sessions, args.domain, ctx.exporter,
+                    ip=args.ip, certain_only=args.certain,
+                    policy_ref=args.policy, cache_key=ctx.cache_key())
+    return 0
+
+
 def _rule_needs_action(args, ctx):
     err("Specify what to do: nsxctl rule list | show | hygiene | baseline "
-        "| create | edit | move | delete")
+        "| create | edit | move | delete | search")
     return 2
 
 
@@ -10676,6 +11033,52 @@ def cmd_audit_undo(args, ctx):
     act_audit_log(ctx.audit, ctx.sessions, write_enabled=True,
                   exporter=ctx.exporter, limit=args.limit, domain=args.domain)
     return 0
+
+
+# ==========================================================================
+# commands/vm.py  --  `nsxctl vm` — VM-centric views.
+# ==========================================================================
+
+def register_vm(sub, parents):
+    p = add_command(sub, parents, "vm", "VM-centric views.")
+    vsub = p.add_subparsers(dest="vm_action", metavar="<action>")
+
+    gr = add_action(
+        vsub, parents, "groups", "Show every group a VM belongs to.",
+        description="Groups this VM is currently a member of, using NSX's own "
+                    "reverse-association index. Shows every group regardless of "
+                    "how membership is decided -- tag-based, segment-based, VIF-based "
+                    "and IP-set groups all appear, unlike the per-group member listing "
+                    "which silently skips non-VirtualMachine member types.\n\n"
+                    "Also shows how many DFW rules reference each group, so you can "
+                    "see at a glance which groups are security-relevant.",
+        epilog="examples:\n"
+               "  nsxctl vm groups web-prod-01\n"
+               "  nsxctl vm groups web   # substring match\n"
+               "  nsxctl vm groups web-prod-01 --json")
+    gr.add_argument("vm", help="VM name or substring.")
+    gr.set_defaults(func=cmd_vm_groups)
+
+    p.set_defaults(func=_vm_needs_action)
+
+
+def cmd_vm_groups(args, ctx):
+    lms = ctx.lms()
+    if not lms:
+        err("No Local Manager sessions. Add a manager with role 'lm' to your "
+            "inventory.")
+        return 2
+    try:
+        act_vm_groups(ctx.sessions, args.vm, args.domain, ctx.exporter)
+    except NsxError as e:
+        err(str(e))
+        return 2
+    return 0
+
+
+def _vm_needs_action(args, ctx):
+    err("Specify what to do: nsxctl vm groups")
+    return 2
 
 
 # ==========================================================================

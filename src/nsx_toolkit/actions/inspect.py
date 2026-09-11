@@ -10,6 +10,8 @@ definitions -- so a rule listed here is exactly the rule hygiene reports on
 and trace evaluates, in the same evaluation order.
 """
 
+import ipaddress
+
 from ..api import (
     ANY,
     F_ACTION_FIELD,
@@ -19,7 +21,9 @@ from ..api import (
     F_DIRECTION,
     F_DISABLED,
     F_DISPLAY_NAME,
+    F_EXPRESSION,
     F_ID,
+    F_IP_ADDRESSES,
     F_L4_PROTOCOL,
     F_LOGGED,
     F_PATH,
@@ -30,10 +34,16 @@ from ..api import (
     F_SERVICES,
     F_SOURCE_GROUPS,
     RT,
+    RT_CONDITION,
+    RT_CONJUNCTION,
+    RT_IPADDRESS,
     RT_L4_PORTSET,
+    RT_NESTED,
+    RT_PATHEXPR,
     category_rank,
     group_id_from_path,
     origin_of_path,
+    p_group,
 )
 from ..authoring import service_inventory
 from ..namecache import (
@@ -44,12 +54,15 @@ from ..namecache import (
 )
 from ..output import (
     cB,
+    cBG,
     cBR,
+    cBY,
     cC,
     cD,
     cG,
     cR,
     cY,
+    err,
     hr,
     more_note,
     say,
@@ -374,4 +387,212 @@ def act_service_show(sessions, domain, exporter, ref):
     rows = [[service.get(F_ID, ""), service.get(F_DISPLAY_NAME, ""),
              protocol, ports, kind]]
     exporter.stage("service", SERVICE_HEADERS, rows)
+    return rows
+
+
+# ── rule search ──────────────────────────────────────────────────────────────
+
+RULE_SEARCH_HEADERS = ["manager", "origin", "policy", "rule", "action",
+                       "direction", "source_match", "dest_match"]
+
+# Match verdicts (higher = more certain)
+_MATCH_NONE = 0
+_MATCH_POSSIBLE = 1   # tag/condition-based group; can't evaluate statically
+_MATCH_ANY = 2        # ANY wildcard — always matches
+_MATCH_EXACT = 3      # confirmed via IPAddressExpression
+
+
+def _net(cidr):
+    """Parse CIDR or host IP; return ip_network or None."""
+    try:
+        return ipaddress.ip_network(str(cidr).strip(), strict=False)
+    except ValueError:
+        return None
+
+
+def _ip_in_entries(query_net, entries):
+    """Check whether query_net is covered by any IPAddressExpression in entries."""
+    for entry in entries or []:
+        if entry.get(RT) != RT_IPADDRESS:
+            continue
+        for addr in entry.get(F_IP_ADDRESSES) or []:
+            candidate = _net(addr)
+            if candidate is None:
+                continue
+            try:
+                if query_net.subnet_of(candidate) or candidate.subnet_of(query_net):
+                    return True
+            except TypeError:
+                # mixed v4/v6
+                pass
+    return False
+
+
+def _group_match_basis(query_net, expression):
+    """Return (_MATCH_EXACT | _MATCH_POSSIBLE | _MATCH_NONE) for a group expression."""
+    if not expression:
+        return _MATCH_NONE
+    # Flatten nested and conjunction types to a single list of leaf entries.
+    leaves = []
+    queue = list(expression) if isinstance(expression, list) else [expression]
+    while queue:
+        item = queue.pop()
+        if not isinstance(item, dict):
+            continue
+        rt = item.get(RT, "")
+        if rt in (RT_CONJUNCTION, RT_NESTED):
+            queue.extend(item.get(F_EXPRESSION) or [])
+        else:
+            leaves.append(item)
+
+    has_ip = any(e.get(RT) == RT_IPADDRESS for e in leaves)
+    has_condition = any(e.get(RT) in (RT_CONDITION, RT_PATHEXPR) for e in leaves)
+
+    if has_ip and _ip_in_entries(query_net, leaves):
+        return _MATCH_EXACT
+    if has_condition or (has_ip and not _ip_in_entries(query_net, leaves)):
+        # Tag/segment-based groups may still match the IP at runtime.
+        return _MATCH_POSSIBLE if has_condition else _MATCH_NONE
+    return _MATCH_NONE
+
+
+def _build_group_index(sessions, domain, group_paths):
+    """Map group_path -> match basis for as many groups as we can fetch."""
+    index = {}
+    for nsx in sessions:
+        for gpath in list(group_paths):
+            if gpath in index:
+                continue
+            gid = group_id_from_path(gpath)
+            if not gid:
+                continue
+            try:
+                g = nsx.get(p_group(nsx.base(domain), domain, gid))
+                index[gpath] = g.get(F_EXPRESSION)
+            except Exception:  # noqa: BLE001
+                pass
+    return index
+
+
+def _refs_match(paths, query_net, group_expr_index, certain_only):
+    """Best match verdict for a list of group paths."""
+    values = [p for p in (paths or []) if p]
+    if not values or values == [ANY]:
+        return _MATCH_ANY, "ANY"
+    best = _MATCH_NONE
+    best_label = ""
+    for path in values:
+        expr = group_expr_index.get(path)
+        basis = _group_match_basis(query_net, expr)
+        if expr is None and not certain_only:
+            basis = max(basis, _MATCH_POSSIBLE)
+        if basis > best:
+            best = basis
+            gid = group_id_from_path(path) or path
+            if basis == _MATCH_EXACT:
+                best_label = "exact: {}".format(gid)
+            elif basis == _MATCH_POSSIBLE:
+                best_label = "possible: {}".format(gid)
+    return best, best_label
+
+
+def act_rule_search(sessions, domain, exporter, ip, certain_only=False,
+                    policy_ref=None, cache_key=None):
+    """Find DFW rules whose source or destination groups could apply to an IP."""
+    section("RULE SEARCH")
+    query_net = _net(ip)
+    if query_net is None:
+        err("  Not a valid IP or CIDR: '{}'".format(ip))
+        exporter.stage("rule_search", RULE_SEARCH_HEADERS, [])
+        return []
+
+    say("  Searching for rules that could apply to {}".format(cB(str(query_net))))
+    if certain_only:
+        say("  {}".format(cD("(--certain: hiding 'possible' matches)")))
+    hr()
+
+    records = evaluation_order(sweep_rules(sessions, domain))
+    policy_needle = (policy_ref or "").lower() or None
+    if policy_needle:
+        records = [r for r in records
+                   if policy_needle in "{} {}".format(
+                       r.policy_name, r.policy_id).lower()]
+
+    # Collect all unique group paths referenced by any candidate rule.
+    all_paths = set()
+    for record in records:
+        for path in (record.rule.get(F_SOURCE_GROUPS) or []):
+            if path and path != ANY:
+                all_paths.add(path)
+        for path in (record.rule.get(F_DEST_GROUPS) or []):
+            if path and path != ANY:
+                all_paths.add(path)
+
+    group_expr_index = _build_group_index(sessions, domain, all_paths)
+
+    rows = []
+    display_rows = []
+    for record in records:
+        rule = record.rule
+        src_basis, src_label = _refs_match(
+            rule.get(F_SOURCE_GROUPS), query_net, group_expr_index, certain_only)
+        dst_basis, dst_label = _refs_match(
+            rule.get(F_DEST_GROUPS), query_net, group_expr_index, certain_only)
+
+        # A rule matches when either direction hits.
+        direction = str(rule.get(F_DIRECTION, "IN_OUT")).upper()
+        if direction == "IN":
+            # only destination matters for inbound
+            effective = dst_basis
+        elif direction == "OUT":
+            effective = src_basis
+        else:
+            effective = max(src_basis, dst_basis)
+
+        if effective == _MATCH_NONE:
+            continue
+        # --certain: hide any rule where either side is merely "possible"
+        if certain_only and (src_basis == _MATCH_POSSIBLE
+                             or dst_basis == _MATCH_POSSIBLE):
+            continue
+
+        action = str(rule.get(F_ACTION_FIELD, "?"))
+        rows.append([record.nsx.name, record.origin, record.policy_name,
+                     record.rule_name, action, direction,
+                     src_label or "-", dst_label or "-"])
+        src_colour = (cBG if src_basis == _MATCH_EXACT
+                      else (cBY if src_basis == _MATCH_ANY else cD))
+        dst_colour = (cBG if dst_basis == _MATCH_EXACT
+                      else (cBY if dst_basis == _MATCH_ANY else cD))
+        display_rows.append([
+            _rule_action_colour(action)(action),
+            cB(record.rule_name),
+            record.policy_name,
+            src_colour(src_label or "-"),
+            dst_colour(dst_label or "-"),
+            cD(direction),
+        ])
+
+    say("  {} rule(s) could apply to {}{}".format(
+        cC(str(len(rows))), cB(str(query_net)),
+        cD("  (exact + possible)") if not certain_only else ""))
+    if not rows:
+        say("  {}".format(cD("(no matches)")))
+        exporter.stage("rule_search", RULE_SEARCH_HEADERS, [])
+        return []
+
+    table(["Action", "Rule", "Policy", "Source match", "Dest match", "Dir"],
+          display_rows, indent=4)
+    hr()
+    say("  {}  {}".format(
+        cD("legend:"),
+        cD("exact = IP in group's IPAddressExpression  |  "
+           "possible = tag/segment-based (check at runtime)")))
+    say("  {}  {}".format(
+        cD("next:"),
+        cC("nsxctl trace VM_A VM_B --port N   # confirm what actually decides")))
+
+    remember_names(KIND_RULE, [r.rule_name for r in records]
+                   + [r.rule_id for r in records], cache_key)
+    exporter.stage("rule_search", RULE_SEARCH_HEADERS, rows)
     return rows
