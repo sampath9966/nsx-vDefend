@@ -66,6 +66,9 @@ class FakeState:
         self.fail_times = {}         # path substring -> remaining 503s
         self.require_auth = True
         self.lock = threading.Lock()
+        self.alarms = []
+        self.certs = []
+        self.capacity_data = []
 
     # --- content helpers ---------------------------------------------------
     def add_vm(self, name, external_id=None, tags=None, power="VM_RUNNING"):
@@ -219,6 +222,36 @@ class FakeState:
             "_last_modified_time", 1700000000000) + 60000
         target["_last_modified_user"] = user
         return target
+
+    def add_alarm(self, aid, severity="HIGH", summary="test alarm",
+                  status="OPEN", node_id="mgr-01", event_count=1,
+                  first_reported=1700000000000, last_reported=1700000000000):
+        alarm = {
+            "id": aid, "severity": severity,
+            "feature_display_name": summary, "status": status,
+            "node_resource_display_name": node_id,
+            "event_count": event_count,
+            "first_reported_time": first_reported,
+            "last_reported_time": last_reported,
+        }
+        self.alarms.append(alarm)
+        return alarm
+
+    def add_cert(self, cid, display_name=None, not_after_days=365, used_by=None):
+        import time as _time
+        not_after_ms = int((_time.time() + not_after_days * 86400) * 1000)
+        cert = {
+            "id": cid,
+            "display_name": display_name or cid,
+            "not_after": not_after_ms,
+            "used_by": [{"href": "/api/v1/node/services/{}".format(h)}
+                        for h in (used_by or [])],
+        }
+        self.certs.append(cert)
+        return cert
+
+    def set_capacity(self, usage_list):
+        self.capacity_data = list(usage_list)
 
     def set_hit_count(self, pid, rid, hits, last_update=1700000000000):
         """Drive the hit-count and baseline checks."""
@@ -598,6 +631,22 @@ class _Handler(BaseHTTPRequestHandler):
             if wanted:
                 vms = [v for v in vms if v["display_name"] == wanted[0]]
             return self._send(200, _page(vms, query))
+
+        if path == "/api/v1/alarms":
+            status_f = (query.get("status") or [None])[0]
+            sev_f    = (query.get("severity") or [None])[0]
+            alarms = st.alarms
+            if status_f:
+                alarms = [a for a in alarms if a.get("status") == status_f]
+            if sev_f:
+                alarms = [a for a in alarms if a.get("severity") == sev_f.upper()]
+            return self._send(200, _page(alarms, query))
+
+        if path == "/api/v1/trust-management/certificates":
+            return self._send(200, _page(st.certs, query))
+
+        if path == "/api/v1/capacity/usage":
+            return self._send(200, {"capacity_usage_data": st.capacity_data})
 
         # Anything below is base-relative; a wrong base must 404 so the GM
         # base probe in Nsx.base() is genuinely exercised.

@@ -73,6 +73,11 @@ authoring (dry run unless --enable-writes):
   nsxctl apply changes.yaml         a declarative file of groups and rules
   nsxctl recommend flows.csv --policy app-tier --out-file proposed.json
 
+health:
+  nsxctl alarms --severity critical
+  nsxctl cert list --warn-days 30
+  nsxctl capacity
+
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
   nsxctl drift --fail-on-drift security --out-junit drift.xml
@@ -175,6 +180,7 @@ def build_parser():
     from .snapshot import register_snapshot
     from .tag import register_tag
     from .trace import register_trace
+    from .ops import register_ops
     from .vm import register_vm
 
     global_parent = argparse.ArgumentParser(add_help=False)
@@ -197,7 +203,7 @@ def build_parser():
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
                      register_recommend, register_vm,
-                     register_shell):
+                     register_ops, register_shell):
         register(sub, parents)
     return parser
 

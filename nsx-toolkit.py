@@ -54,7 +54,7 @@ import xml.sax.saxutils as saxutils
 # version.py  --  Tool identity. Single source of truth for name and version strings.
 # ==========================================================================
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 VERSION_DATE = "2026-09-11"
 TOOL_NAME = "NSX Toolkit"
 TOOL_TAGLINE = "Zero Trust Segmentation · Groups, Tags & DFW"
@@ -536,6 +536,9 @@ PATH_TRACEFLOW_ONE = "/api/v1/traceflow/{tid}"
 PATH_TRACEFLOW_OBSERVATIONS = "/api/v1/traceflow/{tid}/observations"
 PATH_SESSION_CREATE = "/api/session/create"
 PATH_NODE_VERSION = "/api/v1/node/version"
+PATH_ALARMS   = "/api/v1/alarms"
+PATH_CERTS    = "/api/v1/trust-management/certificates"
+PATH_CAPACITY = "/api/v1/capacity/usage"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -635,6 +638,24 @@ F_TARGET_TYPE = "target_type"
 F_IS_VALID = "is_valid"
 F_NODE_VERSION = "node_version"
 F_PRODUCT_VERSION = "product_version"
+# Alarm fields
+F_SEVERITY = "severity"
+F_ALARM_STATUS = "status"
+F_FEATURE_DISPLAY_NAME = "feature_display_name"
+F_EVENT_COUNT = "event_count"
+F_FIRST_REPORTED_TIME = "first_reported_time"
+F_LAST_REPORTED_TIME = "last_reported_time"
+# Certificate fields
+F_NOT_AFTER = "not_after"
+F_USED_BY_LINKS = "used_by"
+F_LINK_HREF = "href"
+# Capacity fields
+F_CAPACITY_USAGE_DATA = "capacity_usage_data"
+F_USAGE_TYPE = "usage_type"
+F_CURRENT_USAGE_COUNT = "current_usage_count"
+F_MAX_SUPPORTED_COUNT = "max_supported_count"
+F_MIN_THRESHOLD_PERCENT = "min_threshold_percent"
+F_MAX_THRESHOLD_PERCENT = "max_threshold_percent"
 
 # --- Expression / criteria types -------------------------------------------
 RT = "resource_type"
@@ -1752,6 +1773,21 @@ class Nsx:
             if v.get(F_EXTERNAL_ID) == ext_id:
                 return v
         return None
+
+    # --- operational health ------------------------------------------------
+    def get_alarms(self, status="OPEN", severity=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if status:
+            params["status"] = status
+        if severity:
+            params["severity"] = severity.upper()
+        return self.get_all(PATH_ALARMS, params=params)
+
+    def get_certificates(self):
+        return self.get_all(PATH_CERTS)
+
+    def get_capacity(self):
+        return self.get(PATH_CAPACITY)
 
     def refresh_vm(self, vm):
         """Re-read one VM straight from NSX, bypassing the cache. Used
@@ -8513,6 +8549,174 @@ def gm_only_estate(sessions):
 
 
 # ==========================================================================
+# actions/ops.py  --  Operational health: alarms, certificates, capacity.
+# ==========================================================================
+
+ALARM_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+ALARM_HEADERS = [
+    "manager", "severity", "summary", "node", "count", "first_seen", "last_seen",
+]
+CERT_HEADERS = ["manager", "name", "expires", "days_left", "used_by", "status"]
+CAP_HEADERS  = ["manager", "resource", "used", "limit", "pct", "status"]
+
+
+def _ts_ms_to_date(ms):
+    try:
+        return datetime.datetime.utcfromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _days_until_ms(ms):
+    try:
+        exp = datetime.datetime.utcfromtimestamp(int(ms) / 1000)
+        return (exp - datetime.datetime.utcnow()).days
+    except Exception:
+        return None
+
+
+def _color_alarm(row):
+    sev = row[1]
+    if sev == "CRITICAL":
+        return [cBR(c) for c in row]
+    if sev == "HIGH":
+        return [cBY(c) for c in row]
+    return row
+
+
+def act_alarms(sessions, exporter, severity=None, show_all=False):
+    """Collect alarms from every manager, dedup by id, sort by severity."""
+    status = None if show_all else "OPEN"
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_alarms(status=status, severity=severity),
+        label="Fetching alarms",
+    )
+    seen, rows = set(), []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for alarm in (result or []):
+            aid = alarm.get(F_ID, "")
+            if aid and aid in seen:
+                continue
+            seen.add(aid)
+            rows.append([
+                s.name,
+                alarm.get(F_SEVERITY, ""),
+                alarm.get(F_FEATURE_DISPLAY_NAME,
+                          alarm.get("summary", alarm.get("alarm_source", ""))),
+                alarm.get("node_resource_display_name",
+                          alarm.get("node_id", "")),
+                str(alarm.get(F_EVENT_COUNT, 1)),
+                _ts_ms_to_date(alarm.get(F_FIRST_REPORTED_TIME, 0)),
+                _ts_ms_to_date(alarm.get(F_LAST_REPORTED_TIME, 0)),
+            ])
+    rows.sort(key=lambda r: ALARM_ORDER.get(r[1], 99))
+    section("Alarms ({})".format(len(rows)))
+    if rows:
+        table(ALARM_HEADERS, [_color_alarm(r) for r in rows])
+    else:
+        say("  No alarms found.")
+    exporter.stage("alarms", ALARM_HEADERS, rows)
+
+
+def act_cert_list(sessions, exporter, warn_days=90, expired_only=False):
+    """List TLS certificates across all managers with expiry status."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_certificates(),
+        label="Fetching certificates",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for cert in (result or []):
+            days = _days_until_ms(cert.get(F_NOT_AFTER, 0))
+            if days is None:
+                status, display = "UNKNOWN", cD("UNKNOWN")
+            elif days <= 0:
+                status, display = "EXPIRED", cBR("EXPIRED")
+            elif days <= 30:
+                status, display = "CRITICAL", cBR("CRITICAL")
+            elif days <= warn_days:
+                status, display = "WARNING", cBY("WARNING")
+            else:
+                status, display = "OK", cBG("OK")
+            if expired_only and status not in ("EXPIRED", "CRITICAL"):
+                continue
+            used = ", ".join(
+                lnk.get(F_LINK_HREF, "").rsplit("/", 1)[-1]
+                for lnk in (cert.get(F_USED_BY_LINKS) or [])
+            ) or "-"
+            rows.append([
+                s.name,
+                cert.get(F_DISPLAY_NAME, cert.get(F_ID, "")),
+                _ts_ms_to_date(cert.get(F_NOT_AFTER, 0)),
+                str(days if days is not None else "?"),
+                used,
+                display,
+            ])
+    section("Certificates ({})".format(len(rows)))
+    if rows:
+        table(CERT_HEADERS, rows)
+    else:
+        say("  No certificates found.")
+    # Store plain status strings (not colored) for structured export
+    plain_rows = [r[:-1] + [r[-1].strip("\x1b[0m").strip()] for r in rows]
+    exporter.stage("certificates", CERT_HEADERS, plain_rows)
+
+
+def act_capacity(sessions, exporter):
+    """Show per-resource utilisation across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_capacity(),
+        label="Fetching capacity",
+    )
+    all_rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        data = (result or {}).get(F_CAPACITY_USAGE_DATA, [])
+        rows = []
+        for entry in data:
+            used  = entry.get(F_CURRENT_USAGE_COUNT, 0)
+            limit = entry.get(F_MAX_SUPPORTED_COUNT, 0)
+            pct   = int(used * 100 / limit) if limit else 0
+            max_thr = entry.get(F_MAX_THRESHOLD_PERCENT, 90)
+            min_thr = entry.get(F_MIN_THRESHOLD_PERCENT, 75)
+            if pct >= max_thr:
+                display = cBR("HIGH")
+            elif pct >= min_thr:
+                display = cBY("WARN")
+            else:
+                display = cBG("OK")
+            rows.append([
+                s.name,
+                entry.get(F_USAGE_TYPE, ""),
+                str(used),
+                str(limit),
+                "{}%".format(pct),
+                display,
+            ])
+            all_rows.append(rows[-1])
+        section("{} capacity".format(s.name))
+        if rows:
+            table(CAP_HEADERS, rows)
+        else:
+            say("  No capacity data.")
+    exporter.stage("capacity", CAP_HEADERS, all_rows)
+
+
+# ==========================================================================
 # actions/recommend.py  --  Turn observed flows into a reviewable ruleset proposal.
 # ==========================================================================
 
@@ -9686,6 +9890,11 @@ authoring (dry run unless --enable-writes):
   nsxctl apply changes.yaml         a declarative file of groups and rules
   nsxctl recommend flows.csv --policy app-tier --out-file proposed.json
 
+health:
+  nsxctl alarms --severity critical
+  nsxctl cert list --warn-days 30
+  nsxctl capacity
+
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
   nsxctl drift --fail-on-drift security --out-junit drift.xml
@@ -9789,6 +9998,7 @@ def build_parser():
     pass
     pass
     pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -9810,7 +10020,7 @@ def build_parser():
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
                      register_recommend, register_vm,
-                     register_shell):
+                     register_ops, register_shell):
         register(sub, parents)
     return parser
 
@@ -10936,6 +11146,78 @@ def cmd_service_list(args, ctx):
 
 def cmd_service_show(args, ctx):
     act_service_show(ctx.sessions, args.domain, ctx.exporter, args.name)
+    return 0
+
+
+# ==========================================================================
+# commands/ops.py  --  Commands: alarms, cert, capacity.
+# ==========================================================================
+
+def register_ops(sub, parents):
+    # ---- alarms -------------------------------------------------------
+    p = add_command(sub, parents, "alarms",
+                    "Show open NSX alarms.",
+                    description="Collect alarms from every manager and display "
+                                "them sorted by severity. Deduplicates by alarm "
+                                "id when a GM and LMs echo the same event.",
+                    epilog="examples:\n"
+                           "  nsxctl alarms\n"
+                           "  nsxctl alarms --severity critical\n"
+                           "  nsxctl alarms --all")
+    p.add_argument("--severity", metavar="LEVEL",
+                   choices=["critical", "high", "medium", "low"],
+                   help="Show only alarms at this severity.")
+    p.add_argument("--all", dest="show_all", action="store_true",
+                   help="Include resolved alarms (default: OPEN only).")
+    p.set_defaults(func=cmd_alarms)
+
+    # ---- cert ---------------------------------------------------------
+    c = add_command(sub, parents, "cert",
+                    "TLS certificate expiry.",
+                    description="Certificate management subcommands.")
+    csub = c.add_subparsers(dest="cert_action", metavar="<action>")
+    ls = add_action(csub, parents, "list",
+                    "List certificates and expiry status.",
+                    description="List TLS certificates across every manager with "
+                                "color-coded expiry status.",
+                    epilog="examples:\n"
+                           "  nsxctl cert list\n"
+                           "  nsxctl cert list --warn-days 30\n"
+                           "  nsxctl cert list --expired")
+    ls.add_argument("--warn-days", type=int, default=90, metavar="N",
+                    help="Highlight certs expiring within N days (default: 90).")
+    ls.add_argument("--expired", action="store_true",
+                    help="Show only expired or critically-expiring certs.")
+    ls.set_defaults(func=cmd_cert_list)
+    c.set_defaults(func=lambda a, ctx: c.print_help())
+
+    # ---- capacity -----------------------------------------------------
+    q = add_command(sub, parents, "capacity",
+                    "Show NSX resource utilisation.",
+                    description="Per-resource utilisation across every manager. "
+                                "Resources approaching their limit are highlighted.",
+                    epilog="examples:\n"
+                           "  nsxctl capacity\n"
+                           "  nsxctl capacity --out-csv cap.csv")
+    q.set_defaults(func=cmd_capacity)
+
+
+def cmd_alarms(args, ctx):
+    act_alarms(ctx.sessions, ctx.exporter,
+               severity=getattr(args, "severity", None),
+               show_all=getattr(args, "show_all", False))
+    return 0
+
+
+def cmd_cert_list(args, ctx):
+    act_cert_list(ctx.sessions, ctx.exporter,
+                  warn_days=getattr(args, "warn_days", 90),
+                  expired_only=getattr(args, "expired", False))
+    return 0
+
+
+def cmd_capacity(args, ctx):
+    act_capacity(ctx.sessions, ctx.exporter)
     return 0
 
 

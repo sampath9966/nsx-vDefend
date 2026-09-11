@@ -65,6 +65,9 @@ PATH_TRACEFLOW_ONE = "/api/v1/traceflow/{tid}"
 PATH_TRACEFLOW_OBSERVATIONS = "/api/v1/traceflow/{tid}/observations"
 PATH_SESSION_CREATE = "/api/session/create"
 PATH_NODE_VERSION = "/api/v1/node/version"
+PATH_ALARMS   = "/api/v1/alarms"
+PATH_CERTS    = "/api/v1/trust-management/certificates"
+PATH_CAPACITY = "/api/v1/capacity/usage"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -164,6 +167,24 @@ F_TARGET_TYPE = "target_type"
 F_IS_VALID = "is_valid"
 F_NODE_VERSION = "node_version"
 F_PRODUCT_VERSION = "product_version"
+# Alarm fields
+F_SEVERITY = "severity"
+F_ALARM_STATUS = "status"
+F_FEATURE_DISPLAY_NAME = "feature_display_name"
+F_EVENT_COUNT = "event_count"
+F_FIRST_REPORTED_TIME = "first_reported_time"
+F_LAST_REPORTED_TIME = "last_reported_time"
+# Certificate fields
+F_NOT_AFTER = "not_after"
+F_USED_BY_LINKS = "used_by"
+F_LINK_HREF = "href"
+# Capacity fields
+F_CAPACITY_USAGE_DATA = "capacity_usage_data"
+F_USAGE_TYPE = "usage_type"
+F_CURRENT_USAGE_COUNT = "current_usage_count"
+F_MAX_SUPPORTED_COUNT = "max_supported_count"
+F_MIN_THRESHOLD_PERCENT = "min_threshold_percent"
+F_MAX_THRESHOLD_PERCENT = "max_threshold_percent"
 
 # --- Expression / criteria types -------------------------------------------
 RT = "resource_type"

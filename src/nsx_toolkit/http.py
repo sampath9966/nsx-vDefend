@@ -42,6 +42,9 @@ from .api import (
     PARAM_CURSOR,
     PARAM_DISPLAY_NAME,
     PARAM_PAGE_SIZE,
+    PATH_ALARMS,
+    PATH_CAPACITY,
+    PATH_CERTS,
     PATH_FABRIC_VMS,
     PATH_NODE_VERSION,
     PATH_SESSION_CREATE,
@@ -478,6 +481,21 @@ class Nsx:
             if v.get(F_EXTERNAL_ID) == ext_id:
                 return v
         return None
+
+    # --- operational health ------------------------------------------------
+    def get_alarms(self, status="OPEN", severity=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if status:
+            params["status"] = status
+        if severity:
+            params["severity"] = severity.upper()
+        return self.get_all(PATH_ALARMS, params=params)
+
+    def get_certificates(self):
+        return self.get_all(PATH_CERTS)
+
+    def get_capacity(self):
+        return self.get(PATH_CAPACITY)
 
     def refresh_vm(self, vm):
         """Re-read one VM straight from NSX, bypassing the cache. Used
