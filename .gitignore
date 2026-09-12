@@ -13,3 +13,6 @@ inventory.json
 taxonomy.json
 credentials.env
 *.log
+
+# Local Claude Code instructions -- not part of the public repo
+CLAUDE.md
