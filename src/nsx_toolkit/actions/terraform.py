@@ -34,7 +34,6 @@ from ..api import (
     F_LOGGED,
     F_MEMBER_TYPE,
     F_OPERATOR,
-    F_PATH,
     F_PATHS,
     F_SCOPE,
     F_SEQUENCE_NUMBER,
@@ -49,8 +48,6 @@ from ..api import (
     RT_NESTED,
     RT_PATHEXPR,
     p_groups,
-    p_sec_policies,
-    p_sec_rules,
 )
 from ..errors import NsxError
 from ..output import say, section

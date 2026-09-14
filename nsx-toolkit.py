@@ -54,7 +54,7 @@ import xml.sax.saxutils as saxutils
 # version.py  --  Tool identity. Single source of truth for name and version strings.
 # ==========================================================================
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 VERSION_DATE = "2026-09-14"
 TOOL_NAME = "NSX Toolkit"
 TOOL_TAGLINE = "Zero Trust Segmentation · Groups, Tags & DFW"
@@ -539,6 +539,14 @@ PATH_NODE_VERSION = "/api/v1/node/version"
 PATH_ALARMS   = "/api/v1/alarms"
 PATH_CERTS    = "/api/v1/trust-management/certificates"
 PATH_CAPACITY = "/api/v1/capacity/usage"
+# Network topology — policy-API paths (relative to a base)
+PATH_SEGMENTS      = "/segments"
+PATH_TIER0S        = "/tier-0s"
+PATH_TIER0_LS      = "/tier-0s/{t0id}/locale-services"
+PATH_BGP_NEIGHBORS = "/tier-0s/{t0id}/locale-services/{lsid}/bgp/neighbors/status"
+# Fabric/management-plane paths (absolute)
+PATH_TRANSPORT_NODES = "/api/v1/transport-nodes"
+PATH_TN_STATUS       = "/api/v1/transport-nodes/{tnid}/status"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -656,6 +664,21 @@ F_CURRENT_USAGE_COUNT = "current_usage_count"
 F_MAX_SUPPORTED_COUNT = "max_supported_count"
 F_MIN_THRESHOLD_PERCENT = "min_threshold_percent"
 F_MAX_THRESHOLD_PERCENT = "max_threshold_percent"
+# Segment fields
+F_SUBNETS           = "subnets"
+F_CONNECTIVITY_PATH = "connectivity_path"
+F_VLAN_IDS          = "vlan_ids"
+F_GATEWAY_ADDRESS   = "gateway_address"
+# Transport-node / edge fields
+F_ADMIN_STATE              = "admin_state"
+F_NODE_DEPLOYMENT_STATUS   = "host_node_deployment_status"
+F_CONTROL_STATUS           = "control_connection_status"
+# BGP fields
+F_NEIGHBOR_ADDRESS  = "neighbor_address"
+F_REMOTE_AS_NUM     = "remote_as_num"
+F_CONNECTION_STATE  = "connection_state"
+F_TIME_SINCE_ESTAB  = "time_since_established"
+F_PREFIXES_RECEIVED = "prefixes_received"
 
 # --- Expression / criteria types -------------------------------------------
 RT = "resource_type"
@@ -763,6 +786,26 @@ def p_rule_stats(base, domain, pid, rid):
 
 def p_domains(base):
     return base + PATH_DOMAINS
+
+
+def p_segments(base):
+    return base + PATH_SEGMENTS
+
+
+def p_tier0s(base):
+    return base + PATH_TIER0S
+
+
+def p_tier0_locale_services(base, t0id):
+    return base + PATH_TIER0_LS.format(t0id=t0id)
+
+
+def p_bgp_neighbors(base, t0id, lsid):
+    return base + PATH_BGP_NEIGHBORS.format(t0id=t0id, lsid=lsid)
+
+
+def p_transport_node_status(tnid):
+    return PATH_TN_STATUS.format(tnid=tnid)
 
 
 def group_id_from_path(path):
@@ -1788,6 +1831,46 @@ class Nsx:
 
     def get_capacity(self):
         return self.get(PATH_CAPACITY)
+
+    def get_segments(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_segments(self.base(domain)))
+        except NsxError:
+            return []
+
+    def get_tier0s(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_tier0s(self.base(domain)))
+        except NsxError:
+            return []
+
+    def get_locale_services(self, t0id, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_tier0_locale_services(self.base(domain), t0id))
+        except NsxError:
+            return []
+
+    def get_bgp_neighbors(self, t0id, lsid, domain=DEFAULT_DOMAIN):
+        try:
+            result = self.get(p_bgp_neighbors(self.base(domain), t0id, lsid))
+            return (result or {}).get(F_RESULTS, [])
+        except NsxError:
+            return []
+
+    def get_transport_nodes(self, node_type=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if node_type:
+            params["node_type"] = node_type
+        try:
+            return self.get_all(PATH_TRANSPORT_NODES, params=params)
+        except NsxError:
+            return []
+
+    def get_transport_node_status(self, tnid):
+        try:
+            return self.get(p_transport_node_status(tnid))
+        except NsxError:
+            return {}
 
     def refresh_vm(self, vm):
         """Re-read one VM straight from NSX, bypassing the cache. Used
@@ -9668,6 +9751,159 @@ def act_terraform_export(sessions, out_dir, domain="default",
 
 
 # ==========================================================================
+# actions/topo.py  --  Network topology: segments, edge transport nodes, BGP neighbours.
+# ==========================================================================
+
+SEG_HEADERS  = ["manager", "name", "type", "vlan", "subnet", "connected_to"]
+EDGE_HEADERS = ["manager", "name", "admin_state", "status"]
+BGP_HEADERS  = ["manager", "tier0", "neighbor", "remote_as",
+                "state", "uptime_s", "prefixes_rx"]
+
+
+def _seg_type(seg):
+    vlan = seg.get(F_VLAN_IDS, [])
+    if vlan:
+        return "vlan"
+    return "overlay"
+
+
+def _connected_to(seg):
+    path = seg.get(F_CONNECTIVITY_PATH) or ""
+    if not path:
+        return "standalone"
+    return path.rsplit("/", 1)[-1]
+
+
+def _first_subnet(seg):
+    for sub in (seg.get(F_SUBNETS) or []):
+        addr = sub.get(F_GATEWAY_ADDRESS, "")
+        if addr:
+            return addr
+    return ""
+
+
+def act_segment_list(sessions, domain, exporter, contains=None, seg_type=None):
+    """List overlay and VLAN-backed segments across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_segments(domain),
+        label="Fetching segments",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for seg in (result or []):
+            name = seg.get(F_DISPLAY_NAME, seg.get(F_ID, ""))
+            if contains and contains.lower() not in name.lower():
+                continue
+            stype = _seg_type(seg)
+            if seg_type and stype != seg_type:
+                continue
+            vlan = ", ".join(str(v) for v in (seg.get(F_VLAN_IDS) or []))
+            rows.append([
+                s.name,
+                name,
+                stype,
+                vlan or "-",
+                _first_subnet(seg) or "-",
+                _connected_to(seg),
+            ])
+    section("Segments ({})".format(len(rows)))
+    if rows:
+        table(SEG_HEADERS, rows)
+    else:
+        say("  No segments found.")
+    exporter.stage("segments", SEG_HEADERS, rows)
+
+
+def act_edge_list(sessions, exporter):
+    """List edge transport nodes and their deployment status."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_transport_nodes(node_type="EdgeNode"),
+        label="Fetching edge nodes",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for node in (result or []):
+            nid = node.get(F_ID, "")
+            name = node.get(F_DISPLAY_NAME, nid)
+            admin = node.get(F_ADMIN_STATE, "")
+            status_obj = s.get_transport_node_status(nid)
+            deploy_status = status_obj.get(F_NODE_DEPLOYMENT_STATUS, "")
+            ctrl = (status_obj.get(F_CONTROL_STATUS) or {}).get("status", "")
+            status_str = deploy_status or ctrl or "UNKNOWN"
+            admin_display = cBG(admin) if admin == "UP" else cBR(admin)
+            rows.append([s.name, name, admin_display, status_str])
+    section("Edge nodes ({})".format(len(rows)))
+    if rows:
+        table(EDGE_HEADERS, rows)
+    else:
+        say("  No edge nodes found.")
+    plain_rows = [[r[0], r[1], r[2].strip("\x1b[0m").strip(), r[3]] for r in rows]
+    exporter.stage("edges", EDGE_HEADERS, plain_rows)
+
+
+def act_bgp(sessions, domain, exporter, tier0=None, down_only=False):
+    """Show BGP neighbour state for all T0 gateways."""
+    all_rows = []
+    for s in sessions:
+        t0s = s.get_tier0s(domain)
+        for t0 in t0s:
+            t0id = t0.get(F_ID, "")
+            t0name = t0.get(F_DISPLAY_NAME, t0id)
+            if tier0 and tier0.lower() not in t0name.lower():
+                continue
+            locale_services = s.get_locale_services(t0id, domain)
+            if not locale_services:
+                continue
+            neighbors = []
+            ls_fetched = parallel_run(
+                locale_services,
+                lambda ls, _s=s, _t=t0id: _s.get_bgp_neighbors(
+                    _t, ls.get(F_ID, ""), domain),
+                label="BGP on {}".format(t0name),
+                key=lambda ls: ls.get(F_ID, ""),
+            )
+            for ls in locale_services:
+                lsid = ls.get(F_ID, "")
+                nbrs = ls_fetched.get(lsid)
+                if isinstance(nbrs, Exception) or not nbrs:
+                    continue
+                neighbors.extend(nbrs)
+            rows = []
+            for nb in neighbors:
+                state = nb.get(F_CONNECTION_STATE, "")
+                if down_only and state == "ESTABLISHED":
+                    continue
+                state_display = cBG(state) if state == "ESTABLISHED" else cBR(state)
+                rows.append([
+                    s.name,
+                    t0name,
+                    nb.get(F_NEIGHBOR_ADDRESS, ""),
+                    nb.get(F_REMOTE_AS_NUM, ""),
+                    state_display,
+                    str(nb.get(F_TIME_SINCE_ESTAB, 0)),
+                    str(nb.get(F_PREFIXES_RECEIVED, 0)),
+                ])
+                all_rows.append(rows[-1])
+            if rows:
+                section("{} — BGP on {}".format(s.name, t0name))
+                table(BGP_HEADERS, rows)
+    if not all_rows:
+        say("  No BGP neighbours found.")
+    plain_rows = [r[:4] + [r[4].strip("\x1b[0m").strip()] + r[5:] for r in all_rows]
+    exporter.stage("bgp", BGP_HEADERS, plain_rows)
+
+
+# ==========================================================================
 # wizard.py  --  First-run setup.
 # ==========================================================================
 
@@ -10220,6 +10456,9 @@ health:
   nsxctl cert list --warn-days 30
   nsxctl capacity
   nsxctl terraform export --out ./tf
+  nsxctl segment list
+  nsxctl edge list
+  nsxctl bgp --down-only
 
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
@@ -10326,6 +10565,7 @@ def build_parser():
     pass
     pass
     pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -10347,7 +10587,8 @@ def build_parser():
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
                      register_recommend, register_vm,
-                     register_ops, register_terraform, register_shell):
+                     register_ops, register_terraform, register_topo,
+                     register_shell):
         register(sub, parents)
     return parser
 
@@ -12207,6 +12448,59 @@ def cmd_terraform_export(args, ctx):
     types = [t.strip() for t in args.types.split(",") if t.strip()]
     act_terraform_export(ctx.sessions, args.out,
                          domain=getattr(args, "domain", "default"), types=types)
+    return 0
+
+
+# ==========================================================================
+# commands/topo.py  --  Commands: segment, edge, bgp.
+# ==========================================================================
+
+def register_topo(sub, parents):
+    # --- segment ---
+    seg = add_command(sub, parents, "segment", "Network segments.")
+    ssub = seg.add_subparsers(dest="seg_action", metavar="<action>")
+    ls = add_action(ssub, parents, "list", "List overlay and VLAN-backed segments.")
+    ls.add_argument("--contains", metavar="TEXT",
+                    help="Filter segments by name substring.")
+    ls.add_argument("--type", dest="seg_type", choices=["overlay", "vlan"],
+                    help="Show only overlay or VLAN-backed segments.")
+    ls.set_defaults(func=cmd_segment_list)
+    seg.set_defaults(func=lambda a, ctx: seg.print_help())
+
+    # --- edge ---
+    edge = add_command(sub, parents, "edge", "Edge transport nodes.")
+    esub = edge.add_subparsers(dest="edge_action", metavar="<action>")
+    el = add_action(esub, parents, "list", "List edge nodes and deployment status.")
+    el.set_defaults(func=cmd_edge_list)
+    edge.set_defaults(func=lambda a, ctx: edge.print_help())
+
+    # --- bgp ---
+    bgp = add_command(sub, parents, "bgp", "BGP neighbour status on T0 gateways.")
+    bgp.add_argument("--tier-0", metavar="NAME",
+                     help="Limit to one T0 gateway by name.")
+    bgp.add_argument("--down-only", action="store_true",
+                     help="Show only non-ESTABLISHED neighbours.")
+    bgp.set_defaults(func=cmd_bgp)
+
+
+def cmd_segment_list(args, ctx):
+    act_segment_list(ctx.sessions, getattr(args, "domain", "default"),
+                     ctx.exporter,
+                     contains=getattr(args, "contains", None),
+                     seg_type=getattr(args, "seg_type", None))
+    return 0
+
+
+def cmd_edge_list(args, ctx):
+    act_edge_list(ctx.sessions, ctx.exporter)
+    return 0
+
+
+def cmd_bgp(args, ctx):
+    act_bgp(ctx.sessions, getattr(args, "domain", "default"),
+            ctx.exporter,
+            tier0=getattr(args, "tier_0", None),
+            down_only=getattr(args, "down_only", False))
     return 0
 
 

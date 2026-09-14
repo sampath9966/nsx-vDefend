@@ -78,6 +78,9 @@ health:
   nsxctl cert list --warn-days 30
   nsxctl capacity
   nsxctl terraform export --out ./tf
+  nsxctl segment list
+  nsxctl edge list
+  nsxctl bgp --down-only
 
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
@@ -182,6 +185,7 @@ def build_parser():
     from .snapshot import register_snapshot
     from .tag import register_tag
     from .terraform import register_terraform
+    from .topo import register_topo
     from .trace import register_trace
     from .vm import register_vm
 
@@ -205,7 +209,8 @@ def build_parser():
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
                      register_recommend, register_vm,
-                     register_ops, register_terraform, register_shell):
+                     register_ops, register_terraform, register_topo,
+                     register_shell):
         register(sub, parents)
     return parser
 

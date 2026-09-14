@@ -48,8 +48,14 @@ from .api import (
     PATH_FABRIC_VMS,
     PATH_NODE_VERSION,
     PATH_SESSION_CREATE,
+    PATH_TRANSPORT_NODES,
     ROLE_GM,
+    p_bgp_neighbors,
     p_groups,
+    p_segments,
+    p_tier0_locale_services,
+    p_tier0s,
+    p_transport_node_status,
     parse_version,
     project_base,
 )
@@ -496,6 +502,46 @@ class Nsx:
 
     def get_capacity(self):
         return self.get(PATH_CAPACITY)
+
+    def get_segments(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_segments(self.base(domain)))
+        except NsxError:
+            return []
+
+    def get_tier0s(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_tier0s(self.base(domain)))
+        except NsxError:
+            return []
+
+    def get_locale_services(self, t0id, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_tier0_locale_services(self.base(domain), t0id))
+        except NsxError:
+            return []
+
+    def get_bgp_neighbors(self, t0id, lsid, domain=DEFAULT_DOMAIN):
+        try:
+            result = self.get(p_bgp_neighbors(self.base(domain), t0id, lsid))
+            return (result or {}).get(F_RESULTS, [])
+        except NsxError:
+            return []
+
+    def get_transport_nodes(self, node_type=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if node_type:
+            params["node_type"] = node_type
+        try:
+            return self.get_all(PATH_TRANSPORT_NODES, params=params)
+        except NsxError:
+            return []
+
+    def get_transport_node_status(self, tnid):
+        try:
+            return self.get(p_transport_node_status(tnid))
+        except NsxError:
+            return {}
 
     def refresh_vm(self, vm):
         """Re-read one VM straight from NSX, bypassing the cache. Used

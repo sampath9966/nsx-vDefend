@@ -13,7 +13,6 @@ from nsx_toolkit.actions.terraform import (
     act_terraform_export,
 )
 
-
 # --- unit helpers -----------------------------------------------------------
 
 def test_tf_id_sanitize():

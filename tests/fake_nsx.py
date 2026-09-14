@@ -27,6 +27,7 @@ them and a stub that just says yes would prove nothing:
 """
 
 import json
+import re
 import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -69,6 +70,12 @@ class FakeState:
         self.alarms = []
         self.certs = []
         self.capacity_data = []
+        self.segments = []
+        self.tier0s = []
+        self.locale_services = {}    # {t0id: [ls, ...]}
+        self.bgp_neighbors = {}      # {(t0id, lsid): [neighbor, ...]}
+        self.transport_nodes = []
+        self.tn_status = {}          # {tnid: status_dict}
 
     # --- content helpers ---------------------------------------------------
     def add_vm(self, name, external_id=None, tags=None, power="VM_RUNNING"):
@@ -252,6 +259,50 @@ class FakeState:
 
     def set_capacity(self, usage_list):
         self.capacity_data = list(usage_list)
+
+    def add_segment(self, sid, display_name=None, seg_type="ROUTED",
+                    gateway="10.0.0.1/24", connectivity_path=None, vlan_ids=None):
+        seg = {"id": sid,
+               "display_name": display_name or sid,
+               "type": seg_type,
+               "subnets": [{"gateway_address": gateway}],
+               "connectivity_path": connectivity_path,
+               "vlan_ids": vlan_ids or []}
+        self.segments.append(seg)
+        return seg
+
+    def add_tier0(self, t0id, display_name=None):
+        t0 = {"id": t0id, "display_name": display_name or t0id}
+        self.tier0s.append(t0)
+        self.locale_services.setdefault(t0id, [])
+        return t0
+
+    def add_locale_service(self, t0id, lsid, display_name=None):
+        ls = {"id": lsid, "display_name": display_name or lsid}
+        self.locale_services.setdefault(t0id, []).append(ls)
+        return ls
+
+    def add_bgp_neighbor(self, t0id, lsid, addr, remote_as="65001",
+                         state="ESTABLISHED", uptime=0, prefixes=0):
+        n = {"neighbor_address": addr,
+             "remote_as_num": remote_as,
+             "connection_state": state,
+             "time_since_established": uptime,
+             "prefixes_received": prefixes}
+        self.bgp_neighbors.setdefault((t0id, lsid), []).append(n)
+        return n
+
+    def add_edge_node(self, eid, display_name=None, admin_state="UP",
+                      status="NODE_READY"):
+        node = {"id": eid,
+                "display_name": display_name or eid,
+                "node_type": "EdgeNode",
+                "admin_state": admin_state}
+        self.transport_nodes.append(node)
+        self.tn_status[eid] = {
+            "host_node_deployment_status": status,
+            "control_connection_status": {"status": "UP"}}
+        return node
 
     def set_hit_count(self, pid, rid, hits, last_update=1700000000000):
         """Drive the hit-count and baseline checks."""
@@ -648,6 +699,17 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/v1/capacity/usage":
             return self._send(200, {"capacity_usage_data": st.capacity_data})
 
+        if path == "/api/v1/transport-nodes":
+            node_type = (query.get("node_type") or [None])[0]
+            nodes = st.transport_nodes
+            if node_type:
+                nodes = [n for n in nodes if n.get("node_type") == node_type]
+            return self._send(200, _page(nodes, query))
+
+        m = re.match(r"^/api/v1/transport-nodes/([^/]+)/status$", path)
+        if m:
+            return self._send(200, st.tn_status.get(m.group(1), {}))
+
         # Anything below is base-relative; a wrong base must 404 so the GM
         # base probe in Nsx.base() is genuinely exercised.
         if not path.startswith(st.base):
@@ -664,6 +726,23 @@ class _Handler(BaseHTTPRequestHandler):
         if rel == "/services":
             return self._send(200, _page(st.services, query))
 
+        if rel == "/segments":
+            return self._send(200, _page(st.segments, query))
+
+        if rel == "/tier-0s":
+            return self._send(200, _page(st.tier0s, query))
+
+        m = re.match(r"^/tier-0s/([^/]+)/locale-services$", rel)
+        if m:
+            t0id = m.group(1)
+            return self._send(200, _page(st.locale_services.get(t0id, []), query))
+
+        m = re.match(
+            r"^/tier-0s/([^/]+)/locale-services/([^/]+)/bgp/neighbors/status$", rel)
+        if m:
+            t0id, lsid = m.group(1), m.group(2)
+            neighbors = st.bgp_neighbors.get((t0id, lsid), [])
+            return self._send(200, {"results": neighbors})
 
         parts = [p for p in rel.split("/") if p]
         # domains/{domain}/groups[/{gid}[/members/virtual-machines]]

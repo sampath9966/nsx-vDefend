@@ -68,6 +68,14 @@ PATH_NODE_VERSION = "/api/v1/node/version"
 PATH_ALARMS   = "/api/v1/alarms"
 PATH_CERTS    = "/api/v1/trust-management/certificates"
 PATH_CAPACITY = "/api/v1/capacity/usage"
+# Network topology — policy-API paths (relative to a base)
+PATH_SEGMENTS      = "/segments"
+PATH_TIER0S        = "/tier-0s"
+PATH_TIER0_LS      = "/tier-0s/{t0id}/locale-services"
+PATH_BGP_NEIGHBORS = "/tier-0s/{t0id}/locale-services/{lsid}/bgp/neighbors/status"
+# Fabric/management-plane paths (absolute)
+PATH_TRANSPORT_NODES = "/api/v1/transport-nodes"
+PATH_TN_STATUS       = "/api/v1/transport-nodes/{tnid}/status"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -185,6 +193,21 @@ F_CURRENT_USAGE_COUNT = "current_usage_count"
 F_MAX_SUPPORTED_COUNT = "max_supported_count"
 F_MIN_THRESHOLD_PERCENT = "min_threshold_percent"
 F_MAX_THRESHOLD_PERCENT = "max_threshold_percent"
+# Segment fields
+F_SUBNETS           = "subnets"
+F_CONNECTIVITY_PATH = "connectivity_path"
+F_VLAN_IDS          = "vlan_ids"
+F_GATEWAY_ADDRESS   = "gateway_address"
+# Transport-node / edge fields
+F_ADMIN_STATE              = "admin_state"
+F_NODE_DEPLOYMENT_STATUS   = "host_node_deployment_status"
+F_CONTROL_STATUS           = "control_connection_status"
+# BGP fields
+F_NEIGHBOR_ADDRESS  = "neighbor_address"
+F_REMOTE_AS_NUM     = "remote_as_num"
+F_CONNECTION_STATE  = "connection_state"
+F_TIME_SINCE_ESTAB  = "time_since_established"
+F_PREFIXES_RECEIVED = "prefixes_received"
 
 # --- Expression / criteria types -------------------------------------------
 RT = "resource_type"
@@ -292,6 +315,26 @@ def p_rule_stats(base, domain, pid, rid):
 
 def p_domains(base):
     return base + PATH_DOMAINS
+
+
+def p_segments(base):
+    return base + PATH_SEGMENTS
+
+
+def p_tier0s(base):
+    return base + PATH_TIER0S
+
+
+def p_tier0_locale_services(base, t0id):
+    return base + PATH_TIER0_LS.format(t0id=t0id)
+
+
+def p_bgp_neighbors(base, t0id, lsid):
+    return base + PATH_BGP_NEIGHBORS.format(t0id=t0id, lsid=lsid)
+
+
+def p_transport_node_status(tnid):
+    return PATH_TN_STATUS.format(tnid=tnid)
 
 
 def group_id_from_path(path):
