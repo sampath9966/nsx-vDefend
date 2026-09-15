@@ -1,6 +1,5 @@
 """Tests for nsxctl vcf import."""
 import json
-import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -72,7 +71,6 @@ def vcf_server(monkeypatch):
 
     # Patch _vcf_get to use http:// internally so we can test without TLS
     import nsx_toolkit.actions.vcf as vcf_mod
-    original_get = vcf_mod._vcf_get
 
     def _plain_get(host, path, user, password, ca_bundle=None):
         import urllib.request
