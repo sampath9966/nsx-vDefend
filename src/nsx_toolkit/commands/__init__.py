@@ -54,6 +54,7 @@ getting started:
   nsxctl status                     can I reach and authenticate everywhere?
   nsxctl doctor                     what does this NSX actually serve?
   nsxctl                            interactive menu
+  nsxctl setup-path                 make `nsxctl` runnable from any terminal
 
 everyday:
   nsxctl compliance                 tagging posture across every Local Manager
@@ -61,6 +62,8 @@ everyday:
   nsxctl impact web-prod-01         what breaks if I retag this VM
   nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
   nsxctl rule list --policy app-tier
+  nsxctl rule search --ip 10.1.2.3  find every rule that could touch this IP
+  nsxctl vm groups web-prod-01      every group this VM belongs to
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
 
@@ -69,6 +72,21 @@ authoring (dry run unless --enable-writes):
   nsxctl rule create allow-web-db --policy app-tier --from g-web --to g-db
   nsxctl apply changes.yaml         a declarative file of groups and rules
   nsxctl recommend flows.csv --policy app-tier --out-file proposed.json
+
+health:
+  nsxctl alarms --severity critical
+  nsxctl cert list --warn-days 30
+  nsxctl capacity
+  nsxctl terraform export --out ./tf
+  nsxctl segment list
+  nsxctl edge list
+  nsxctl bgp --down-only
+  nsxctl gw-policy list
+  nsxctl gw-rule list --policy perimeter
+  nsxctl gw-rule hygiene
+  nsxctl context-profile list
+  nsxctl idps events --severity high
+  nsxctl idps profiles
 
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
@@ -164,14 +182,21 @@ def build_parser():
     from .analysis import register_analysis
     from .apply import register_apply
     from .group import register_group
+    from .gw import register_gw
+    from .idps import register_idps
     from .inspect import register_inspect
+    from .ops import register_ops
     from .recommend import register_recommend
     from .rule import register_rule
     from .setup import register_setup
     from .shell import register_shell
     from .snapshot import register_snapshot
     from .tag import register_tag
+    from .terraform import register_terraform
+    from .topo import register_topo
     from .trace import register_trace
+    from .vcf import register_vcf
+    from .vm import register_vm
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -192,7 +217,9 @@ def build_parser():
                      register_rule, register_inspect,
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
-                     register_recommend,
+                     register_recommend, register_vm,
+                     register_ops, register_terraform, register_topo,
+                     register_gw, register_idps, register_vcf,
                      register_shell):
         register(sub, parents)
     return parser

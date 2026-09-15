@@ -1,6 +1,7 @@
 """Setup and introspection: init, status, managers, login, config."""
 
 import os
+import sys
 
 from ..actions.doctor import act_doctor
 from ..actions.verify import act_verify
@@ -14,7 +15,22 @@ from ..config import (
 )
 from ..creds import creds_file_path, force_set_credentials, keyring_available
 from ..errors import ConfigError, NsxError
-from ..output import cB, cBG, cBR, cC, cD, err, hr, ok_msg, say, section, table
+from ..launcher import module_command, path_status, repair_path
+from ..output import (
+    cB,
+    cBG,
+    cBR,
+    cBY,
+    cC,
+    cD,
+    confirm,
+    err,
+    hr,
+    ok_msg,
+    say,
+    section,
+    table,
+)
 from ..paths import (
     DATA_DIR,
     DEFAULT_AUDIT_FILE,
@@ -66,6 +82,26 @@ def register_setup(sub, parents):
     p.add_argument("--fail-on-missing", action="store_true",
                    help="Exit 1 if any capability is missing or unreadable.")
     p.set_defaults(func=cmd_doctor)
+
+    p = add_command(
+        sub, parents, "setup-path", "Make `nsxctl` runnable from any terminal.",
+        description="Put the directory pip installed the launcher into onto "
+                    "your PATH.\n\n"
+                    "A wheel cannot do this at install time -- there is no "
+                    "install hook to do it from -- so on a Python installed "
+                    "without \"Add Python to PATH\", `nsxctl` is installed and "
+                    "unreachable at the same time, and the shell just says "
+                    "command not found.\n\n"
+                    "Only the per-user PATH is touched, never the system one, "
+                    "and the previous value is saved first.",
+        epilog="examples:\n"
+               "  nsxctl setup-path\n"
+               "  nsxctl setup-path --check      # report only; 1 if unreachable\n"
+               "  py -m nsx_toolkit setup-path   # when `nsxctl` will not run yet")
+    p.add_argument("--check", action="store_true",
+                   help="Report and change nothing. Exit 1 if unreachable.")
+    p.set_defaults(func=cmd_setup_path, needs_inventory=False,
+                   needs_sessions=False)
 
     p = add_command(sub, parents, "managers", "List the configured managers.")
     p.set_defaults(func=cmd_managers)
@@ -120,6 +156,66 @@ def register_setup(sub, parents):
 
 def cmd_init(args, ctx):
     return 0 if run_wizard(args.inventory) else 1
+
+
+def cmd_setup_path(args, ctx):
+    st = path_status()
+    section("LAUNCHER")
+    say("  Interpreter : {}".format(cC(sys.executable)))
+    say("  Scripts dir : {}".format(cC(st.directory)))
+    say("  Launcher    : {}".format(
+        cC(st.launcher) if st.installed else cBR("not found")))
+    say("  On PATH     : {}".format(
+        cBG("yes") if st.reachable else cBR("no")))
+    if st.resolved and st.shadowed:
+        say("  `nsxctl` is : {}".format(cBY(st.resolved)))
+    hr()
+
+    # A different copy earlier on PATH answers to the name. Appending ours
+    # cannot beat it -- PATH is first-match -- so this is reported, not
+    # "fixed" in a way that would leave the same copy winning.
+    if st.shadowed:
+        err("`nsxctl` already resolves to another file:\n"
+            "    {}\n"
+            "  Adding {} to PATH would not change that: the other copy comes\n"
+            "  first and would still win. Remove it, or call this one by its\n"
+            "  full path.".format(st.resolved, st.directory))
+        return 1
+
+    if st.reachable:
+        ok_msg("`nsxctl` runs from any terminal. Nothing to do.")
+        return 0
+
+    say("  {}".format(cD(
+        "The launcher is installed but its directory is not on PATH, so the\n"
+        "  shell cannot find it. pip warns about this and the warning scrolls\n"
+        "  past. Until it is fixed, this works from anywhere:")))
+    say("\n      {}\n".format(cB(module_command())))
+
+    if args.check:
+        return 1
+    if not st.installed:
+        err("No launcher to put on PATH -- install the package for this "
+            "interpreter first.")
+        return 2
+    if not confirm("  Add {} to your PATH? [y/N] ".format(cC(st.directory))):
+        say("\n  Nothing changed.")
+        return 1
+
+    try:
+        changed, detail = repair_path(st)
+    except ConfigError as e:
+        err(str(e))
+        return 2
+    hr()
+    if changed:
+        ok_msg("PATH updated -- {}".format(detail))
+    else:
+        say("  {}".format(detail))
+    say("  {}".format(cD(
+        "A running shell keeps the environment it started with, so this one\n"
+        "  is unchanged. Open a NEW terminal and run `nsxctl version`.")))
+    return 0
 
 
 def cmd_status(args, ctx):

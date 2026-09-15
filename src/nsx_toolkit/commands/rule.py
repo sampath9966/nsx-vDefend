@@ -13,7 +13,7 @@ from ..actions.hygiene import (
     at_or_above,
     fetch_hit_counts,
 )
-from ..actions.inspect import act_rule_list, act_rule_show
+from ..actions.inspect import act_rule_list, act_rule_search, act_rule_show
 from ..authoring import RULE_ACTIONS, RULE_DIRECTIONS
 from ..baseline import (
     BASELINE_HEADERS,
@@ -178,6 +178,28 @@ def register_rule(sub, parents):
     dl.add_argument("--policy", help="Policy the rule is in.")
     dl.set_defaults(func=cmd_rule_delete)
 
+    sr = add_action(
+        rsub, parents, "search", "Find rules that could apply to an IP.",
+        description="Find every DFW rule whose source or destination group "
+                    "could apply to a given IP address or CIDR.\n\n"
+                    "Groups are evaluated statically: a group whose criteria "
+                    "is an explicit IPAddressExpression is checked exactly; a "
+                    "tag- or segment-based group is reported as 'possible' "
+                    "because its membership can only be confirmed at runtime. "
+                    "Use --certain to hide 'possible' rows.",
+        epilog="examples:\n"
+               "  nsxctl rule search --ip 10.1.2.3\n"
+               "  nsxctl rule search --ip 10.0.0.0/8 --certain\n"
+               "  nsxctl rule search --ip 192.168.1.1 --policy app-tier")
+    sr.add_argument("--ip", required=True, metavar="IP/CIDR",
+                    help="IP address or CIDR to search for.")
+    sr.add_argument("--certain", action="store_true",
+                    help="Hide 'possible' matches; show only rules with an "
+                         "exact IP match or ANY.")
+    sr.add_argument("--policy", metavar="NAME",
+                    help="Limit to rules in policies matching NAME.")
+    sr.set_defaults(func=cmd_rule_search)
+
     p.set_defaults(func=_rule_needs_action)
 
 
@@ -278,9 +300,16 @@ def cmd_rule_delete(args, ctx):
     return _rule_write(args, ctx, policy_ref=args.policy, delete=True)
 
 
+def cmd_rule_search(args, ctx):
+    act_rule_search(ctx.sessions, args.domain, ctx.exporter,
+                    ip=args.ip, certain_only=args.certain,
+                    policy_ref=args.policy, cache_key=ctx.cache_key())
+    return 0
+
+
 def _rule_needs_action(args, ctx):
     err("Specify what to do: nsxctl rule list | show | hygiene | baseline "
-        "| create | edit | move | delete")
+        "| create | edit | move | delete | search")
     return 2
 
 

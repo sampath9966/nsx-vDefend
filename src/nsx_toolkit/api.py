@@ -65,6 +65,27 @@ PATH_TRACEFLOW_ONE = "/api/v1/traceflow/{tid}"
 PATH_TRACEFLOW_OBSERVATIONS = "/api/v1/traceflow/{tid}/observations"
 PATH_SESSION_CREATE = "/api/session/create"
 PATH_NODE_VERSION = "/api/v1/node/version"
+PATH_ALARMS   = "/api/v1/alarms"
+PATH_CERTS    = "/api/v1/trust-management/certificates"
+PATH_CAPACITY = "/api/v1/capacity/usage"
+# Network topology — policy-API paths (relative to a base)
+PATH_SEGMENTS      = "/segments"
+PATH_TIER0S        = "/tier-0s"
+PATH_TIER0_LS      = "/tier-0s/{t0id}/locale-services"
+PATH_BGP_NEIGHBORS = "/tier-0s/{t0id}/locale-services/{lsid}/bgp/neighbors/status"
+# Fabric/management-plane paths (absolute)
+PATH_TRANSPORT_NODES = "/api/v1/transport-nodes"
+PATH_TN_STATUS       = "/api/v1/transport-nodes/{tnid}/status"
+# Gateway Firewall paths (relative to base, domain-scoped)
+PATH_GW_POLICIES     = "/domains/{domain}/gateway-policies"
+PATH_GW_POLICY       = "/domains/{domain}/gateway-policies/{pid}"
+PATH_GW_RULES        = "/domains/{domain}/gateway-policies/{pid}/rules"
+PATH_GW_RULE         = "/domains/{domain}/gateway-policies/{pid}/rules/{rid}"
+PATH_GW_STATS        = "/domains/{domain}/gateway-policies/{pid}/statistics"
+# Advanced security paths (relative to base)
+PATH_CONTEXT_PROFILES = "/context-profiles"
+PATH_IDS_PROFILES     = "/intrusion-services/profiles"
+PATH_IDS_EVENTS       = "/intrusion-services/ids-events"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -164,6 +185,39 @@ F_TARGET_TYPE = "target_type"
 F_IS_VALID = "is_valid"
 F_NODE_VERSION = "node_version"
 F_PRODUCT_VERSION = "product_version"
+# Alarm fields
+F_SEVERITY = "severity"
+F_ALARM_STATUS = "status"
+F_FEATURE_DISPLAY_NAME = "feature_display_name"
+F_EVENT_COUNT = "event_count"
+F_FIRST_REPORTED_TIME = "first_reported_time"
+F_LAST_REPORTED_TIME = "last_reported_time"
+# Certificate fields
+F_NOT_AFTER = "not_after"
+F_USED_BY_LINKS = "used_by"
+F_LINK_HREF = "href"
+# Capacity fields
+F_CAPACITY_USAGE_DATA = "capacity_usage_data"
+F_USAGE_TYPE = "usage_type"
+F_CURRENT_USAGE_COUNT = "current_usage_count"
+F_MAX_SUPPORTED_COUNT = "max_supported_count"
+F_MIN_THRESHOLD_PERCENT = "min_threshold_percent"
+F_MAX_THRESHOLD_PERCENT = "max_threshold_percent"
+# Segment fields
+F_SUBNETS           = "subnets"
+F_CONNECTIVITY_PATH = "connectivity_path"
+F_VLAN_IDS          = "vlan_ids"
+F_GATEWAY_ADDRESS   = "gateway_address"
+# Transport-node / edge fields
+F_ADMIN_STATE              = "admin_state"
+F_NODE_DEPLOYMENT_STATUS   = "host_node_deployment_status"
+F_CONTROL_STATUS           = "control_connection_status"
+# BGP fields
+F_NEIGHBOR_ADDRESS  = "neighbor_address"
+F_REMOTE_AS_NUM     = "remote_as_num"
+F_CONNECTION_STATE  = "connection_state"
+F_TIME_SINCE_ESTAB  = "time_since_established"
+F_PREFIXES_RECEIVED = "prefixes_received"
 
 # --- Expression / criteria types -------------------------------------------
 RT = "resource_type"
@@ -271,6 +325,58 @@ def p_rule_stats(base, domain, pid, rid):
 
 def p_domains(base):
     return base + PATH_DOMAINS
+
+
+def p_segments(base):
+    return base + PATH_SEGMENTS
+
+
+def p_tier0s(base):
+    return base + PATH_TIER0S
+
+
+def p_tier0_locale_services(base, t0id):
+    return base + PATH_TIER0_LS.format(t0id=t0id)
+
+
+def p_bgp_neighbors(base, t0id, lsid):
+    return base + PATH_BGP_NEIGHBORS.format(t0id=t0id, lsid=lsid)
+
+
+def p_transport_node_status(tnid):
+    return PATH_TN_STATUS.format(tnid=tnid)
+
+
+def p_gw_policies(base, domain):
+    return base + PATH_GW_POLICIES.format(domain=domain)
+
+
+def p_gw_policy(base, domain, pid):
+    return base + PATH_GW_POLICY.format(domain=domain, pid=pid)
+
+
+def p_gw_rules(base, domain, pid):
+    return base + PATH_GW_RULES.format(domain=domain, pid=pid)
+
+
+def p_gw_rule(base, domain, pid, rid):
+    return base + PATH_GW_RULE.format(domain=domain, pid=pid, rid=rid)
+
+
+def p_gw_stats(base, domain, pid):
+    return base + PATH_GW_STATS.format(domain=domain, pid=pid)
+
+
+def p_context_profiles(base):
+    return base + PATH_CONTEXT_PROFILES
+
+
+def p_ids_profiles(base):
+    return base + PATH_IDS_PROFILES
+
+
+def p_ids_events(base):
+    return base + PATH_IDS_EVENTS
 
 
 def group_id_from_path(path):

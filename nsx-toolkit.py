@@ -37,9 +37,11 @@ import os
 import platform
 import random
 import re
+import shutil
 import socket
 import ssl
 import sys
+import sysconfig
 import threading
 import time
 import urllib.error
@@ -52,8 +54,8 @@ import xml.sax.saxutils as saxutils
 # version.py  --  Tool identity. Single source of truth for name and version strings.
 # ==========================================================================
 
-VERSION = "1.0.0"
-VERSION_DATE = "2026-09-08"
+VERSION = "1.2.0"
+VERSION_DATE = "2026-09-14"
 TOOL_NAME = "NSX Toolkit"
 TOOL_TAGLINE = "Zero Trust Segmentation · Groups, Tags & DFW"
 
@@ -534,6 +536,27 @@ PATH_TRACEFLOW_ONE = "/api/v1/traceflow/{tid}"
 PATH_TRACEFLOW_OBSERVATIONS = "/api/v1/traceflow/{tid}/observations"
 PATH_SESSION_CREATE = "/api/session/create"
 PATH_NODE_VERSION = "/api/v1/node/version"
+PATH_ALARMS   = "/api/v1/alarms"
+PATH_CERTS    = "/api/v1/trust-management/certificates"
+PATH_CAPACITY = "/api/v1/capacity/usage"
+# Network topology — policy-API paths (relative to a base)
+PATH_SEGMENTS      = "/segments"
+PATH_TIER0S        = "/tier-0s"
+PATH_TIER0_LS      = "/tier-0s/{t0id}/locale-services"
+PATH_BGP_NEIGHBORS = "/tier-0s/{t0id}/locale-services/{lsid}/bgp/neighbors/status"
+# Fabric/management-plane paths (absolute)
+PATH_TRANSPORT_NODES = "/api/v1/transport-nodes"
+PATH_TN_STATUS       = "/api/v1/transport-nodes/{tnid}/status"
+# Gateway Firewall paths (relative to base, domain-scoped)
+PATH_GW_POLICIES     = "/domains/{domain}/gateway-policies"
+PATH_GW_POLICY       = "/domains/{domain}/gateway-policies/{pid}"
+PATH_GW_RULES        = "/domains/{domain}/gateway-policies/{pid}/rules"
+PATH_GW_RULE         = "/domains/{domain}/gateway-policies/{pid}/rules/{rid}"
+PATH_GW_STATS        = "/domains/{domain}/gateway-policies/{pid}/statistics"
+# Advanced security paths (relative to base)
+PATH_CONTEXT_PROFILES = "/context-profiles"
+PATH_IDS_PROFILES     = "/intrusion-services/profiles"
+PATH_IDS_EVENTS       = "/intrusion-services/ids-events"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -633,6 +656,39 @@ F_TARGET_TYPE = "target_type"
 F_IS_VALID = "is_valid"
 F_NODE_VERSION = "node_version"
 F_PRODUCT_VERSION = "product_version"
+# Alarm fields
+F_SEVERITY = "severity"
+F_ALARM_STATUS = "status"
+F_FEATURE_DISPLAY_NAME = "feature_display_name"
+F_EVENT_COUNT = "event_count"
+F_FIRST_REPORTED_TIME = "first_reported_time"
+F_LAST_REPORTED_TIME = "last_reported_time"
+# Certificate fields
+F_NOT_AFTER = "not_after"
+F_USED_BY_LINKS = "used_by"
+F_LINK_HREF = "href"
+# Capacity fields
+F_CAPACITY_USAGE_DATA = "capacity_usage_data"
+F_USAGE_TYPE = "usage_type"
+F_CURRENT_USAGE_COUNT = "current_usage_count"
+F_MAX_SUPPORTED_COUNT = "max_supported_count"
+F_MIN_THRESHOLD_PERCENT = "min_threshold_percent"
+F_MAX_THRESHOLD_PERCENT = "max_threshold_percent"
+# Segment fields
+F_SUBNETS           = "subnets"
+F_CONNECTIVITY_PATH = "connectivity_path"
+F_VLAN_IDS          = "vlan_ids"
+F_GATEWAY_ADDRESS   = "gateway_address"
+# Transport-node / edge fields
+F_ADMIN_STATE              = "admin_state"
+F_NODE_DEPLOYMENT_STATUS   = "host_node_deployment_status"
+F_CONTROL_STATUS           = "control_connection_status"
+# BGP fields
+F_NEIGHBOR_ADDRESS  = "neighbor_address"
+F_REMOTE_AS_NUM     = "remote_as_num"
+F_CONNECTION_STATE  = "connection_state"
+F_TIME_SINCE_ESTAB  = "time_since_established"
+F_PREFIXES_RECEIVED = "prefixes_received"
 
 # --- Expression / criteria types -------------------------------------------
 RT = "resource_type"
@@ -740,6 +796,58 @@ def p_rule_stats(base, domain, pid, rid):
 
 def p_domains(base):
     return base + PATH_DOMAINS
+
+
+def p_segments(base):
+    return base + PATH_SEGMENTS
+
+
+def p_tier0s(base):
+    return base + PATH_TIER0S
+
+
+def p_tier0_locale_services(base, t0id):
+    return base + PATH_TIER0_LS.format(t0id=t0id)
+
+
+def p_bgp_neighbors(base, t0id, lsid):
+    return base + PATH_BGP_NEIGHBORS.format(t0id=t0id, lsid=lsid)
+
+
+def p_transport_node_status(tnid):
+    return PATH_TN_STATUS.format(tnid=tnid)
+
+
+def p_gw_policies(base, domain):
+    return base + PATH_GW_POLICIES.format(domain=domain)
+
+
+def p_gw_policy(base, domain, pid):
+    return base + PATH_GW_POLICY.format(domain=domain, pid=pid)
+
+
+def p_gw_rules(base, domain, pid):
+    return base + PATH_GW_RULES.format(domain=domain, pid=pid)
+
+
+def p_gw_rule(base, domain, pid, rid):
+    return base + PATH_GW_RULE.format(domain=domain, pid=pid, rid=rid)
+
+
+def p_gw_stats(base, domain, pid):
+    return base + PATH_GW_STATS.format(domain=domain, pid=pid)
+
+
+def p_context_profiles(base):
+    return base + PATH_CONTEXT_PROFILES
+
+
+def p_ids_profiles(base):
+    return base + PATH_IDS_PROFILES
+
+
+def p_ids_events(base):
+    return base + PATH_IDS_EVENTS
 
 
 def group_id_from_path(path):
@@ -1750,6 +1858,94 @@ class Nsx:
             if v.get(F_EXTERNAL_ID) == ext_id:
                 return v
         return None
+
+    # --- operational health ------------------------------------------------
+    def get_alarms(self, status="OPEN", severity=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if status:
+            params["status"] = status
+        if severity:
+            params["severity"] = severity.upper()
+        return self.get_all(PATH_ALARMS, params=params)
+
+    def get_certificates(self):
+        return self.get_all(PATH_CERTS)
+
+    def get_capacity(self):
+        return self.get(PATH_CAPACITY)
+
+    def get_segments(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_segments(self.base(domain)))
+        except NsxError:
+            return []
+
+    def get_tier0s(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_tier0s(self.base(domain)))
+        except NsxError:
+            return []
+
+    def get_locale_services(self, t0id, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_tier0_locale_services(self.base(domain), t0id))
+        except NsxError:
+            return []
+
+    def get_bgp_neighbors(self, t0id, lsid, domain=DEFAULT_DOMAIN):
+        try:
+            result = self.get(p_bgp_neighbors(self.base(domain), t0id, lsid))
+            return (result or {}).get(F_RESULTS, [])
+        except NsxError:
+            return []
+
+    def get_transport_nodes(self, node_type=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if node_type:
+            params["node_type"] = node_type
+        try:
+            return self.get_all(PATH_TRANSPORT_NODES, params=params)
+        except NsxError:
+            return []
+
+    def get_transport_node_status(self, tnid):
+        try:
+            return self.get(p_transport_node_status(tnid))
+        except NsxError:
+            return {}
+
+    def get_gw_policies(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_gw_policies(self.base(domain), domain))
+        except NsxError:
+            return []
+
+    def get_gw_rules(self, pid, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_gw_rules(self.base(domain), domain, pid))
+        except NsxError:
+            return []
+
+    def get_context_profiles(self):
+        try:
+            return self.get_all(p_context_profiles(self.base()))
+        except NsxError:
+            return []
+
+    def get_ids_profiles(self):
+        try:
+            return self.get_all(p_ids_profiles(self.base()))
+        except NsxError:
+            return []
+
+    def get_ids_events(self, severity=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if severity:
+            params["severity"] = severity.upper()
+        try:
+            return self.get_all(p_ids_events(self.base()), params=params)
+        except NsxError:
+            return []
 
     def refresh_vm(self, vm):
         """Re-read one VM straight from NSX, bypassing the cache. Used
@@ -5066,6 +5262,308 @@ def write_report(path, title, subtitle="", notes=(), tiles=(), sections=()):
 
 
 # ==========================================================================
+# launcher.py  --  Where pip put the console script, and whether the shell can find it.
+# ==========================================================================
+
+# Both console scripts this package installs. The first is the one we put on
+# PATH for; the second is the continuity alias and lands in the same place.
+LAUNCHER_NAMES = ("nsxctl", "nsx-toolkit")
+
+# Written into the shell rc file so a second run recognises its own work
+# rather than appending the same line again.
+MARKER = "# added by `nsxctl setup-path`"
+
+
+def _norm_dir(directory):
+    """Normalise a directory for comparison the way PATH lookup treats it.
+
+    Variables are expanded because the Windows *user* PATH is stored raw in
+    the registry -- `%USERPROFILE%\\...` -- while the PATH this process
+    inherited is already expanded. Comparing the two without expanding is how
+    you conclude a directory is missing when it is already configured.
+    """
+    if not directory or not directory.strip():
+        return ""
+    expanded = os.path.expanduser(os.path.expandvars(directory.strip()))
+    trimmed = expanded.rstrip("\\/") or expanded
+    return os.path.normcase(os.path.normpath(trimmed))
+
+
+def path_entries(env_path=None):
+    """The directories on PATH, in order, empties dropped."""
+    raw = os.environ.get("PATH", "") if env_path is None else env_path
+    return [entry for entry in raw.split(os.pathsep) if entry.strip()]
+
+
+def on_path(directory, env_path=None):
+    target = _norm_dir(directory)
+    if not target:
+        return False
+    return any(_norm_dir(entry) == target for entry in path_entries(env_path))
+
+
+def _user_scheme():
+    """The sysconfig scheme `pip install --user` writes into."""
+    try:
+        return sysconfig.get_preferred_scheme("user")   # 3.10+
+    except AttributeError:
+        return "nt_user" if os.name == "nt" else "posix_user"
+
+
+def candidate_dirs():
+    """Every directory a console script for THIS interpreter could be in.
+
+    There is more than one because the answer depends on how the toolkit was
+    installed: the default scheme for a plain `pip install`, the user scheme
+    for `pip install --user`, and the interpreter's own directory inside a
+    virtualenv. Guessing one and reporting on it would be wrong for the other
+    two, so all three are searched and the one actually holding a launcher
+    wins.
+    """
+    found, seen = [], set()
+
+    def add(directory):
+        key = _norm_dir(directory)
+        if key and key not in seen:
+            seen.add(key)
+            found.append(directory)
+
+    add(sysconfig.get_path("scripts"))
+    try:
+        add(sysconfig.get_path("scripts", _user_scheme()))
+    except (KeyError, ValueError):
+        pass          # an unusual scheme name is not worth failing over
+    add(os.path.dirname(os.path.abspath(sys.executable)))
+    return found
+
+
+def _launcher_suffixes():
+    # On Windows pip writes a real .exe launcher; -script.py appears with some
+    # older installers. Elsewhere the script has no extension at all.
+    return (".exe", "-script.py", "") if os.name == "nt" else ("",)
+
+
+def launcher_in(directory):
+    """The path of a console script inside `directory`, or None."""
+    if not directory or not os.path.isdir(directory):
+        return None
+    for name in LAUNCHER_NAMES:
+        for suffix in _launcher_suffixes():
+            candidate = os.path.join(directory, name + suffix)
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+class PathStatus:
+    """What the shell can and cannot currently see.
+
+    `reachable` is the only thing that decides whether typing `nsxctl` works.
+    The rest exists to explain why not, because "command not found" for a
+    command that is definitely installed is the confusing part.
+    """
+
+    def __init__(self, directory, launcher, reachable, resolved):
+        self.directory = directory
+        self.launcher = launcher
+        self.reachable = reachable
+        self.resolved = resolved
+
+    @property
+    def installed(self):
+        return self.launcher is not None
+
+    @property
+    def shadowed(self):
+        """Reachable, but the name resolves to a different file than ours.
+
+        An older copy earlier on PATH answers to `nsxctl` and the fix for
+        every other problem here would not touch it.
+        """
+        if not self.resolved or not self.launcher:
+            return False
+        return _norm_dir(os.path.dirname(self.resolved)) != _norm_dir(self.directory)
+
+
+def path_status(env_path=None):
+    directory, launcher = None, None
+    for candidate in candidate_dirs():
+        found = launcher_in(candidate)
+        if found:
+            directory, launcher = candidate, found
+            break
+    if directory is None:
+        # Nothing installed anywhere we can see. Report where it *would* go,
+        # so the message can still say something useful.
+        directory = sysconfig.get_path("scripts")
+    return PathStatus(directory=directory, launcher=launcher,
+                  reachable=on_path(directory, env_path),
+                  resolved=shutil.which(LAUNCHER_NAMES[0]))
+
+
+# === APPLYING THE FIX ===
+def _backup_path_value(kind, value):
+    """Keep the previous value before changing it.
+
+    Editing PATH is the kind of change that is hard to undo from memory if it
+    goes wrong, and this runs on a machine where the user is already confused
+    about why something does not work.
+    """
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        path = os.path.join(
+            DATA_DIR, "path-backup-{}-{}.txt".format(kind, local_stamp()))
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(value)
+        return path
+    except OSError:
+        return None      # a missing backup must not stop the repair
+
+
+def _win_read_user_path():
+    """(raw value, registry type) of the per-user PATH.
+
+    Read raw on purpose: QueryValueEx does not expand REG_EXPAND_SZ, so
+    `%USERPROFILE%\\bin` comes back intact and gets written back intact. A
+    round trip through an expanded value would hard-code this machine's paths
+    into the user's environment.
+    """
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+        try:
+            value, kind = winreg.QueryValueEx(key, "Path")
+            return value or "", kind
+        except FileNotFoundError:
+            return "", winreg.REG_EXPAND_SZ
+
+
+def _win_broadcast():
+    """Tell running processes the environment changed.
+
+    Without this the new PATH reaches nothing until the next logon. Explorer
+    picks the broadcast up and passes it to the shells it starts, so a newly
+    opened terminal sees it. It cannot reach the shell that is running us --
+    a process's environment is fixed once it starts -- which is why the
+    caller still says to open a new one.
+    """
+    try:
+        import ctypes
+        result = ctypes.c_void_p()
+        ctypes.windll.user32.SendMessageTimeoutW(
+            0xFFFF,          # HWND_BROADCAST
+            0x001A,          # WM_SETTINGCHANGE
+            0,
+            ctypes.c_wchar_p("Environment"),
+            0x0002,          # SMTO_ABORTIFHUNG
+            5000,
+            ctypes.byref(result))
+        return True
+    except Exception:        # noqa: BLE001 - cosmetic; a new shell works regardless
+        return False
+
+
+def _win_apply(directory):
+    import winreg
+    current, kind = _win_read_user_path()
+    if on_path(directory, current):
+        return False, ("already in your user PATH -- open a NEW terminal for "
+                       "it to take effect")
+    backup = _backup_path_value("user", current)
+    joined = (current.rstrip(os.pathsep) + os.pathsep + directory
+              if current.strip() else directory)
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                        winreg.KEY_SET_VALUE) as key:
+        winreg.SetValueEx(key, "Path", 0, kind, joined)
+    _win_broadcast()
+    return True, ("added to your user PATH" +
+                  (" (previous value saved to {})".format(backup)
+                   if backup else ""))
+
+
+def rc_file():
+    """The shell startup file to append to, chosen from $SHELL.
+
+    Guessed rather than asked for, but never guessed silently: the caller
+    prints the file it picked before writing to it.
+    """
+    shell = os.path.basename(os.environ.get("SHELL", "")).lower()
+    home = os.path.expanduser("~")
+    if "fish" in shell:
+        return os.path.join(home, ".config", "fish", "config.fish")
+    if "zsh" in shell:
+        return os.path.join(home, ".zshrc")
+    if "bash" in shell:
+        # macOS bash reads .bash_profile for a login shell, which is what
+        # Terminal.app starts; Linux reads .bashrc.
+        if sys.platform == "darwin":
+            return os.path.join(home, ".bash_profile")
+        return os.path.join(home, ".bashrc")
+    return None
+
+
+def rc_line(directory, path=None):
+    """The line that puts `directory` on PATH, in the rc file's own syntax."""
+    if path and path.endswith(".fish"):
+        return 'fish_add_path "{}"'.format(directory)
+    return 'export PATH="{}:$PATH"'.format(directory)
+
+
+def _posix_apply(directory):
+    path = rc_file()
+    if not path:
+        raise ConfigError(
+            "Cannot tell which shell you use ($SHELL is unset or unknown), so "
+            "there is no file to edit safely.\n"
+            "  Add this line to your shell's startup file yourself:\n"
+            "    {}".format(rc_line(directory)))
+    line = rc_line(directory, path)
+    existing = ""
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            existing = handle.read()
+    if line in existing:
+        return False, ("already in {} -- run `exec $SHELL` or open a new "
+                       "terminal".format(path))
+    backup = _backup_path_value("rc", existing) if existing else None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("{}\n{}\n{}\n".format(prefix, MARKER, line))
+    return True, ("appended to {}".format(path) +
+                  (" (previous contents saved to {})".format(backup)
+                   if backup else ""))
+
+
+def repair_path(st):
+    """Put the launcher's directory on PATH. Returns (changed, detail).
+
+    Refuses rather than guesses in the one case that matters: if no launcher
+    was found, adding the directory would put an empty directory on the user's
+    PATH and fix nothing, while looking like it had worked.
+    """
+    if not st.installed:
+        raise ConfigError(
+            "No nsxctl launcher found for this interpreter ({}).\n"
+            "  Nothing would be gained by adding {} to PATH.\n"
+            "  Install it first:  {} -m pip install --user nsxctl".format(
+                sys.executable, st.directory, os.path.basename(sys.executable)))
+    if os.name == "nt":
+        return _win_apply(st.directory)
+    return _posix_apply(st.directory)
+
+
+def module_command():
+    """How to invoke the toolkit when the console script is unreachable.
+
+    `py` on Windows and the running interpreter everywhere else -- `py` is
+    installed into C:\\Windows, so it is on PATH even when Python itself is
+    not, which is exactly the situation this hint is printed in.
+    """
+    launcher = "py" if os.name == "nt" else sys.executable
+    return "{} -m nsx_toolkit".format(launcher)
+
+
+# ==========================================================================
 # actions/groups.py  --  Group search: criteria, and optionally VM members.
 # ==========================================================================
 
@@ -5870,6 +6368,123 @@ def act_reverse_lookup(all_sessions, needle, domain, exporter):
         say("  {} reference these groups on any manager.".format(cG("No DFW rules")))
     hr()
     exporter.stage("reverse_lookup", REVERSE_HEADERS, rows)
+
+
+# ==========================================================================
+# actions/vm.py  --  VM-centric views: groups a VM is a member of, and the rules that reference them.
+# ==========================================================================
+
+VM_GROUP_HEADERS = ["vm", "manager", "group_id", "group_name", "origin",
+                    "criteria", "rule_count"]
+
+
+def act_vm_groups(all_sessions, needle, domain, exporter):
+    """Groups this VM belongs to (any member type) and how many DFW rules reference them.
+
+    Uses NSX's own virtual-machine-group-associations reverse index, which is
+    member-type agnostic -- it works for tag-matched, segment-matched, VIF-matched
+    and IP-set groups equally, unlike the /members/virtual-machines sub-resource
+    which silently returns nothing for non-VM-typed groups.
+    """
+    lm_sessions = [s for s in all_sessions if s.role == ROLE_LM]
+    gm_sessions = [s for s in all_sessions if s.role == ROLE_GM]
+
+    # VMs are LM-local objects -- find the VM on whichever LM has it.
+    found = None
+    for nsx in lm_sessions:
+        try:
+            hits = nsx.find_vms(needle)
+            if hits:
+                found = (nsx, hits[0])
+                break
+        except NsxError:
+            continue
+    if not found:
+        say("  No VM matching '{}' on any Local Manager.".format(needle))
+        exporter.stage("vm_groups", VM_GROUP_HEADERS, [])
+        return
+
+    nsx_lm, vm = found
+    vname = vm.get(F_DISPLAY_NAME, "?")
+    ext_id = vm.get(F_EXTERNAL_ID)
+    section("VM GROUPS")
+    say("  VM       : {}".format(cB(vname)))
+    say("  Found on : {}".format(cC(nsx_lm.name)))
+
+    if not ext_id:
+        say("  {} VM has no external_id -- cannot resolve group associations.".format(
+            cBR("[error]")))
+        exporter.stage("vm_groups", VM_GROUP_HEADERS, [])
+        return
+
+    # --- Group membership via reverse-association index ---
+    matched = {}  # group_id -> (path, display_name, origin)
+    with Spinner("Association lookup on {}".format(nsx_lm.name)):
+        try:
+            for a in nsx_lm.get_all(p_vm_group_assoc(nsx_lm.base(domain)),
+                                    params={PARAM_VM_EXTERNAL_ID: ext_id}):
+                gpath = a.get(F_PATH, "")
+                gid = a.get(F_TARGET_ID) or (group_id_from_path(gpath) if gpath else "?")
+                matched[gid] = (gpath, a.get(F_TARGET_DISPLAY_NAME, gid),
+                                origin_of_path(gpath))
+        except NsxError as e:
+            err("association lookup failed: {}".format(e))
+
+    # Best-effort GM supplement -- catches Global Groups not yet realized here.
+    for nsx_gm in gm_sessions:
+        try:
+            for a in nsx_gm.get_all(p_vm_group_assoc(nsx_gm.base(domain)),
+                                    params={PARAM_VM_EXTERNAL_ID: ext_id}):
+                gpath = a.get(F_PATH, "")
+                gid = a.get(F_TARGET_ID) or (group_id_from_path(gpath) if gpath else "?")
+                if gid not in matched:
+                    matched[gid] = (gpath, a.get(F_TARGET_DISPLAY_NAME, gid),
+                                    origin_of_path(gpath))
+        except NsxError:
+            pass
+
+    if not matched:
+        say("  {}".format(cD("Not a member of any group.")))
+        exporter.stage("vm_groups", VM_GROUP_HEADERS, [])
+        return
+
+    say("  Member of: {} group(s)".format(cC(str(len(matched)))))
+    hr()
+
+    # Count how many DFW rules reference each group
+    group_paths = {gp for gp, _, _ in matched.values() if gp}
+    rule_counts = {}
+    for record in sweep_rules(all_sessions, domain):
+        for gp in record.group_refs() & group_paths:
+            rule_counts[gp] = rule_counts.get(gp, 0) + 1
+
+    # Fetch group expressions for the criteria column
+    rows = []
+    display_rows = []
+    for gid, (gpath, gname, origin) in sorted(matched.items(),
+                                               key=lambda kv: kv[1][1].lower()):
+        criteria = ""
+        for nsx in (lm_sessions + gm_sessions):
+            try:
+                g = nsx.get(p_group(nsx.base(domain), domain, gid))
+                criteria = criteria_summary(g.get(F_EXPRESSION))
+                break
+            except NsxError:
+                continue
+        rc = rule_counts.get(gpath, 0)
+        origin_lbl = cC("GM") if origin == "GM" else cD("LM")
+        rows.append([vname, nsx_lm.name, gid, gname, origin, criteria, str(rc)])
+        display_rows.append([origin_lbl, cB(gname), cD(gid),
+                             criteria[:48] if criteria else cD("(unknown)"),
+                             cBG(str(rc)) if rc else cD("0")])
+
+    table(["Origin", "Group", "Id", "Criteria", "DFW Rules"],
+          display_rows, indent=4)
+    hr()
+    say("  {}  {}".format(
+        cD("next:"),
+        cC("nsxctl rule search --ip <IP>   # find rules by IP address")))
+    exporter.stage("vm_groups", VM_GROUP_HEADERS, rows)
 
 
 # ==========================================================================
@@ -7670,6 +8285,214 @@ def act_service_show(sessions, domain, exporter, ref):
     return rows
 
 
+# ── rule search ──────────────────────────────────────────────────────────────
+
+RULE_SEARCH_HEADERS = ["manager", "origin", "policy", "rule", "action",
+                       "direction", "source_match", "dest_match"]
+
+# Match verdicts (higher = more certain)
+_MATCH_NONE = 0
+_MATCH_POSSIBLE = 1   # tag/condition-based group; can't evaluate statically
+_MATCH_ANY = 2        # ANY wildcard — always matches
+_MATCH_EXACT = 3      # confirmed via IPAddressExpression
+
+
+def _net(cidr):
+    """Parse CIDR or host IP; return ip_network or None."""
+    try:
+        return ipaddress.ip_network(str(cidr).strip(), strict=False)
+    except ValueError:
+        return None
+
+
+def _ip_in_entries(query_net, entries):
+    """Check whether query_net is covered by any IPAddressExpression in entries."""
+    for entry in entries or []:
+        if entry.get(RT) != RT_IPADDRESS:
+            continue
+        for addr in entry.get(F_IP_ADDRESSES) or []:
+            candidate = _net(addr)
+            if candidate is None:
+                continue
+            try:
+                if query_net.subnet_of(candidate) or candidate.subnet_of(query_net):
+                    return True
+            except TypeError:
+                # mixed v4/v6
+                pass
+    return False
+
+
+def _group_match_basis(query_net, expression):
+    """Return (_MATCH_EXACT | _MATCH_POSSIBLE | _MATCH_NONE) for a group expression."""
+    if not expression:
+        return _MATCH_NONE
+    # Flatten nested and conjunction types to a single list of leaf entries.
+    leaves = []
+    queue = list(expression) if isinstance(expression, list) else [expression]
+    while queue:
+        item = queue.pop()
+        if not isinstance(item, dict):
+            continue
+        rt = item.get(RT, "")
+        if rt in (RT_CONJUNCTION, RT_NESTED):
+            queue.extend(item.get(F_EXPRESSION) or [])
+        else:
+            leaves.append(item)
+
+    has_ip = any(e.get(RT) == RT_IPADDRESS for e in leaves)
+    has_condition = any(e.get(RT) in (RT_CONDITION, RT_PATHEXPR) for e in leaves)
+
+    if has_ip and _ip_in_entries(query_net, leaves):
+        return _MATCH_EXACT
+    if has_condition or (has_ip and not _ip_in_entries(query_net, leaves)):
+        # Tag/segment-based groups may still match the IP at runtime.
+        return _MATCH_POSSIBLE if has_condition else _MATCH_NONE
+    return _MATCH_NONE
+
+
+def _build_group_index(sessions, domain, group_paths):
+    """Map group_path -> match basis for as many groups as we can fetch."""
+    index = {}
+    for nsx in sessions:
+        for gpath in list(group_paths):
+            if gpath in index:
+                continue
+            gid = group_id_from_path(gpath)
+            if not gid:
+                continue
+            try:
+                g = nsx.get(p_group(nsx.base(domain), domain, gid))
+                index[gpath] = g.get(F_EXPRESSION)
+            except Exception:  # noqa: BLE001
+                pass
+    return index
+
+
+def _refs_match(paths, query_net, group_expr_index, certain_only):
+    """Best match verdict for a list of group paths."""
+    values = [p for p in (paths or []) if p]
+    if not values or values == [ANY]:
+        return _MATCH_ANY, "ANY"
+    best = _MATCH_NONE
+    best_label = ""
+    for path in values:
+        expr = group_expr_index.get(path)
+        basis = _group_match_basis(query_net, expr)
+        if expr is None and not certain_only:
+            basis = max(basis, _MATCH_POSSIBLE)
+        if basis > best:
+            best = basis
+            gid = group_id_from_path(path) or path
+            if basis == _MATCH_EXACT:
+                best_label = "exact: {}".format(gid)
+            elif basis == _MATCH_POSSIBLE:
+                best_label = "possible: {}".format(gid)
+    return best, best_label
+
+
+def act_rule_search(sessions, domain, exporter, ip, certain_only=False,
+                    policy_ref=None, cache_key=None):
+    """Find DFW rules whose source or destination groups could apply to an IP."""
+    section("RULE SEARCH")
+    query_net = _net(ip)
+    if query_net is None:
+        err("  Not a valid IP or CIDR: '{}'".format(ip))
+        exporter.stage("rule_search", RULE_SEARCH_HEADERS, [])
+        return []
+
+    say("  Searching for rules that could apply to {}".format(cB(str(query_net))))
+    if certain_only:
+        say("  {}".format(cD("(--certain: hiding 'possible' matches)")))
+    hr()
+
+    records = evaluation_order(sweep_rules(sessions, domain))
+    policy_needle = (policy_ref or "").lower() or None
+    if policy_needle:
+        records = [r for r in records
+                   if policy_needle in "{} {}".format(
+                       r.policy_name, r.policy_id).lower()]
+
+    # Collect all unique group paths referenced by any candidate rule.
+    all_paths = set()
+    for record in records:
+        for path in (record.rule.get(F_SOURCE_GROUPS) or []):
+            if path and path != ANY:
+                all_paths.add(path)
+        for path in (record.rule.get(F_DEST_GROUPS) or []):
+            if path and path != ANY:
+                all_paths.add(path)
+
+    group_expr_index = _build_group_index(sessions, domain, all_paths)
+
+    rows = []
+    display_rows = []
+    for record in records:
+        rule = record.rule
+        src_basis, src_label = _refs_match(
+            rule.get(F_SOURCE_GROUPS), query_net, group_expr_index, certain_only)
+        dst_basis, dst_label = _refs_match(
+            rule.get(F_DEST_GROUPS), query_net, group_expr_index, certain_only)
+
+        # A rule matches when either direction hits.
+        direction = str(rule.get(F_DIRECTION, "IN_OUT")).upper()
+        if direction == "IN":
+            # only destination matters for inbound
+            effective = dst_basis
+        elif direction == "OUT":
+            effective = src_basis
+        else:
+            effective = max(src_basis, dst_basis)
+
+        if effective == _MATCH_NONE:
+            continue
+        # --certain: hide any rule where either side is merely "possible"
+        if certain_only and (src_basis == _MATCH_POSSIBLE
+                             or dst_basis == _MATCH_POSSIBLE):
+            continue
+
+        action = str(rule.get(F_ACTION_FIELD, "?"))
+        rows.append([record.nsx.name, record.origin, record.policy_name,
+                     record.rule_name, action, direction,
+                     src_label or "-", dst_label or "-"])
+        src_colour = (cBG if src_basis == _MATCH_EXACT
+                      else (cBY if src_basis == _MATCH_ANY else cD))
+        dst_colour = (cBG if dst_basis == _MATCH_EXACT
+                      else (cBY if dst_basis == _MATCH_ANY else cD))
+        display_rows.append([
+            _rule_action_colour(action)(action),
+            cB(record.rule_name),
+            record.policy_name,
+            src_colour(src_label or "-"),
+            dst_colour(dst_label or "-"),
+            cD(direction),
+        ])
+
+    say("  {} rule(s) could apply to {}{}".format(
+        cC(str(len(rows))), cB(str(query_net)),
+        cD("  (exact + possible)") if not certain_only else ""))
+    if not rows:
+        say("  {}".format(cD("(no matches)")))
+        exporter.stage("rule_search", RULE_SEARCH_HEADERS, [])
+        return []
+
+    table(["Action", "Rule", "Policy", "Source match", "Dest match", "Dir"],
+          display_rows, indent=4)
+    hr()
+    say("  {}  {}".format(
+        cD("legend:"),
+        cD("exact = IP in group's IPAddressExpression  |  "
+           "possible = tag/segment-based (check at runtime)")))
+    say("  {}  {}".format(
+        cD("next:"),
+        cC("nsxctl trace VM_A VM_B --port N   # confirm what actually decides")))
+
+    remember_names(KIND_RULE, [r.rule_name for r in records]
+                   + [r.rule_id for r in records], cache_key)
+    exporter.stage("rule_search", RULE_SEARCH_HEADERS, rows)
+    return rows
+
+
 # ==========================================================================
 # actions/doctor.py  --  What does THIS NSX actually serve.
 # ==========================================================================
@@ -7881,6 +8704,177 @@ def unhealthy_count(probes):
 def gm_only_estate(sessions):
     """True when nothing that needs a Local Manager can possibly work."""
     return bool(sessions) and all(s.role == ROLE_GM for s in sessions)
+
+
+# ==========================================================================
+# actions/ops.py  --  Operational health: alarms, certificates, capacity.
+# ==========================================================================
+
+ALARM_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+ALARM_HEADERS = [
+    "manager", "severity", "summary", "node", "count", "first_seen", "last_seen",
+]
+CERT_HEADERS = ["manager", "name", "expires", "days_left", "used_by", "status"]
+CAP_HEADERS  = ["manager", "resource", "used", "limit", "pct", "status"]
+
+
+def _ts_ms_to_date(ms):
+    try:
+        return datetime.datetime.fromtimestamp(
+            int(ms) / 1000, tz=datetime.timezone.utc
+        ).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _days_until_ms(ms):
+    try:
+        exp = datetime.datetime.fromtimestamp(int(ms) / 1000, tz=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return (exp - now).days
+    except Exception:
+        return None
+
+
+def _color_alarm(row):
+    sev = row[1]
+    if sev == "CRITICAL":
+        return [cBR(c) for c in row]
+    if sev == "HIGH":
+        return [cBY(c) for c in row]
+    return row
+
+
+def act_alarms(sessions, exporter, severity=None, show_all=False):
+    """Collect alarms from every manager, dedup by id, sort by severity."""
+    status = None if show_all else "OPEN"
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_alarms(status=status, severity=severity),
+        label="Fetching alarms",
+    )
+    seen, rows = set(), []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for alarm in (result or []):
+            aid = alarm.get(F_ID, "")
+            if aid and aid in seen:
+                continue
+            seen.add(aid)
+            rows.append([
+                s.name,
+                alarm.get(F_SEVERITY, ""),
+                alarm.get(F_FEATURE_DISPLAY_NAME,
+                          alarm.get("summary", alarm.get("alarm_source", ""))),
+                alarm.get("node_resource_display_name",
+                          alarm.get("node_id", "")),
+                str(alarm.get(F_EVENT_COUNT, 1)),
+                _ts_ms_to_date(alarm.get(F_FIRST_REPORTED_TIME, 0)),
+                _ts_ms_to_date(alarm.get(F_LAST_REPORTED_TIME, 0)),
+            ])
+    rows.sort(key=lambda r: ALARM_ORDER.get(r[1], 99))
+    section("Alarms ({})".format(len(rows)))
+    if rows:
+        table(ALARM_HEADERS, [_color_alarm(r) for r in rows])
+    else:
+        say("  No alarms found.")
+    exporter.stage("alarms", ALARM_HEADERS, rows)
+
+
+def act_cert_list(sessions, exporter, warn_days=90, expired_only=False):
+    """List TLS certificates across all managers with expiry status."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_certificates(),
+        label="Fetching certificates",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for cert in (result or []):
+            days = _days_until_ms(cert.get(F_NOT_AFTER, 0))
+            if days is None:
+                status, display = "UNKNOWN", cD("UNKNOWN")
+            elif days <= 0:
+                status, display = "EXPIRED", cBR("EXPIRED")
+            elif days <= 30:
+                status, display = "CRITICAL", cBR("CRITICAL")
+            elif days <= warn_days:
+                status, display = "WARNING", cBY("WARNING")
+            else:
+                status, display = "OK", cBG("OK")
+            if expired_only and status not in ("EXPIRED", "CRITICAL"):
+                continue
+            used = ", ".join(
+                lnk.get(F_LINK_HREF, "").rsplit("/", 1)[-1]
+                for lnk in (cert.get(F_USED_BY_LINKS) or [])
+            ) or "-"
+            rows.append([
+                s.name,
+                cert.get(F_DISPLAY_NAME, cert.get(F_ID, "")),
+                _ts_ms_to_date(cert.get(F_NOT_AFTER, 0)),
+                str(days if days is not None else "?"),
+                used,
+                display,
+            ])
+    section("Certificates ({})".format(len(rows)))
+    if rows:
+        table(CERT_HEADERS, rows)
+    else:
+        say("  No certificates found.")
+    # Store plain status strings (not colored) for structured export
+    plain_rows = [r[:-1] + [r[-1].strip("\x1b[0m").strip()] for r in rows]
+    exporter.stage("certificates", CERT_HEADERS, plain_rows)
+
+
+def act_capacity(sessions, exporter):
+    """Show per-resource utilisation across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_capacity(),
+        label="Fetching capacity",
+    )
+    all_rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        data = (result or {}).get(F_CAPACITY_USAGE_DATA, [])
+        rows = []
+        for entry in data:
+            used  = entry.get(F_CURRENT_USAGE_COUNT, 0)
+            limit = entry.get(F_MAX_SUPPORTED_COUNT, 0)
+            pct   = int(used * 100 / limit) if limit else 0
+            max_thr = entry.get(F_MAX_THRESHOLD_PERCENT, 90)
+            min_thr = entry.get(F_MIN_THRESHOLD_PERCENT, 75)
+            if pct >= max_thr:
+                display = cBR("HIGH")
+            elif pct >= min_thr:
+                display = cBY("WARN")
+            else:
+                display = cBG("OK")
+            rows.append([
+                s.name,
+                entry.get(F_USAGE_TYPE, ""),
+                str(used),
+                str(limit),
+                "{}%".format(pct),
+                display,
+            ])
+            all_rows.append(rows[-1])
+        section("{} capacity".format(s.name))
+        if rows:
+            table(CAP_HEADERS, rows)
+        else:
+            say("  No capacity data.")
+    exporter.stage("capacity", CAP_HEADERS, all_rows)
 
 
 # ==========================================================================
@@ -8510,6 +9504,836 @@ def act_drift_menu(ctx):
 
 
 # ==========================================================================
+# actions/terraform.py  --  Terraform HCL export: groups, DFW policies, certificates.
+# ==========================================================================
+
+_TF_ID_RE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _tf_id(s):
+    result = _TF_ID_RE.sub("_", str(s))
+    if result and result[0].isdigit():
+        result = "_" + result
+    return result or "_resource"
+
+
+def _hcl_str(v):
+    escaped = str(v).replace("\\", "\\\\").replace('"', '\\"')
+    return '"{}"'.format(escaped)
+
+
+def _hcl_list(items):
+    if not items:
+        return "[]"
+    return "[{}]".format(", ".join(_hcl_str(i) for i in items))
+
+
+def _hcl_groups(paths):
+    """Rule source/dest/scope field: ANY → [] for Terraform provider."""
+    if not paths or list(paths) == [ANY]:
+        return "[]"
+    return _hcl_list(paths)
+
+
+def _indent(text, n=2):
+    pad = " " * n
+    return "\n".join(pad + line if line.strip() else line
+                     for line in text.splitlines())
+
+
+def _element_block(elem):
+    """One expression element (non-conjunction) → HCL block lines."""
+    rt = elem.get(RT, "")
+    lines = []
+    if rt == RT_CONDITION:
+        lines.append("condition {")
+        lines.append('  key         = {}'.format(_hcl_str(elem.get(F_KEY, ""))))
+        lines.append('  operator    = {}'.format(_hcl_str(elem.get(F_OPERATOR, ""))))
+        lines.append('  member_type = {}'.format(_hcl_str(elem.get(F_MEMBER_TYPE, ""))))
+        lines.append('  value       = {}'.format(_hcl_str(elem.get(F_VALUE, ""))))
+        lines.append("}")
+    elif rt == RT_IPADDRESS:
+        ips = elem.get(F_IP_ADDRESSES, [])
+        lines.append("ipaddress_expression {")
+        lines.append("  ip_addresses = {}".format(_hcl_list(ips)))
+        lines.append("}")
+    elif rt == RT_PATHEXPR:
+        paths = elem.get(F_PATHS, [])
+        lines.append("path_expression {")
+        lines.append("  member_paths = {}".format(_hcl_list(paths)))
+        lines.append("}")
+    elif rt == RT_EXTERNALID:
+        ext_ids = elem.get(F_EXTERNAL_IDS, [])
+        lines.append("external_id_expression {")
+        lines.append("  external_ids = {}".format(_hcl_list(ext_ids)))
+        if F_MEMBER_TYPE in elem:
+            lines.append('  member_type  = {}'.format(
+                _hcl_str(elem[F_MEMBER_TYPE])))
+        lines.append("}")
+    elif rt == RT_NESTED:
+        inner = _expression_to_hcl(elem.get(F_EXPRESSIONS, []))
+        lines.append("criteria {")
+        lines.append(_indent(inner))
+        lines.append("}")
+    else:
+        lines.append("# unsupported expression type: {}".format(rt))
+    return "\n".join(lines)
+
+
+def _expression_to_hcl(expr_list):
+    """NSX expression list → HCL criteria/conjunction blocks."""
+    if not expr_list:
+        return ""
+    segments = []
+    current = []
+    conjunctions = []
+    for elem in expr_list:
+        if elem.get(RT) == RT_CONJUNCTION:
+            segments.append(current)
+            conjunctions.append(elem.get("conjunction_operator", "AND"))
+            current = []
+        else:
+            current.append(elem)
+    segments.append(current)
+
+    parts = []
+    for i, seg in enumerate(segments):
+        if not seg:
+            continue
+        if i > 0 and i - 1 < len(conjunctions):
+            parts.append("conjunction {{\n  operator = {}\n}}".format(
+                _hcl_str(conjunctions[i - 1])))
+        inner_lines = []
+        for elem in seg:
+            inner_lines.append(_element_block(elem))
+        parts.append("criteria {{\n{}\n}}".format(
+            _indent("\n".join(inner_lines))))
+    return "\n".join(parts)
+
+
+def _group_hcl(group, domain):
+    """nsxt_policy_group resource block."""
+    gid = group.get(F_ID, "unknown")
+    name = group.get(F_DISPLAY_NAME, gid)
+    desc = group.get(F_DESCRIPTION, "")
+    exprs = group.get("expression", [])
+    tid = _tf_id(gid)
+
+    lines = ['resource "nsxt_policy_group" {} {{'.format(_hcl_str(tid))]
+    lines.append('  display_name = {}'.format(_hcl_str(name)))
+    lines.append('  nsx_id       = {}'.format(_hcl_str(gid)))
+    lines.append('  domain       = {}'.format(_hcl_str(domain)))
+    if desc:
+        lines.append('  description  = {}'.format(_hcl_str(desc)))
+    if exprs:
+        criteria_hcl = _expression_to_hcl(exprs)
+        if criteria_hcl:
+            lines.append("")
+            lines.append(_indent(criteria_hcl))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _rule_block(rule):
+    """One rule {} block inside a security policy resource."""
+    rid = rule.get(F_ID, "unknown")
+    name = rule.get(F_DISPLAY_NAME, rid)
+    src = rule.get(F_SOURCE_GROUPS, [])
+    dst = rule.get(F_DEST_GROUPS, [])
+    scope = rule.get(F_SCOPE, [])
+    svcs = rule.get(F_SERVICES, [])
+    action = rule.get(F_ACTION_FIELD, "ALLOW")
+    direction = rule.get(F_DIRECTION, "IN_OUT")
+    ip_proto = rule.get(F_IP_PROTOCOL, "IPV4_IPV6")
+    logged = str(rule.get(F_LOGGED, False)).lower()
+    disabled = str(rule.get(F_DISABLED, False)).lower()
+    seq = rule.get(F_SEQUENCE_NUMBER, 0)
+
+    lines = ["rule {"]
+    lines.append('  display_name       = {}'.format(_hcl_str(name)))
+    lines.append('  nsx_id             = {}'.format(_hcl_str(rid)))
+    lines.append('  action             = {}'.format(_hcl_str(action)))
+    lines.append('  direction          = {}'.format(_hcl_str(direction)))
+    lines.append('  ip_protocol        = {}'.format(_hcl_str(ip_proto)))
+    lines.append('  source_groups      = {}'.format(_hcl_groups(src)))
+    lines.append('  destination_groups = {}'.format(_hcl_groups(dst)))
+    if scope and list(scope) != [ANY]:
+        lines.append('  scope              = {}'.format(_hcl_list(scope)))
+    if svcs and list(svcs) != [ANY]:
+        lines.append('  services           = {}'.format(_hcl_list(svcs)))
+    lines.append('  logged             = {}'.format(logged))
+    lines.append('  disabled           = {}'.format(disabled))
+    lines.append('  sequence_number    = {}'.format(int(seq or 0)))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _policy_hcl(policy, rules, domain):
+    """nsxt_policy_security_policy resource block with inline rule blocks."""
+    pid = policy.get(F_ID, "unknown")
+    name = policy.get(F_DISPLAY_NAME, pid)
+    category = policy.get(F_CATEGORY, "Application")
+    scope = policy.get(F_SCOPE, [])
+    seq = policy.get(F_SEQUENCE_NUMBER, 0)
+    tid = _tf_id(pid)
+
+    lines = ['resource "nsxt_policy_security_policy" {} {{'.format(_hcl_str(tid))]
+    lines.append('  display_name    = {}'.format(_hcl_str(name)))
+    lines.append('  nsx_id          = {}'.format(_hcl_str(pid)))
+    lines.append('  domain          = {}'.format(_hcl_str(domain)))
+    lines.append('  category        = {}'.format(_hcl_str(category)))
+    lines.append('  sequence_number = {}'.format(int(seq or 0)))
+    lines.append('  locked          = false')
+    if scope and list(scope) != [ANY]:
+        lines.append('  scope           = {}'.format(_hcl_list(scope)))
+    for rule in rules:
+        lines.append("")
+        lines.append(_indent(_rule_block(rule)))
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _cert_hcl(cert):
+    """nsxt_certificate resource block (PEM not available via API)."""
+    cid = cert.get(F_ID, "unknown")
+    name = cert.get(F_DISPLAY_NAME, cid)
+    tid = _tf_id(cid)
+
+    lines = ['resource "nsxt_certificate" {} {{'.format(_hcl_str(tid))]
+    lines.append('  display_name = {}'.format(_hcl_str(name)))
+    lines.append('  nsx_id       = {}'.format(_hcl_str(cid)))
+    lines.append('  # pem_encoded = "<paste certificate PEM here>"')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _imports_hcl(groups, policies, certs, domain):
+    """terraform import {} blocks for all exported resources (Terraform >= 1.5)."""
+    lines = []
+    for g in groups:
+        gid = g.get(F_ID, "")
+        tid = _tf_id(gid)
+        lines.append("import {")
+        lines.append('  to = nsxt_policy_group.{}'.format(tid))
+        lines.append('  id = "{}/{}"'.format(domain, gid))
+        lines.append("}")
+    for p in policies:
+        pid = p.get(F_ID, "")
+        tid = _tf_id(pid)
+        lines.append("import {")
+        lines.append('  to = nsxt_policy_security_policy.{}'.format(tid))
+        lines.append('  id = "{}/{}"'.format(domain, pid))
+        lines.append("}")
+    for c in certs:
+        cid = c.get(F_ID, "")
+        tid = _tf_id(cid)
+        lines.append("import {")
+        lines.append('  to = nsxt_certificate.{}'.format(tid))
+        lines.append('  id = "{}"'.format(cid))
+        lines.append("}")
+    return "\n".join(lines)
+
+
+_PROVIDER_TF = '''\
+terraform {
+  required_providers {
+    nsxt = {
+      source  = "vmware/nsxt"
+      version = ">= 3.3.0"
+    }
+  }
+  required_version = ">= 1.5"
+}
+
+provider "nsxt" {
+  host                 = "<NSX_MANAGER_HOST>"
+  username             = "<USERNAME>"
+  password             = "<PASSWORD>"
+  allow_unverified_ssl = true
+}
+'''
+
+
+def act_terraform_export(sessions, out_dir, domain="default",
+                         types=("groups", "dfw", "certs")):
+    """Fetch NSX config from all managers and write Terraform HCL files."""
+    os.makedirs(out_dir, exist_ok=True)
+    provider_path = os.path.join(out_dir, "provider.tf")
+    with open(provider_path, "w", encoding="utf-8") as f:
+        f.write(_PROVIDER_TF)
+    say("Wrote {}".format(provider_path))
+
+    for nsx in sessions:
+        mgr_dir = os.path.join(out_dir, nsx.name)
+        os.makedirs(mgr_dir, exist_ok=True)
+        section("{} — Terraform export".format(nsx.name))
+
+        groups = []
+        if "groups" in types:
+            try:
+                base = nsx.base(domain)
+                groups = nsx.get_all(p_groups(base, domain))
+            except NsxError as exc:
+                say("  groups skipped: {}".format(exc))
+                groups = []
+            if groups:
+                blocks = [_group_hcl(g, domain) for g in groups]
+                path = os.path.join(mgr_dir, "groups.tf")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n\n".join(blocks) + "\n")
+                say("  groups.tf ({} groups)".format(len(groups)))
+
+        policies = []
+        policy_rule_map = {}
+        if "dfw" in types:
+            policies = policies_for(nsx, domain)
+            if policies:
+                pairs = fetch_rules_for(nsx, domain, policies)
+                for pol, rule in pairs:
+                    pid = pol.get(F_ID, "")
+                    policy_rule_map.setdefault(pid, []).append(rule)
+                blocks = []
+                for pol in policies:
+                    pid = pol.get(F_ID, "")
+                    rules = policy_rule_map.get(pid, [])
+                    blocks.append(_policy_hcl(pol, rules, domain))
+                path = os.path.join(mgr_dir, "dfw.tf")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n\n".join(blocks) + "\n")
+                say("  dfw.tf ({} policies)".format(len(policies)))
+
+        certs = []
+        if "certs" in types:
+            try:
+                certs = nsx.get_certificates()
+            except NsxError as exc:
+                say("  certs skipped: {}".format(exc))
+                certs = []
+            if certs:
+                blocks = [_cert_hcl(c) for c in certs]
+                path = os.path.join(mgr_dir, "certs.tf")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n\n".join(blocks) + "\n")
+                say("  certs.tf ({} certs)".format(len(certs)))
+
+        if groups or policies or certs:
+            imports = _imports_hcl(groups, policies, certs, domain)
+            if imports:
+                path = os.path.join(mgr_dir, "imports.tf")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(imports + "\n")
+                say("  imports.tf")
+
+
+# ==========================================================================
+# actions/topo.py  --  Network topology: segments, edge transport nodes, BGP neighbours.
+# ==========================================================================
+
+SEG_HEADERS  = ["manager", "name", "type", "vlan", "subnet", "connected_to"]
+EDGE_HEADERS = ["manager", "name", "admin_state", "status"]
+BGP_HEADERS  = ["manager", "tier0", "neighbor", "remote_as",
+                "state", "uptime_s", "prefixes_rx"]
+
+
+def _seg_type(seg):
+    vlan = seg.get(F_VLAN_IDS, [])
+    if vlan:
+        return "vlan"
+    return "overlay"
+
+
+def _connected_to(seg):
+    path = seg.get(F_CONNECTIVITY_PATH) or ""
+    if not path:
+        return "standalone"
+    return path.rsplit("/", 1)[-1]
+
+
+def _first_subnet(seg):
+    for sub in (seg.get(F_SUBNETS) or []):
+        addr = sub.get(F_GATEWAY_ADDRESS, "")
+        if addr:
+            return addr
+    return ""
+
+
+def act_segment_list(sessions, domain, exporter, contains=None, seg_type=None):
+    """List overlay and VLAN-backed segments across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_segments(domain),
+        label="Fetching segments",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for seg in (result or []):
+            name = seg.get(F_DISPLAY_NAME, seg.get(F_ID, ""))
+            if contains and contains.lower() not in name.lower():
+                continue
+            stype = _seg_type(seg)
+            if seg_type and stype != seg_type:
+                continue
+            vlan = ", ".join(str(v) for v in (seg.get(F_VLAN_IDS) or []))
+            rows.append([
+                s.name,
+                name,
+                stype,
+                vlan or "-",
+                _first_subnet(seg) or "-",
+                _connected_to(seg),
+            ])
+    section("Segments ({})".format(len(rows)))
+    if rows:
+        table(SEG_HEADERS, rows)
+    else:
+        say("  No segments found.")
+    exporter.stage("segments", SEG_HEADERS, rows)
+
+
+def act_edge_list(sessions, exporter):
+    """List edge transport nodes and their deployment status."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_transport_nodes(node_type="EdgeNode"),
+        label="Fetching edge nodes",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for node in (result or []):
+            nid = node.get(F_ID, "")
+            name = node.get(F_DISPLAY_NAME, nid)
+            admin = node.get(F_ADMIN_STATE, "")
+            status_obj = s.get_transport_node_status(nid)
+            deploy_status = status_obj.get(F_NODE_DEPLOYMENT_STATUS, "")
+            ctrl = (status_obj.get(F_CONTROL_STATUS) or {}).get("status", "")
+            status_str = deploy_status or ctrl or "UNKNOWN"
+            admin_display = cBG(admin) if admin == "UP" else cBR(admin)
+            rows.append([s.name, name, admin_display, status_str])
+    section("Edge nodes ({})".format(len(rows)))
+    if rows:
+        table(EDGE_HEADERS, rows)
+    else:
+        say("  No edge nodes found.")
+    plain_rows = [[r[0], r[1], r[2].strip("\x1b[0m").strip(), r[3]] for r in rows]
+    exporter.stage("edges", EDGE_HEADERS, plain_rows)
+
+
+def act_bgp(sessions, domain, exporter, tier0=None, down_only=False):
+    """Show BGP neighbour state for all T0 gateways."""
+    all_rows = []
+    for s in sessions:
+        t0s = s.get_tier0s(domain)
+        for t0 in t0s:
+            t0id = t0.get(F_ID, "")
+            t0name = t0.get(F_DISPLAY_NAME, t0id)
+            if tier0 and tier0.lower() not in t0name.lower():
+                continue
+            locale_services = s.get_locale_services(t0id, domain)
+            if not locale_services:
+                continue
+            neighbors = []
+            ls_fetched = parallel_run(
+                locale_services,
+                lambda ls, _s=s, _t=t0id: _s.get_bgp_neighbors(
+                    _t, ls.get(F_ID, ""), domain),
+                label="BGP on {}".format(t0name),
+                key=lambda ls: ls.get(F_ID, ""),
+            )
+            for ls in locale_services:
+                lsid = ls.get(F_ID, "")
+                nbrs = ls_fetched.get(lsid)
+                if isinstance(nbrs, Exception) or not nbrs:
+                    continue
+                neighbors.extend(nbrs)
+            rows = []
+            for nb in neighbors:
+                state = nb.get(F_CONNECTION_STATE, "")
+                if down_only and state == "ESTABLISHED":
+                    continue
+                state_display = cBG(state) if state == "ESTABLISHED" else cBR(state)
+                rows.append([
+                    s.name,
+                    t0name,
+                    nb.get(F_NEIGHBOR_ADDRESS, ""),
+                    nb.get(F_REMOTE_AS_NUM, ""),
+                    state_display,
+                    str(nb.get(F_TIME_SINCE_ESTAB, 0)),
+                    str(nb.get(F_PREFIXES_RECEIVED, 0)),
+                ])
+                all_rows.append(rows[-1])
+            if rows:
+                section("{} — BGP on {}".format(s.name, t0name))
+                table(BGP_HEADERS, rows)
+    if not all_rows:
+        say("  No BGP neighbours found.")
+    plain_rows = [r[:4] + [r[4].strip("\x1b[0m").strip()] + r[5:] for r in all_rows]
+    exporter.stage("bgp", BGP_HEADERS, plain_rows)
+
+
+# ==========================================================================
+# actions/gw_inspect.py  --  Gateway Firewall (GFW): policy list, rule list, hygiene.
+# ==========================================================================
+
+GW_POLICY_HEADERS = ["manager", "id", "name", "category", "seq", "rules", "applied_to"]
+GW_RULE_HEADERS   = ["manager", "policy", "seq", "rule", "action",
+                     "source", "destination", "service", "state"]
+GW_HYGIENE_HEADERS = ["manager", "policy", "rule", "finding"]
+
+
+def _shorten_groups(groups):
+    if not groups or groups == [ANY]:
+        return ANY
+    return ", ".join(g.rsplit("/", 1)[-1] for g in groups)
+
+
+def _shorten_services(services):
+    if not services or services == [ANY]:
+        return ANY
+    return ", ".join(s.rsplit("/", 1)[-1] for s in services)
+
+
+def act_gw_policy_list(sessions, domain, exporter, contains=None):
+    """List gateway policies across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_gw_policies(domain),
+        label="Fetching gateway policies",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for pol in (result or []):
+            name = pol.get(F_DISPLAY_NAME, pol.get(F_ID, ""))
+            if contains and contains.lower() not in name.lower():
+                continue
+            pid = pol.get(F_ID, "")
+            rules = s.get_gw_rules(pid, domain)
+            scope_parts = [
+                g.rsplit("/", 1)[-1]
+                for g in (pol.get(F_SCOPE) or [])
+                if g != ANY
+            ]
+            rows.append([
+                s.name,
+                pid,
+                name,
+                pol.get(F_CATEGORY, ""),
+                str(pol.get(F_SEQUENCE_NUMBER, "")),
+                str(len(rules)),
+                ", ".join(scope_parts) or ANY,
+            ])
+    section("Gateway policies ({})".format(len(rows)))
+    if rows:
+        table(GW_POLICY_HEADERS, rows)
+    else:
+        say("  No gateway policies found.")
+    exporter.stage("gw_policies", GW_POLICY_HEADERS, rows)
+
+
+def act_gw_rule_list(sessions, domain, exporter, policy=None,
+                     contains=None, action=None, disabled_only=False):
+    """List gateway firewall rules across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_gw_policies(domain),
+        label="Fetching gateway policies",
+    )
+    all_rows = []
+    for s in sessions:
+        policies = fetched.get(s.name)
+        if isinstance(policies, Exception) or not policies:
+            continue
+        for pol in policies:
+            pname = pol.get(F_DISPLAY_NAME, pol.get(F_ID, ""))
+            if policy and policy.lower() not in pname.lower():
+                continue
+            pid = pol.get(F_ID, "")
+            rules = s.get_gw_rules(pid, domain)
+            for rule in rules:
+                rname = rule.get(F_DISPLAY_NAME, rule.get(F_ID, ""))
+                if contains and contains.lower() not in rname.lower():
+                    continue
+                act = rule.get(F_ACTION_FIELD, "")
+                if action and action.upper() != act.upper():
+                    continue
+                disabled = rule.get(F_DISABLED, False)
+                if disabled_only and not disabled:
+                    continue
+                act_display = cBG(act) if act == "ALLOW" else cBR(act)
+                state = cBR("DISABLED") if disabled else cD("enabled")
+                all_rows.append([
+                    s.name,
+                    pname,
+                    str(rule.get(F_SEQUENCE_NUMBER, "")),
+                    rname,
+                    act_display,
+                    _shorten_groups(rule.get(F_SOURCE_GROUPS) or []),
+                    _shorten_groups(rule.get(F_DEST_GROUPS) or []),
+                    _shorten_services(rule.get(F_SERVICES) or []),
+                    state,
+                ])
+    section("Gateway rules ({})".format(len(all_rows)))
+    if all_rows:
+        table(GW_RULE_HEADERS, all_rows)
+    else:
+        say("  No gateway rules found.")
+    plain = [
+        r[:4] + [r[4].strip("\x1b[0m").strip()] + r[5:8]
+        + [r[8].strip("\x1b[0m").strip()]
+        for r in all_rows
+    ]
+    exporter.stage("gw_rules", GW_RULE_HEADERS, plain)
+
+
+def act_gw_hygiene(sessions, domain, exporter):
+    """Gateway firewall hygiene: any-any-allow, disabled rules, drop-not-logged."""
+    findings = []
+    for s in sessions:
+        policies = s.get_gw_policies(domain)
+        for pol in policies:
+            pid = pol.get(F_ID, "")
+            pname = pol.get(F_DISPLAY_NAME, pid)
+            rules = s.get_gw_rules(pid, domain)
+            for rule in rules:
+                rname = rule.get(F_DISPLAY_NAME, rule.get(F_ID, ""))
+                act = rule.get(F_ACTION_FIELD, "")
+                src = rule.get(F_SOURCE_GROUPS, [])
+                dst = rule.get(F_DEST_GROUPS, [])
+                disabled = rule.get(F_DISABLED, False)
+                logged = rule.get(F_LOGGED, True)
+                if disabled:
+                    findings.append([s.name, pname, rname, "disabled-rule"])
+                if src == [ANY] and dst == [ANY] and act == "ALLOW":
+                    findings.append([s.name, pname, rname, "any-any-allow"])
+                if act in ("DROP", "REJECT") and not logged:
+                    findings.append([s.name, pname, rname, "drop-not-logged"])
+    section("Gateway hygiene ({} findings)".format(len(findings)))
+    if findings:
+        table(GW_HYGIENE_HEADERS, findings)
+    else:
+        say("  No issues found.")
+    exporter.stage("gw_hygiene", GW_HYGIENE_HEADERS, findings)
+
+
+# ==========================================================================
+# actions/idps.py  --  Advanced security: context profiles and IDS/IPS events.
+# ==========================================================================
+
+CTX_PROFILE_HEADERS = ["manager", "id", "name", "type", "attributes"]
+IDS_EVENT_HEADERS   = ["manager", "time", "severity", "signature",
+                       "src_ip", "dst_ip", "count"]
+IDS_PROFILE_HEADERS = ["manager", "id", "name", "overridden_signatures"]
+
+
+def _sev_color(sev):
+    s = str(sev).upper()
+    if s in ("CRITICAL", "HIGH"):
+        return cBR(s)
+    if s == "MEDIUM":
+        return cBY(s)
+    return cD(s)
+
+
+def act_context_profile_list(sessions, exporter, contains=None):
+    """List NSX context profiles (L7 app / FQDN signatures)."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_context_profiles(),
+        label="Fetching context profiles",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for cp in (result or []):
+            name = cp.get(F_DISPLAY_NAME, cp.get(F_ID, ""))
+            if contains and contains.lower() not in name.lower():
+                continue
+            attrs = cp.get("attributes") or []
+            attr_str = ", ".join(
+                "{}={}".format(a.get("key", ""), a.get("value", ""))
+                for a in attrs[:3]
+            ) or "-"
+            cp_type = cp.get("profile_type", cp.get("resource_type", ""))
+            rows.append([s.name, cp.get(F_ID, ""), name, cp_type, attr_str])
+    section("Context profiles ({})".format(len(rows)))
+    if rows:
+        table(CTX_PROFILE_HEADERS, rows)
+    else:
+        say("  No context profiles found.")
+    exporter.stage("context_profiles", CTX_PROFILE_HEADERS, rows)
+
+
+def act_ids_events(sessions, exporter, severity=None):
+    """Show IDS/IPS detection events, newest first."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_ids_events(severity=severity),
+        label="Fetching IDS events",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for ev in (result or []):
+            rows.append([
+                s.name,
+                str(ev.get("event_time", "")),
+                ev.get("severity", ""),
+                ev.get("intrusion_service_signature_id",
+                       ev.get("signature_id", "")),
+                ev.get("src_ip", ""),
+                ev.get("dst_ip", ""),
+                str(ev.get("count", 1)),
+            ])
+    rows.sort(key=lambda r: r[1], reverse=True)
+    section("IDS events ({})".format(len(rows)))
+    if rows:
+        colored = [r[:2] + [_sev_color(r[2])] + r[3:] for r in rows]
+        table(IDS_EVENT_HEADERS, colored)
+    else:
+        say("  No IDS events found.")
+    exporter.stage("ids_events", IDS_EVENT_HEADERS, rows)
+
+
+def act_ids_profiles(sessions, exporter):
+    """List IDS/IPS signature profiles."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_ids_profiles(),
+        label="Fetching IDS profiles",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for prof in (result or []):
+            overrides = prof.get("overridden_signatures") or []
+            rows.append([
+                s.name,
+                prof.get(F_ID, ""),
+                prof.get(F_DISPLAY_NAME, prof.get(F_ID, "")),
+                str(len(overrides)),
+            ])
+    section("IDS profiles ({})".format(len(rows)))
+    if rows:
+        table(IDS_PROFILE_HEADERS, rows)
+    else:
+        say("  No IDS profiles found.")
+    exporter.stage("ids_profiles", IDS_PROFILE_HEADERS, rows)
+
+
+# ==========================================================================
+# actions/vcf.py  --  VCF SDDC Manager integration: discover NSX Local Managers across all SDDCs.
+# ==========================================================================
+
+VCF_HEADERS = ["sddc", "nsx_host", "status"]
+
+
+def _vcf_get(host, path, user, password, ca_bundle=None):
+    url = "https://{}{}".format(host, path)
+    creds = base64.b64encode("{}:{}".format(user, password).encode()).decode()
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Basic {}".format(creds),
+        "Accept": "application/json",
+    })
+    ctx = ssl.create_default_context()
+    if ca_bundle:
+        ctx.load_verify_locations(ca_bundle)
+    with urllib.request.urlopen(req, context=ctx) as resp:
+        return json.loads(resp.read())
+
+
+def act_vcf_import(vcf_host, vcf_user, vcf_password, out_path,
+                   ca_bundle=None, enable_writes=False, exporter=None):
+    """Discover NSX Local Managers from VCF SDDC Manager and merge into inventory."""
+    say("Connecting to VCF SDDC Manager: {}".format(vcf_host))
+    try:
+        data = _vcf_get(vcf_host, "/v1/sddcs", vcf_user, vcf_password, ca_bundle)
+    except Exception as exc:
+        say("  Error reaching VCF SDDC Manager: {}".format(exc))
+        return
+
+    sddcs = data.get("elements", [])
+    say("  Found {} SDDC(s).".format(len(sddcs)))
+
+    existing = {}
+    if os.path.exists(out_path):
+        try:
+            with open(out_path) as f:
+                inv = json.load(f)
+            for mgr in inv.get("managers", []):
+                existing[mgr.get("host", "").lower()] = mgr
+        except Exception as exc:
+            say("  Warning: could not read {}: {}".format(out_path, exc))
+            inv = {"managers": []}
+    else:
+        inv = {"managers": []}
+
+    rows = []
+    new_entries = []
+    for sddc in sddcs:
+        sddc_name = sddc.get("name", sddc.get("id", ""))
+        nsx_mgr = sddc.get("nsxtManager") or {}
+        nsx_host = nsx_mgr.get("hostname", "")
+        if not nsx_host:
+            say("  SDDC '{}' has no nsxtManager.hostname — skipped.".format(sddc_name))
+            continue
+        host_key = nsx_host.lower()
+        if host_key in existing:
+            rows.append([sddc_name, nsx_host, "already present"])
+        else:
+            entry = {
+                "name": sddc_name,
+                "role": "lm",
+                "host": nsx_host,
+                "port": 443,
+                "scheme": "https",
+                "verify_ssl": True,
+            }
+            new_entries.append(entry)
+            rows.append([sddc_name, nsx_host, "new"])
+
+    section("VCF NSX managers ({} discovered)".format(len(rows)))
+    if rows:
+        table(VCF_HEADERS, rows)
+    else:
+        say("  No NSX managers discovered.")
+
+    if new_entries:
+        if enable_writes:
+            inv["managers"].extend(new_entries)
+            with open(out_path, "w") as f:
+                json.dump(inv, f, indent=2)
+            say("  Written to {}.".format(out_path))
+        else:
+            say("  Dry run — {} new manager(s) would be added to {}. "
+                "Pass --enable-writes to commit.".format(len(new_entries), out_path))
+    else:
+        say("  Inventory up to date — nothing to add.")
+
+    if exporter is not None:
+        exporter.stage("vcf_import", VCF_HEADERS, rows)
+
+
+# ==========================================================================
 # wizard.py  --  First-run setup.
 # ==========================================================================
 
@@ -9038,6 +10862,7 @@ getting started:
   nsxctl status                     can I reach and authenticate everywhere?
   nsxctl doctor                     what does this NSX actually serve?
   nsxctl                            interactive menu
+  nsxctl setup-path                 make `nsxctl` runnable from any terminal
 
 everyday:
   nsxctl compliance                 tagging posture across every Local Manager
@@ -9045,6 +10870,8 @@ everyday:
   nsxctl impact web-prod-01         what breaks if I retag this VM
   nsxctl trace web-01 db-01 --port 3306    can A reach B, and what decided it
   nsxctl rule list --policy app-tier
+  nsxctl rule search --ip 10.1.2.3  find every rule that could touch this IP
+  nsxctl vm groups web-prod-01      every group this VM belongs to
   nsxctl group list --contains web
   nsxctl tag apply changes.csv      dry run; add --enable-writes --yes to commit
 
@@ -9053,6 +10880,21 @@ authoring (dry run unless --enable-writes):
   nsxctl rule create allow-web-db --policy app-tier --from g-web --to g-db
   nsxctl apply changes.yaml         a declarative file of groups and rules
   nsxctl recommend flows.csv --policy app-tier --out-file proposed.json
+
+health:
+  nsxctl alarms --severity critical
+  nsxctl cert list --warn-days 30
+  nsxctl capacity
+  nsxctl terraform export --out ./tf
+  nsxctl segment list
+  nsxctl edge list
+  nsxctl bgp --down-only
+  nsxctl gw-policy list
+  nsxctl gw-rule list --policy perimeter
+  nsxctl gw-rule hygiene
+  nsxctl context-profile list
+  nsxctl idps events --severity high
+  nsxctl idps profiles
 
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
@@ -9156,6 +10998,13 @@ def build_parser():
     pass
     pass
     pass
+    pass
+    pass
+    pass
+    pass
+    pass
+    pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -9176,7 +11025,9 @@ def build_parser():
                      register_rule, register_inspect,
                      register_analysis, register_trace,
                      register_snapshot, register_apply,
-                     register_recommend,
+                     register_recommend, register_vm,
+                     register_ops, register_terraform, register_topo,
+                     register_gw, register_idps, register_vcf,
                      register_shell):
         register(sub, parents)
     return parser
@@ -9244,6 +11095,26 @@ def register_setup(sub, parents):
                    help="Exit 1 if any capability is missing or unreadable.")
     p.set_defaults(func=cmd_doctor)
 
+    p = add_command(
+        sub, parents, "setup-path", "Make `nsxctl` runnable from any terminal.",
+        description="Put the directory pip installed the launcher into onto "
+                    "your PATH.\n\n"
+                    "A wheel cannot do this at install time -- there is no "
+                    "install hook to do it from -- so on a Python installed "
+                    "without \"Add Python to PATH\", `nsxctl` is installed and "
+                    "unreachable at the same time, and the shell just says "
+                    "command not found.\n\n"
+                    "Only the per-user PATH is touched, never the system one, "
+                    "and the previous value is saved first.",
+        epilog="examples:\n"
+               "  nsxctl setup-path\n"
+               "  nsxctl setup-path --check      # report only; 1 if unreachable\n"
+               "  py -m nsx_toolkit setup-path   # when `nsxctl` will not run yet")
+    p.add_argument("--check", action="store_true",
+                   help="Report and change nothing. Exit 1 if unreachable.")
+    p.set_defaults(func=cmd_setup_path, needs_inventory=False,
+                   needs_sessions=False)
+
     p = add_command(sub, parents, "managers", "List the configured managers.")
     p.set_defaults(func=cmd_managers)
 
@@ -9297,6 +11168,66 @@ def register_setup(sub, parents):
 
 def cmd_init(args, ctx):
     return 0 if run_wizard(args.inventory) else 1
+
+
+def cmd_setup_path(args, ctx):
+    st = path_status()
+    section("LAUNCHER")
+    say("  Interpreter : {}".format(cC(sys.executable)))
+    say("  Scripts dir : {}".format(cC(st.directory)))
+    say("  Launcher    : {}".format(
+        cC(st.launcher) if st.installed else cBR("not found")))
+    say("  On PATH     : {}".format(
+        cBG("yes") if st.reachable else cBR("no")))
+    if st.resolved and st.shadowed:
+        say("  `nsxctl` is : {}".format(cBY(st.resolved)))
+    hr()
+
+    # A different copy earlier on PATH answers to the name. Appending ours
+    # cannot beat it -- PATH is first-match -- so this is reported, not
+    # "fixed" in a way that would leave the same copy winning.
+    if st.shadowed:
+        err("`nsxctl` already resolves to another file:\n"
+            "    {}\n"
+            "  Adding {} to PATH would not change that: the other copy comes\n"
+            "  first and would still win. Remove it, or call this one by its\n"
+            "  full path.".format(st.resolved, st.directory))
+        return 1
+
+    if st.reachable:
+        ok_msg("`nsxctl` runs from any terminal. Nothing to do.")
+        return 0
+
+    say("  {}".format(cD(
+        "The launcher is installed but its directory is not on PATH, so the\n"
+        "  shell cannot find it. pip warns about this and the warning scrolls\n"
+        "  past. Until it is fixed, this works from anywhere:")))
+    say("\n      {}\n".format(cB(module_command())))
+
+    if args.check:
+        return 1
+    if not st.installed:
+        err("No launcher to put on PATH -- install the package for this "
+            "interpreter first.")
+        return 2
+    if not confirm("  Add {} to your PATH? [y/N] ".format(cC(st.directory))):
+        say("\n  Nothing changed.")
+        return 1
+
+    try:
+        changed, detail = repair_path(st)
+    except ConfigError as e:
+        err(str(e))
+        return 2
+    hr()
+    if changed:
+        ok_msg("PATH updated -- {}".format(detail))
+    else:
+        say("  {}".format(detail))
+    say("  {}".format(cD(
+        "A running shell keeps the environment it started with, so this one\n"
+        "  is unchanged. Open a NEW terminal and run `nsxctl version`.")))
+    return 0
 
 
 def cmd_status(args, ctx):
@@ -9873,6 +11804,28 @@ def register_rule(sub, parents):
     dl.add_argument("--policy", help="Policy the rule is in.")
     dl.set_defaults(func=cmd_rule_delete)
 
+    sr = add_action(
+        rsub, parents, "search", "Find rules that could apply to an IP.",
+        description="Find every DFW rule whose source or destination group "
+                    "could apply to a given IP address or CIDR.\n\n"
+                    "Groups are evaluated statically: a group whose criteria "
+                    "is an explicit IPAddressExpression is checked exactly; a "
+                    "tag- or segment-based group is reported as 'possible' "
+                    "because its membership can only be confirmed at runtime. "
+                    "Use --certain to hide 'possible' rows.",
+        epilog="examples:\n"
+               "  nsxctl rule search --ip 10.1.2.3\n"
+               "  nsxctl rule search --ip 10.0.0.0/8 --certain\n"
+               "  nsxctl rule search --ip 192.168.1.1 --policy app-tier")
+    sr.add_argument("--ip", required=True, metavar="IP/CIDR",
+                    help="IP address or CIDR to search for.")
+    sr.add_argument("--certain", action="store_true",
+                    help="Hide 'possible' matches; show only rules with an "
+                         "exact IP match or ANY.")
+    sr.add_argument("--policy", metavar="NAME",
+                    help="Limit to rules in policies matching NAME.")
+    sr.set_defaults(func=cmd_rule_search)
+
     p.set_defaults(func=_rule_needs_action)
 
 
@@ -9973,9 +11926,16 @@ def cmd_rule_delete(args, ctx):
     return _rule_write(args, ctx, policy_ref=args.policy, delete=True)
 
 
+def cmd_rule_search(args, ctx):
+    act_rule_search(ctx.sessions, args.domain, ctx.exporter,
+                    ip=args.ip, certain_only=args.certain,
+                    policy_ref=args.policy, cache_key=ctx.cache_key())
+    return 0
+
+
 def _rule_needs_action(args, ctx):
     err("Specify what to do: nsxctl rule list | show | hygiene | baseline "
-        "| create | edit | move | delete")
+        "| create | edit | move | delete | search")
     return 2
 
 
@@ -10198,6 +12158,78 @@ def cmd_service_show(args, ctx):
 
 
 # ==========================================================================
+# commands/ops.py  --  Commands: alarms, cert, capacity.
+# ==========================================================================
+
+def register_ops(sub, parents):
+    # ---- alarms -------------------------------------------------------
+    p = add_command(sub, parents, "alarms",
+                    "Show open NSX alarms.",
+                    description="Collect alarms from every manager and display "
+                                "them sorted by severity. Deduplicates by alarm "
+                                "id when a GM and LMs echo the same event.",
+                    epilog="examples:\n"
+                           "  nsxctl alarms\n"
+                           "  nsxctl alarms --severity critical\n"
+                           "  nsxctl alarms --all")
+    p.add_argument("--severity", metavar="LEVEL",
+                   choices=["critical", "high", "medium", "low"],
+                   help="Show only alarms at this severity.")
+    p.add_argument("--all", dest="show_all", action="store_true",
+                   help="Include resolved alarms (default: OPEN only).")
+    p.set_defaults(func=cmd_alarms)
+
+    # ---- cert ---------------------------------------------------------
+    c = add_command(sub, parents, "cert",
+                    "TLS certificate expiry.",
+                    description="Certificate management subcommands.")
+    csub = c.add_subparsers(dest="cert_action", metavar="<action>")
+    ls = add_action(csub, parents, "list",
+                    "List certificates and expiry status.",
+                    description="List TLS certificates across every manager with "
+                                "color-coded expiry status.",
+                    epilog="examples:\n"
+                           "  nsxctl cert list\n"
+                           "  nsxctl cert list --warn-days 30\n"
+                           "  nsxctl cert list --expired")
+    ls.add_argument("--warn-days", type=int, default=90, metavar="N",
+                    help="Highlight certs expiring within N days (default: 90).")
+    ls.add_argument("--expired", action="store_true",
+                    help="Show only expired or critically-expiring certs.")
+    ls.set_defaults(func=cmd_cert_list)
+    c.set_defaults(func=lambda a, ctx: c.print_help())
+
+    # ---- capacity -----------------------------------------------------
+    q = add_command(sub, parents, "capacity",
+                    "Show NSX resource utilisation.",
+                    description="Per-resource utilisation across every manager. "
+                                "Resources approaching their limit are highlighted.",
+                    epilog="examples:\n"
+                           "  nsxctl capacity\n"
+                           "  nsxctl capacity --out-csv cap.csv")
+    q.set_defaults(func=cmd_capacity)
+
+
+def cmd_alarms(args, ctx):
+    act_alarms(ctx.sessions, ctx.exporter,
+               severity=getattr(args, "severity", None),
+               show_all=getattr(args, "show_all", False))
+    return 0
+
+
+def cmd_cert_list(args, ctx):
+    act_cert_list(ctx.sessions, ctx.exporter,
+                  warn_days=getattr(args, "warn_days", 90),
+                  expired_only=getattr(args, "expired", False))
+    return 0
+
+
+def cmd_capacity(args, ctx):
+    act_capacity(ctx.sessions, ctx.exporter)
+    return 0
+
+
+# ==========================================================================
 # commands/analysis.py  --  Analysis commands: impact, parity, compliance, audit.
 # ==========================================================================
 
@@ -10291,6 +12323,52 @@ def cmd_audit_undo(args, ctx):
     act_audit_log(ctx.audit, ctx.sessions, write_enabled=True,
                   exporter=ctx.exporter, limit=args.limit, domain=args.domain)
     return 0
+
+
+# ==========================================================================
+# commands/vm.py  --  `nsxctl vm` — VM-centric views.
+# ==========================================================================
+
+def register_vm(sub, parents):
+    p = add_command(sub, parents, "vm", "VM-centric views.")
+    vsub = p.add_subparsers(dest="vm_action", metavar="<action>")
+
+    gr = add_action(
+        vsub, parents, "groups", "Show every group a VM belongs to.",
+        description="Groups this VM is currently a member of, using NSX's own "
+                    "reverse-association index. Shows every group regardless of "
+                    "how membership is decided -- tag-based, segment-based, VIF-based "
+                    "and IP-set groups all appear, unlike the per-group member listing "
+                    "which silently skips non-VirtualMachine member types.\n\n"
+                    "Also shows how many DFW rules reference each group, so you can "
+                    "see at a glance which groups are security-relevant.",
+        epilog="examples:\n"
+               "  nsxctl vm groups web-prod-01\n"
+               "  nsxctl vm groups web   # substring match\n"
+               "  nsxctl vm groups web-prod-01 --json")
+    gr.add_argument("vm", help="VM name or substring.")
+    gr.set_defaults(func=cmd_vm_groups)
+
+    p.set_defaults(func=_vm_needs_action)
+
+
+def cmd_vm_groups(args, ctx):
+    lms = ctx.lms()
+    if not lms:
+        err("No Local Manager sessions. Add a manager with role 'lm' to your "
+            "inventory.")
+        return 2
+    try:
+        act_vm_groups(ctx.sessions, args.vm, args.domain, ctx.exporter)
+    except NsxError as e:
+        err(str(e))
+        return 2
+    return 0
+
+
+def _vm_needs_action(args, ctx):
+    err("Specify what to do: nsxctl vm groups")
+    return 2
 
 
 # ==========================================================================
@@ -10785,6 +12863,235 @@ def _short(value, limit=60):
 
 def _line(field, value):
     return "{}: {}".format(field, _short(value))
+
+
+# ==========================================================================
+# commands/terraform.py  --  Command: terraform export.
+# ==========================================================================
+
+def register_terraform(sub, parents):
+    p = add_command(sub, parents, "terraform",
+                    "Export NSX config as Terraform HCL.")
+    psub = p.add_subparsers(dest="tf_action", metavar="<action>")
+    ex = add_command(psub, parents, "export",
+                     "Write HCL files per manager and resource type.")
+    ex.add_argument("--out", default="terraform-export", metavar="DIR",
+                    help="Output directory (default: terraform-export).")
+    ex.add_argument("--types", default="groups,dfw,certs", metavar="LIST",
+                    help="Comma-separated resource types to export "
+                         "(groups, dfw, certs). Default: all.")
+    ex.set_defaults(func=cmd_terraform_export)
+    p.set_defaults(func=lambda a, ctx: p.print_help())
+
+
+def cmd_terraform_export(args, ctx):
+    types = [t.strip() for t in args.types.split(",") if t.strip()]
+    act_terraform_export(ctx.sessions, args.out,
+                         domain=getattr(args, "domain", "default"), types=types)
+    return 0
+
+
+# ==========================================================================
+# commands/topo.py  --  Commands: segment, edge, bgp.
+# ==========================================================================
+
+def register_topo(sub, parents):
+    # --- segment ---
+    seg = add_command(sub, parents, "segment", "Network segments.")
+    ssub = seg.add_subparsers(dest="seg_action", metavar="<action>")
+    ls = add_action(ssub, parents, "list", "List overlay and VLAN-backed segments.")
+    ls.add_argument("--contains", metavar="TEXT",
+                    help="Filter segments by name substring.")
+    ls.add_argument("--type", dest="seg_type", choices=["overlay", "vlan"],
+                    help="Show only overlay or VLAN-backed segments.")
+    ls.set_defaults(func=cmd_segment_list)
+    seg.set_defaults(func=lambda a, ctx: seg.print_help())
+
+    # --- edge ---
+    edge = add_command(sub, parents, "edge", "Edge transport nodes.")
+    esub = edge.add_subparsers(dest="edge_action", metavar="<action>")
+    el = add_action(esub, parents, "list", "List edge nodes and deployment status.")
+    el.set_defaults(func=cmd_edge_list)
+    edge.set_defaults(func=lambda a, ctx: edge.print_help())
+
+    # --- bgp ---
+    bgp = add_command(sub, parents, "bgp", "BGP neighbour status on T0 gateways.")
+    bgp.add_argument("--tier-0", metavar="NAME",
+                     help="Limit to one T0 gateway by name.")
+    bgp.add_argument("--down-only", action="store_true",
+                     help="Show only non-ESTABLISHED neighbours.")
+    bgp.set_defaults(func=cmd_bgp)
+
+
+def cmd_segment_list(args, ctx):
+    act_segment_list(ctx.sessions, getattr(args, "domain", "default"),
+                     ctx.exporter,
+                     contains=getattr(args, "contains", None),
+                     seg_type=getattr(args, "seg_type", None))
+    return 0
+
+
+def cmd_edge_list(args, ctx):
+    act_edge_list(ctx.sessions, ctx.exporter)
+    return 0
+
+
+def cmd_bgp(args, ctx):
+    act_bgp(ctx.sessions, getattr(args, "domain", "default"),
+            ctx.exporter,
+            tier0=getattr(args, "tier_0", None),
+            down_only=getattr(args, "down_only", False))
+    return 0
+
+
+# ==========================================================================
+# commands/gw.py  --  Commands: gw-policy, gw-rule.
+# ==========================================================================
+
+def register_gw(sub, parents):
+    # --- gw-policy ---
+    gp = add_command(sub, parents, "gw-policy", "Gateway firewall policies.")
+    gpsub = gp.add_subparsers(dest="gp_action", metavar="<action>")
+    gpl = add_action(gpsub, parents, "list", "List gateway policies.")
+    gpl.add_argument("--contains", metavar="TEXT",
+                     help="Filter by name substring.")
+    gpl.set_defaults(func=cmd_gw_policy_list)
+    gp.set_defaults(func=lambda a, ctx: gp.print_help())
+
+    # --- gw-rule ---
+    gr = add_command(sub, parents, "gw-rule", "Gateway firewall rules.")
+    grsub = gr.add_subparsers(dest="gr_action", metavar="<action>")
+
+    grl = add_action(grsub, parents, "list", "List gateway firewall rules.")
+    grl.add_argument("--policy", metavar="NAME",
+                     help="Limit to one policy by name.")
+    grl.add_argument("--contains", metavar="TEXT",
+                     help="Filter rules by name substring.")
+    grl.add_argument("--action", metavar="ACTION",
+                     choices=["allow", "drop", "reject"],
+                     help="Show only rules with this action.")
+    grl.add_argument("--disabled", action="store_true",
+                     help="Show only disabled rules.")
+    grl.set_defaults(func=cmd_gw_rule_list)
+
+    grh = add_action(grsub, parents, "hygiene",
+                     "Check gateway rules for common issues.")
+    grh.set_defaults(func=cmd_gw_hygiene)
+
+    gr.set_defaults(func=lambda a, ctx: gr.print_help())
+
+
+def cmd_gw_policy_list(args, ctx):
+    act_gw_policy_list(ctx.sessions, getattr(args, "domain", "default"),
+                       ctx.exporter,
+                       contains=getattr(args, "contains", None))
+    return 0
+
+
+def cmd_gw_rule_list(args, ctx):
+    act_gw_rule_list(ctx.sessions, getattr(args, "domain", "default"),
+                     ctx.exporter,
+                     policy=getattr(args, "policy", None),
+                     contains=getattr(args, "contains", None),
+                     action=getattr(args, "action", None),
+                     disabled_only=getattr(args, "disabled", False))
+    return 0
+
+
+def cmd_gw_hygiene(args, ctx):
+    act_gw_hygiene(ctx.sessions, getattr(args, "domain", "default"),
+                   ctx.exporter)
+    return 0
+
+
+# ==========================================================================
+# commands/idps.py  --  Commands: context-profile, idps.
+# ==========================================================================
+
+def register_idps(sub, parents):
+    # --- context-profile ---
+    cp = add_command(sub, parents, "context-profile",
+                     "NSX context profiles (L7 app / FQDN signatures).")
+    cpsub = cp.add_subparsers(dest="cp_action", metavar="<action>")
+    cpl = add_action(cpsub, parents, "list", "List context profiles.")
+    cpl.add_argument("--contains", metavar="TEXT",
+                     help="Filter by name substring.")
+    cpl.set_defaults(func=cmd_context_profile_list)
+    cp.set_defaults(func=lambda a, ctx: cp.print_help())
+
+    # --- idps ---
+    ip = add_command(sub, parents, "idps", "IDS/IPS profiles and events.")
+    ipsub = ip.add_subparsers(dest="idps_action", metavar="<action>")
+
+    ipe = add_action(ipsub, parents, "events",
+                     "Show IDS/IPS detection events.")
+    ipe.add_argument("--severity", metavar="LEVEL",
+                     choices=["critical", "high", "medium", "low"],
+                     help="Filter events by severity.")
+    ipe.set_defaults(func=cmd_ids_events)
+
+    ipp = add_action(ipsub, parents, "profiles",
+                     "List IDS/IPS signature profiles.")
+    ipp.set_defaults(func=cmd_ids_profiles)
+
+    ip.set_defaults(func=lambda a, ctx: ip.print_help())
+
+
+def cmd_context_profile_list(args, ctx):
+    act_context_profile_list(ctx.sessions, ctx.exporter,
+                             contains=getattr(args, "contains", None))
+    return 0
+
+
+def cmd_ids_events(args, ctx):
+    act_ids_events(ctx.sessions, ctx.exporter,
+                   severity=getattr(args, "severity", None))
+    return 0
+
+
+def cmd_ids_profiles(args, ctx):
+    act_ids_profiles(ctx.sessions, ctx.exporter)
+    return 0
+
+
+# ==========================================================================
+# commands/vcf.py  --  Command: vcf import.
+# ==========================================================================
+
+def register_vcf(sub, parents):
+    p = add_command(sub, parents, "vcf",
+                    "VMware Cloud Foundation (VCF) integration.")
+    psub = p.add_subparsers(dest="vcf_action", metavar="<action>")
+    imp = add_action(psub, parents, "import",
+                     "Discover NSX managers from VCF SDDC Manager and "
+                     "add them to the inventory.")
+    imp.add_argument("--vcf-host", required=True, metavar="HOST",
+                     help="VCF SDDC Manager hostname or IP.")
+    imp.add_argument("--vcf-user", default="administrator@vsphere.local",
+                     metavar="USER",
+                     help="VCF SDDC Manager username.")
+    imp.add_argument("--vcf-password", metavar="PASS",
+                     help="VCF password (prompted if omitted).")
+    imp.add_argument("--out", default="inventory.json", metavar="PATH",
+                     help="Inventory file to update (default: inventory.json).")
+    imp.set_defaults(func=cmd_vcf_import)
+    p.set_defaults(func=lambda a, ctx: p.print_help())
+
+
+def cmd_vcf_import(args, ctx):
+    password = getattr(args, "vcf_password", None)
+    if not password and not getattr(args, "non_interactive", False):
+        password = getpass.getpass("VCF password: ")
+    act_vcf_import(
+        vcf_host=args.vcf_host,
+        vcf_user=args.vcf_user,
+        vcf_password=password or "",
+        out_path=args.out,
+        ca_bundle=getattr(args, "ca_bundle", None),
+        enable_writes=getattr(args, "enable_writes", False),
+        exporter=ctx.exporter,
+    )
+    return 0
 
 
 # ==========================================================================
@@ -11473,8 +13780,34 @@ def _apply_modes(args):
     set_store_policy(args.store)
 
 
-def main(argv=None):
+def _module_launch_hint(raw):
+    """Point a stranded install at the one command that repairs it.
+
+    Reaching us through `python -m` is itself the signal: nearly everyone who
+    does it got here because `nsxctl` was not found. Printed before parsing so
+    it still appears alongside `--help`, which is the first thing that gets
+    tried; on stderr so it can never land in piped output; and only on a
+    terminal, so a script sees nothing.
+    """
+    if "--json" in raw or not sys.stderr.isatty():
+        return
+    try:
+        if path_status().reachable:
+            return
+    except Exception:  # noqa: BLE001 - a hint must never break the run
+        return
+    # Not err(): this is not an error, and the run continues normally. Not
+    # warn() either -- that prints to stdout, which is the one place a hint
+    # must never appear.
+    print("  {} `nsxctl` is installed but not on your PATH. Fix it with:"
+          "\n          {} setup-path".format(cBY("[hint]"), module_command()),
+          file=sys.stderr, flush=True)
+
+
+def main(argv=None, via_module=False):
     raw = list(sys.argv[1:] if argv is None else argv)
+    if via_module:
+        _module_launch_hint(raw)
 
     # --- old flag interface: translate, warn, continue -------------------------
     legacy_warnings = []
