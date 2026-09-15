@@ -51,7 +51,12 @@ from .api import (
     PATH_TRANSPORT_NODES,
     ROLE_GM,
     p_bgp_neighbors,
+    p_context_profiles,
     p_groups,
+    p_gw_policies,
+    p_gw_rules,
+    p_ids_events,
+    p_ids_profiles,
     p_segments,
     p_tier0_locale_services,
     p_tier0s,
@@ -542,6 +547,39 @@ class Nsx:
             return self.get(p_transport_node_status(tnid))
         except NsxError:
             return {}
+
+    def get_gw_policies(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_gw_policies(self.base(domain), domain))
+        except NsxError:
+            return []
+
+    def get_gw_rules(self, pid, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_gw_rules(self.base(domain), domain, pid))
+        except NsxError:
+            return []
+
+    def get_context_profiles(self):
+        try:
+            return self.get_all(p_context_profiles(self.base()))
+        except NsxError:
+            return []
+
+    def get_ids_profiles(self):
+        try:
+            return self.get_all(p_ids_profiles(self.base()))
+        except NsxError:
+            return []
+
+    def get_ids_events(self, severity=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if severity:
+            params["severity"] = severity.upper()
+        try:
+            return self.get_all(p_ids_events(self.base()), params=params)
+        except NsxError:
+            return []
 
     def refresh_vm(self, vm):
         """Re-read one VM straight from NSX, bypassing the cache. Used

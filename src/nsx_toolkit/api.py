@@ -76,6 +76,16 @@ PATH_BGP_NEIGHBORS = "/tier-0s/{t0id}/locale-services/{lsid}/bgp/neighbors/statu
 # Fabric/management-plane paths (absolute)
 PATH_TRANSPORT_NODES = "/api/v1/transport-nodes"
 PATH_TN_STATUS       = "/api/v1/transport-nodes/{tnid}/status"
+# Gateway Firewall paths (relative to base, domain-scoped)
+PATH_GW_POLICIES     = "/domains/{domain}/gateway-policies"
+PATH_GW_POLICY       = "/domains/{domain}/gateway-policies/{pid}"
+PATH_GW_RULES        = "/domains/{domain}/gateway-policies/{pid}/rules"
+PATH_GW_RULE         = "/domains/{domain}/gateway-policies/{pid}/rules/{rid}"
+PATH_GW_STATS        = "/domains/{domain}/gateway-policies/{pid}/statistics"
+# Advanced security paths (relative to base)
+PATH_CONTEXT_PROFILES = "/context-profiles"
+PATH_IDS_PROFILES     = "/intrusion-services/profiles"
+PATH_IDS_EVENTS       = "/intrusion-services/ids-events"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -335,6 +345,38 @@ def p_bgp_neighbors(base, t0id, lsid):
 
 def p_transport_node_status(tnid):
     return PATH_TN_STATUS.format(tnid=tnid)
+
+
+def p_gw_policies(base, domain):
+    return base + PATH_GW_POLICIES.format(domain=domain)
+
+
+def p_gw_policy(base, domain, pid):
+    return base + PATH_GW_POLICY.format(domain=domain, pid=pid)
+
+
+def p_gw_rules(base, domain, pid):
+    return base + PATH_GW_RULES.format(domain=domain, pid=pid)
+
+
+def p_gw_rule(base, domain, pid, rid):
+    return base + PATH_GW_RULE.format(domain=domain, pid=pid, rid=rid)
+
+
+def p_gw_stats(base, domain, pid):
+    return base + PATH_GW_STATS.format(domain=domain, pid=pid)
+
+
+def p_context_profiles(base):
+    return base + PATH_CONTEXT_PROFILES
+
+
+def p_ids_profiles(base):
+    return base + PATH_IDS_PROFILES
+
+
+def p_ids_events(base):
+    return base + PATH_IDS_EVENTS
 
 
 def group_id_from_path(path):

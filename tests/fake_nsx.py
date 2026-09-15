@@ -76,6 +76,11 @@ class FakeState:
         self.bgp_neighbors = {}      # {(t0id, lsid): [neighbor, ...]}
         self.transport_nodes = []
         self.tn_status = {}          # {tnid: status_dict}
+        self.gw_policies = []
+        self.gw_rules = {}           # policy id -> [rule dicts]
+        self.context_profiles = []
+        self.ids_profiles = []
+        self.ids_events = []
 
     # --- content helpers ---------------------------------------------------
     def add_vm(self, name, external_id=None, tags=None, power="VM_RUNNING"):
@@ -303,6 +308,52 @@ class FakeState:
             "host_node_deployment_status": status,
             "control_connection_status": {"status": "UP"}}
         return node
+
+    def add_gw_policy(self, pid, display_name=None, category="LocalGatewayRules",
+                      seq=10, scope=None):
+        pol = {"id": pid, "display_name": display_name or pid,
+               "category": category, "sequence_number": seq,
+               "scope": scope or ["ANY"],
+               "path": "/infra/gateway-policies/{}".format(pid)}
+        pol.update(_meta(pol["path"]))
+        self.gw_policies.append(pol)
+        self.gw_rules.setdefault(pid, [])
+        return pol
+
+    def add_gw_rule(self, pid, rid, display_name=None, action="ALLOW",
+                    src=None, dst=None, services=None, disabled=False, logged=True):
+        rule = {"id": rid, "display_name": display_name or rid,
+                "action": action,
+                "sequence_number": len(self.gw_rules.get(pid, [])) * 10 + 10,
+                "source_groups": src or ["ANY"],
+                "destination_groups": dst or ["ANY"],
+                "services": services or ["ANY"],
+                "disabled": disabled, "logged": logged}
+        self.gw_rules.setdefault(pid, []).append(rule)
+        return rule
+
+    def add_context_profile(self, cpid, display_name=None, profile_type="AppID",
+                            attrs=None):
+        cp = {"id": cpid, "display_name": display_name or cpid,
+              "profile_type": profile_type,
+              "attributes": attrs or [{"key": "APP_ID", "value": "SSL"}]}
+        self.context_profiles.append(cp)
+        return cp
+
+    def add_ids_profile(self, iid, display_name=None, overrides=None):
+        prof = {"id": iid, "display_name": display_name or iid,
+                "overridden_signatures": overrides or []}
+        self.ids_profiles.append(prof)
+        return prof
+
+    def add_ids_event(self, severity="HIGH", sig_id="1001", src="10.0.0.1",
+                      dst="10.0.0.2", count=1, event_time="2026-09-01T00:00:00Z"):
+        ev = {"severity": severity.upper(),
+              "intrusion_service_signature_id": sig_id,
+              "src_ip": src, "dst_ip": dst,
+              "count": count, "event_time": event_time}
+        self.ids_events.append(ev)
+        return ev
 
     def set_hit_count(self, pid, rid, hits, last_update=1700000000000):
         """Drive the hit-count and baseline checks."""
@@ -743,6 +794,31 @@ class _Handler(BaseHTTPRequestHandler):
             t0id, lsid = m.group(1), m.group(2)
             neighbors = st.bgp_neighbors.get((t0id, lsid), [])
             return self._send(200, {"results": neighbors})
+
+        # gateway-policies
+        m = re.match(r"^/domains/([^/]+)/gateway-policies$", rel)
+        if m:
+            return self._send(200, _page(st.gw_policies, query))
+
+        m = re.match(r"^/domains/([^/]+)/gateway-policies/([^/]+)/rules$", rel)
+        if m:
+            pid = m.group(2)
+            return self._send(200, _page(st.gw_rules.get(pid, []), query))
+
+        # context-profiles
+        if rel == "/context-profiles":
+            return self._send(200, _page(st.context_profiles, query))
+
+        # IDS/IPS
+        if rel == "/intrusion-services/profiles":
+            return self._send(200, _page(st.ids_profiles, query))
+
+        if rel == "/intrusion-services/ids-events":
+            sev = (query.get("severity") or [None])[0]
+            evs = st.ids_events
+            if sev:
+                evs = [e for e in evs if e.get("severity") == sev.upper()]
+            return self._send(200, _page(evs, query))
 
         parts = [p for p in rel.split("/") if p]
         # domains/{domain}/groups[/{gid}[/members/virtual-machines]]

@@ -81,6 +81,12 @@ health:
   nsxctl segment list
   nsxctl edge list
   nsxctl bgp --down-only
+  nsxctl gw-policy list
+  nsxctl gw-rule list --policy perimeter
+  nsxctl gw-rule hygiene
+  nsxctl context-profile list
+  nsxctl idps events --severity high
+  nsxctl idps profiles
 
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
@@ -176,6 +182,8 @@ def build_parser():
     from .analysis import register_analysis
     from .apply import register_apply
     from .group import register_group
+    from .gw import register_gw
+    from .idps import register_idps
     from .inspect import register_inspect
     from .ops import register_ops
     from .recommend import register_recommend
@@ -187,6 +195,7 @@ def build_parser():
     from .terraform import register_terraform
     from .topo import register_topo
     from .trace import register_trace
+    from .vcf import register_vcf
     from .vm import register_vm
 
     global_parent = argparse.ArgumentParser(add_help=False)
@@ -210,6 +219,7 @@ def build_parser():
                      register_snapshot, register_apply,
                      register_recommend, register_vm,
                      register_ops, register_terraform, register_topo,
+                     register_gw, register_idps, register_vcf,
                      register_shell):
         register(sub, parents)
     return parser

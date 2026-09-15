@@ -547,6 +547,16 @@ PATH_BGP_NEIGHBORS = "/tier-0s/{t0id}/locale-services/{lsid}/bgp/neighbors/statu
 # Fabric/management-plane paths (absolute)
 PATH_TRANSPORT_NODES = "/api/v1/transport-nodes"
 PATH_TN_STATUS       = "/api/v1/transport-nodes/{tnid}/status"
+# Gateway Firewall paths (relative to base, domain-scoped)
+PATH_GW_POLICIES     = "/domains/{domain}/gateway-policies"
+PATH_GW_POLICY       = "/domains/{domain}/gateway-policies/{pid}"
+PATH_GW_RULES        = "/domains/{domain}/gateway-policies/{pid}/rules"
+PATH_GW_RULE         = "/domains/{domain}/gateway-policies/{pid}/rules/{rid}"
+PATH_GW_STATS        = "/domains/{domain}/gateway-policies/{pid}/statistics"
+# Advanced security paths (relative to base)
+PATH_CONTEXT_PROFILES = "/context-profiles"
+PATH_IDS_PROFILES     = "/intrusion-services/profiles"
+PATH_IDS_EVENTS       = "/intrusion-services/ids-events"
 
 # --- Query parameters ------------------------------------------------------
 PARAM_CURSOR = "cursor"
@@ -806,6 +816,38 @@ def p_bgp_neighbors(base, t0id, lsid):
 
 def p_transport_node_status(tnid):
     return PATH_TN_STATUS.format(tnid=tnid)
+
+
+def p_gw_policies(base, domain):
+    return base + PATH_GW_POLICIES.format(domain=domain)
+
+
+def p_gw_policy(base, domain, pid):
+    return base + PATH_GW_POLICY.format(domain=domain, pid=pid)
+
+
+def p_gw_rules(base, domain, pid):
+    return base + PATH_GW_RULES.format(domain=domain, pid=pid)
+
+
+def p_gw_rule(base, domain, pid, rid):
+    return base + PATH_GW_RULE.format(domain=domain, pid=pid, rid=rid)
+
+
+def p_gw_stats(base, domain, pid):
+    return base + PATH_GW_STATS.format(domain=domain, pid=pid)
+
+
+def p_context_profiles(base):
+    return base + PATH_CONTEXT_PROFILES
+
+
+def p_ids_profiles(base):
+    return base + PATH_IDS_PROFILES
+
+
+def p_ids_events(base):
+    return base + PATH_IDS_EVENTS
 
 
 def group_id_from_path(path):
@@ -1871,6 +1913,39 @@ class Nsx:
             return self.get(p_transport_node_status(tnid))
         except NsxError:
             return {}
+
+    def get_gw_policies(self, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_gw_policies(self.base(domain), domain))
+        except NsxError:
+            return []
+
+    def get_gw_rules(self, pid, domain=DEFAULT_DOMAIN):
+        try:
+            return self.get_all(p_gw_rules(self.base(domain), domain, pid))
+        except NsxError:
+            return []
+
+    def get_context_profiles(self):
+        try:
+            return self.get_all(p_context_profiles(self.base()))
+        except NsxError:
+            return []
+
+    def get_ids_profiles(self):
+        try:
+            return self.get_all(p_ids_profiles(self.base()))
+        except NsxError:
+            return []
+
+    def get_ids_events(self, severity=None):
+        params = {PARAM_PAGE_SIZE: PAGE_SIZE}
+        if severity:
+            params["severity"] = severity.upper()
+        try:
+            return self.get_all(p_ids_events(self.base()), params=params)
+        except NsxError:
+            return []
 
     def refresh_vm(self, vm):
         """Re-read one VM straight from NSX, bypassing the cache. Used
@@ -9904,6 +9979,361 @@ def act_bgp(sessions, domain, exporter, tier0=None, down_only=False):
 
 
 # ==========================================================================
+# actions/gw_inspect.py  --  Gateway Firewall (GFW): policy list, rule list, hygiene.
+# ==========================================================================
+
+GW_POLICY_HEADERS = ["manager", "id", "name", "category", "seq", "rules", "applied_to"]
+GW_RULE_HEADERS   = ["manager", "policy", "seq", "rule", "action",
+                     "source", "destination", "service", "state"]
+GW_HYGIENE_HEADERS = ["manager", "policy", "rule", "finding"]
+
+
+def _shorten_groups(groups):
+    if not groups or groups == [ANY]:
+        return ANY
+    return ", ".join(g.rsplit("/", 1)[-1] for g in groups)
+
+
+def _shorten_services(services):
+    if not services or services == [ANY]:
+        return ANY
+    return ", ".join(s.rsplit("/", 1)[-1] for s in services)
+
+
+def act_gw_policy_list(sessions, domain, exporter, contains=None):
+    """List gateway policies across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_gw_policies(domain),
+        label="Fetching gateway policies",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for pol in (result or []):
+            name = pol.get(F_DISPLAY_NAME, pol.get(F_ID, ""))
+            if contains and contains.lower() not in name.lower():
+                continue
+            pid = pol.get(F_ID, "")
+            rules = s.get_gw_rules(pid, domain)
+            scope_parts = [
+                g.rsplit("/", 1)[-1]
+                for g in (pol.get(F_SCOPE) or [])
+                if g != ANY
+            ]
+            rows.append([
+                s.name,
+                pid,
+                name,
+                pol.get(F_CATEGORY, ""),
+                str(pol.get(F_SEQUENCE_NUMBER, "")),
+                str(len(rules)),
+                ", ".join(scope_parts) or ANY,
+            ])
+    section("Gateway policies ({})".format(len(rows)))
+    if rows:
+        table(GW_POLICY_HEADERS, rows)
+    else:
+        say("  No gateway policies found.")
+    exporter.stage("gw_policies", GW_POLICY_HEADERS, rows)
+
+
+def act_gw_rule_list(sessions, domain, exporter, policy=None,
+                     contains=None, action=None, disabled_only=False):
+    """List gateway firewall rules across all managers."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_gw_policies(domain),
+        label="Fetching gateway policies",
+    )
+    all_rows = []
+    for s in sessions:
+        policies = fetched.get(s.name)
+        if isinstance(policies, Exception) or not policies:
+            continue
+        for pol in policies:
+            pname = pol.get(F_DISPLAY_NAME, pol.get(F_ID, ""))
+            if policy and policy.lower() not in pname.lower():
+                continue
+            pid = pol.get(F_ID, "")
+            rules = s.get_gw_rules(pid, domain)
+            for rule in rules:
+                rname = rule.get(F_DISPLAY_NAME, rule.get(F_ID, ""))
+                if contains and contains.lower() not in rname.lower():
+                    continue
+                act = rule.get(F_ACTION_FIELD, "")
+                if action and action.upper() != act.upper():
+                    continue
+                disabled = rule.get(F_DISABLED, False)
+                if disabled_only and not disabled:
+                    continue
+                act_display = cBG(act) if act == "ALLOW" else cBR(act)
+                state = cBR("DISABLED") if disabled else cD("enabled")
+                all_rows.append([
+                    s.name,
+                    pname,
+                    str(rule.get(F_SEQUENCE_NUMBER, "")),
+                    rname,
+                    act_display,
+                    _shorten_groups(rule.get(F_SOURCE_GROUPS) or []),
+                    _shorten_groups(rule.get(F_DEST_GROUPS) or []),
+                    _shorten_services(rule.get(F_SERVICES) or []),
+                    state,
+                ])
+    section("Gateway rules ({})".format(len(all_rows)))
+    if all_rows:
+        table(GW_RULE_HEADERS, all_rows)
+    else:
+        say("  No gateway rules found.")
+    plain = [
+        r[:4] + [r[4].strip("\x1b[0m").strip()] + r[5:8]
+        + [r[8].strip("\x1b[0m").strip()]
+        for r in all_rows
+    ]
+    exporter.stage("gw_rules", GW_RULE_HEADERS, plain)
+
+
+def act_gw_hygiene(sessions, domain, exporter):
+    """Gateway firewall hygiene: any-any-allow, disabled rules, drop-not-logged."""
+    findings = []
+    for s in sessions:
+        policies = s.get_gw_policies(domain)
+        for pol in policies:
+            pid = pol.get(F_ID, "")
+            pname = pol.get(F_DISPLAY_NAME, pid)
+            rules = s.get_gw_rules(pid, domain)
+            for rule in rules:
+                rname = rule.get(F_DISPLAY_NAME, rule.get(F_ID, ""))
+                act = rule.get(F_ACTION_FIELD, "")
+                src = rule.get(F_SOURCE_GROUPS, [])
+                dst = rule.get(F_DEST_GROUPS, [])
+                disabled = rule.get(F_DISABLED, False)
+                logged = rule.get(F_LOGGED, True)
+                if disabled:
+                    findings.append([s.name, pname, rname, "disabled-rule"])
+                if src == [ANY] and dst == [ANY] and act == "ALLOW":
+                    findings.append([s.name, pname, rname, "any-any-allow"])
+                if act in ("DROP", "REJECT") and not logged:
+                    findings.append([s.name, pname, rname, "drop-not-logged"])
+    section("Gateway hygiene ({} findings)".format(len(findings)))
+    if findings:
+        table(GW_HYGIENE_HEADERS, findings)
+    else:
+        say("  No issues found.")
+    exporter.stage("gw_hygiene", GW_HYGIENE_HEADERS, findings)
+
+
+# ==========================================================================
+# actions/idps.py  --  Advanced security: context profiles and IDS/IPS events.
+# ==========================================================================
+
+CTX_PROFILE_HEADERS = ["manager", "id", "name", "type", "attributes"]
+IDS_EVENT_HEADERS   = ["manager", "time", "severity", "signature",
+                       "src_ip", "dst_ip", "count"]
+IDS_PROFILE_HEADERS = ["manager", "id", "name", "overridden_signatures"]
+
+
+def _sev_color(sev):
+    s = str(sev).upper()
+    if s in ("CRITICAL", "HIGH"):
+        return cBR(s)
+    if s == "MEDIUM":
+        return cBY(s)
+    return cD(s)
+
+
+def act_context_profile_list(sessions, exporter, contains=None):
+    """List NSX context profiles (L7 app / FQDN signatures)."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_context_profiles(),
+        label="Fetching context profiles",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for cp in (result or []):
+            name = cp.get(F_DISPLAY_NAME, cp.get(F_ID, ""))
+            if contains and contains.lower() not in name.lower():
+                continue
+            attrs = cp.get("attributes") or []
+            attr_str = ", ".join(
+                "{}={}".format(a.get("key", ""), a.get("value", ""))
+                for a in attrs[:3]
+            ) or "-"
+            cp_type = cp.get("profile_type", cp.get("resource_type", ""))
+            rows.append([s.name, cp.get(F_ID, ""), name, cp_type, attr_str])
+    section("Context profiles ({})".format(len(rows)))
+    if rows:
+        table(CTX_PROFILE_HEADERS, rows)
+    else:
+        say("  No context profiles found.")
+    exporter.stage("context_profiles", CTX_PROFILE_HEADERS, rows)
+
+
+def act_ids_events(sessions, exporter, severity=None):
+    """Show IDS/IPS detection events, newest first."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_ids_events(severity=severity),
+        label="Fetching IDS events",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for ev in (result or []):
+            rows.append([
+                s.name,
+                str(ev.get("event_time", "")),
+                ev.get("severity", ""),
+                ev.get("intrusion_service_signature_id",
+                       ev.get("signature_id", "")),
+                ev.get("src_ip", ""),
+                ev.get("dst_ip", ""),
+                str(ev.get("count", 1)),
+            ])
+    rows.sort(key=lambda r: r[1], reverse=True)
+    section("IDS events ({})".format(len(rows)))
+    if rows:
+        colored = [r[:2] + [_sev_color(r[2])] + r[3:] for r in rows]
+        table(IDS_EVENT_HEADERS, colored)
+    else:
+        say("  No IDS events found.")
+    exporter.stage("ids_events", IDS_EVENT_HEADERS, rows)
+
+
+def act_ids_profiles(sessions, exporter):
+    """List IDS/IPS signature profiles."""
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_ids_profiles(),
+        label="Fetching IDS profiles",
+    )
+    rows = []
+    for s in sessions:
+        result = fetched.get(s.name)
+        if isinstance(result, Exception):
+            say("  {} skipped: {}".format(s.name, result))
+            continue
+        for prof in (result or []):
+            overrides = prof.get("overridden_signatures") or []
+            rows.append([
+                s.name,
+                prof.get(F_ID, ""),
+                prof.get(F_DISPLAY_NAME, prof.get(F_ID, "")),
+                str(len(overrides)),
+            ])
+    section("IDS profiles ({})".format(len(rows)))
+    if rows:
+        table(IDS_PROFILE_HEADERS, rows)
+    else:
+        say("  No IDS profiles found.")
+    exporter.stage("ids_profiles", IDS_PROFILE_HEADERS, rows)
+
+
+# ==========================================================================
+# actions/vcf.py  --  VCF SDDC Manager integration: discover NSX Local Managers across all SDDCs.
+# ==========================================================================
+
+VCF_HEADERS = ["sddc", "nsx_host", "status"]
+
+
+def _vcf_get(host, path, user, password, ca_bundle=None):
+    url = "https://{}{}".format(host, path)
+    creds = base64.b64encode("{}:{}".format(user, password).encode()).decode()
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Basic {}".format(creds),
+        "Accept": "application/json",
+    })
+    ctx = ssl.create_default_context()
+    if ca_bundle:
+        ctx.load_verify_locations(ca_bundle)
+    with urllib.request.urlopen(req, context=ctx) as resp:
+        return json.loads(resp.read())
+
+
+def act_vcf_import(vcf_host, vcf_user, vcf_password, out_path,
+                   ca_bundle=None, enable_writes=False, exporter=None):
+    """Discover NSX Local Managers from VCF SDDC Manager and merge into inventory."""
+    say("Connecting to VCF SDDC Manager: {}".format(vcf_host))
+    try:
+        data = _vcf_get(vcf_host, "/v1/sddcs", vcf_user, vcf_password, ca_bundle)
+    except Exception as exc:
+        say("  Error reaching VCF SDDC Manager: {}".format(exc))
+        return
+
+    sddcs = data.get("elements", [])
+    say("  Found {} SDDC(s).".format(len(sddcs)))
+
+    existing = {}
+    if os.path.exists(out_path):
+        try:
+            with open(out_path) as f:
+                inv = json.load(f)
+            for mgr in inv.get("managers", []):
+                existing[mgr.get("host", "").lower()] = mgr
+        except Exception as exc:
+            say("  Warning: could not read {}: {}".format(out_path, exc))
+            inv = {"managers": []}
+    else:
+        inv = {"managers": []}
+
+    rows = []
+    new_entries = []
+    for sddc in sddcs:
+        sddc_name = sddc.get("name", sddc.get("id", ""))
+        nsx_mgr = sddc.get("nsxtManager") or {}
+        nsx_host = nsx_mgr.get("hostname", "")
+        if not nsx_host:
+            say("  SDDC '{}' has no nsxtManager.hostname — skipped.".format(sddc_name))
+            continue
+        host_key = nsx_host.lower()
+        if host_key in existing:
+            rows.append([sddc_name, nsx_host, "already present"])
+        else:
+            entry = {
+                "name": sddc_name,
+                "role": "lm",
+                "host": nsx_host,
+                "port": 443,
+                "scheme": "https",
+                "verify_ssl": True,
+            }
+            new_entries.append(entry)
+            rows.append([sddc_name, nsx_host, "new"])
+
+    section("VCF NSX managers ({} discovered)".format(len(rows)))
+    if rows:
+        table(VCF_HEADERS, rows)
+    else:
+        say("  No NSX managers discovered.")
+
+    if new_entries:
+        if enable_writes:
+            inv["managers"].extend(new_entries)
+            with open(out_path, "w") as f:
+                json.dump(inv, f, indent=2)
+            say("  Written to {}.".format(out_path))
+        else:
+            say("  Dry run — {} new manager(s) would be added to {}. "
+                "Pass --enable-writes to commit.".format(len(new_entries), out_path))
+    else:
+        say("  Inventory up to date — nothing to add.")
+
+    if exporter is not None:
+        exporter.stage("vcf_import", VCF_HEADERS, rows)
+
+
+# ==========================================================================
 # wizard.py  --  First-run setup.
 # ==========================================================================
 
@@ -10459,6 +10889,12 @@ health:
   nsxctl segment list
   nsxctl edge list
   nsxctl bgp --down-only
+  nsxctl gw-policy list
+  nsxctl gw-rule list --policy perimeter
+  nsxctl gw-rule hygiene
+  nsxctl context-profile list
+  nsxctl idps events --severity high
+  nsxctl idps profiles
 
 scheduled:
   nsxctl rule hygiene --only-on-change --notify $SLACK_URL
@@ -10566,6 +11002,9 @@ def build_parser():
     pass
     pass
     pass
+    pass
+    pass
+    pass
 
     global_parent = argparse.ArgumentParser(add_help=False)
     add_global_args(global_parent)
@@ -10588,6 +11027,7 @@ def build_parser():
                      register_snapshot, register_apply,
                      register_recommend, register_vm,
                      register_ops, register_terraform, register_topo,
+                     register_gw, register_idps, register_vcf,
                      register_shell):
         register(sub, parents)
     return parser
@@ -12501,6 +12941,156 @@ def cmd_bgp(args, ctx):
             ctx.exporter,
             tier0=getattr(args, "tier_0", None),
             down_only=getattr(args, "down_only", False))
+    return 0
+
+
+# ==========================================================================
+# commands/gw.py  --  Commands: gw-policy, gw-rule.
+# ==========================================================================
+
+def register_gw(sub, parents):
+    # --- gw-policy ---
+    gp = add_command(sub, parents, "gw-policy", "Gateway firewall policies.")
+    gpsub = gp.add_subparsers(dest="gp_action", metavar="<action>")
+    gpl = add_action(gpsub, parents, "list", "List gateway policies.")
+    gpl.add_argument("--contains", metavar="TEXT",
+                     help="Filter by name substring.")
+    gpl.set_defaults(func=cmd_gw_policy_list)
+    gp.set_defaults(func=lambda a, ctx: gp.print_help())
+
+    # --- gw-rule ---
+    gr = add_command(sub, parents, "gw-rule", "Gateway firewall rules.")
+    grsub = gr.add_subparsers(dest="gr_action", metavar="<action>")
+
+    grl = add_action(grsub, parents, "list", "List gateway firewall rules.")
+    grl.add_argument("--policy", metavar="NAME",
+                     help="Limit to one policy by name.")
+    grl.add_argument("--contains", metavar="TEXT",
+                     help="Filter rules by name substring.")
+    grl.add_argument("--action", metavar="ACTION",
+                     choices=["allow", "drop", "reject"],
+                     help="Show only rules with this action.")
+    grl.add_argument("--disabled", action="store_true",
+                     help="Show only disabled rules.")
+    grl.set_defaults(func=cmd_gw_rule_list)
+
+    grh = add_action(grsub, parents, "hygiene",
+                     "Check gateway rules for common issues.")
+    grh.set_defaults(func=cmd_gw_hygiene)
+
+    gr.set_defaults(func=lambda a, ctx: gr.print_help())
+
+
+def cmd_gw_policy_list(args, ctx):
+    act_gw_policy_list(ctx.sessions, getattr(args, "domain", "default"),
+                       ctx.exporter,
+                       contains=getattr(args, "contains", None))
+    return 0
+
+
+def cmd_gw_rule_list(args, ctx):
+    act_gw_rule_list(ctx.sessions, getattr(args, "domain", "default"),
+                     ctx.exporter,
+                     policy=getattr(args, "policy", None),
+                     contains=getattr(args, "contains", None),
+                     action=getattr(args, "action", None),
+                     disabled_only=getattr(args, "disabled", False))
+    return 0
+
+
+def cmd_gw_hygiene(args, ctx):
+    act_gw_hygiene(ctx.sessions, getattr(args, "domain", "default"),
+                   ctx.exporter)
+    return 0
+
+
+# ==========================================================================
+# commands/idps.py  --  Commands: context-profile, idps.
+# ==========================================================================
+
+def register_idps(sub, parents):
+    # --- context-profile ---
+    cp = add_command(sub, parents, "context-profile",
+                     "NSX context profiles (L7 app / FQDN signatures).")
+    cpsub = cp.add_subparsers(dest="cp_action", metavar="<action>")
+    cpl = add_action(cpsub, parents, "list", "List context profiles.")
+    cpl.add_argument("--contains", metavar="TEXT",
+                     help="Filter by name substring.")
+    cpl.set_defaults(func=cmd_context_profile_list)
+    cp.set_defaults(func=lambda a, ctx: cp.print_help())
+
+    # --- idps ---
+    ip = add_command(sub, parents, "idps", "IDS/IPS profiles and events.")
+    ipsub = ip.add_subparsers(dest="idps_action", metavar="<action>")
+
+    ipe = add_action(ipsub, parents, "events",
+                     "Show IDS/IPS detection events.")
+    ipe.add_argument("--severity", metavar="LEVEL",
+                     choices=["critical", "high", "medium", "low"],
+                     help="Filter events by severity.")
+    ipe.set_defaults(func=cmd_ids_events)
+
+    ipp = add_action(ipsub, parents, "profiles",
+                     "List IDS/IPS signature profiles.")
+    ipp.set_defaults(func=cmd_ids_profiles)
+
+    ip.set_defaults(func=lambda a, ctx: ip.print_help())
+
+
+def cmd_context_profile_list(args, ctx):
+    act_context_profile_list(ctx.sessions, ctx.exporter,
+                             contains=getattr(args, "contains", None))
+    return 0
+
+
+def cmd_ids_events(args, ctx):
+    act_ids_events(ctx.sessions, ctx.exporter,
+                   severity=getattr(args, "severity", None))
+    return 0
+
+
+def cmd_ids_profiles(args, ctx):
+    act_ids_profiles(ctx.sessions, ctx.exporter)
+    return 0
+
+
+# ==========================================================================
+# commands/vcf.py  --  Command: vcf import.
+# ==========================================================================
+
+def register_vcf(sub, parents):
+    p = add_command(sub, parents, "vcf",
+                    "VMware Cloud Foundation (VCF) integration.")
+    psub = p.add_subparsers(dest="vcf_action", metavar="<action>")
+    imp = add_action(psub, parents, "import",
+                     "Discover NSX managers from VCF SDDC Manager and "
+                     "add them to the inventory.")
+    imp.add_argument("--vcf-host", required=True, metavar="HOST",
+                     help="VCF SDDC Manager hostname or IP.")
+    imp.add_argument("--vcf-user", default="administrator@vsphere.local",
+                     metavar="USER",
+                     help="VCF SDDC Manager username.")
+    imp.add_argument("--vcf-password", metavar="PASS",
+                     help="VCF password (prompted if omitted).")
+    imp.add_argument("--out", default="inventory.json", metavar="PATH",
+                     help="Inventory file to update (default: inventory.json).")
+    imp.set_defaults(func=cmd_vcf_import)
+    p.set_defaults(func=lambda a, ctx: p.print_help())
+
+
+def cmd_vcf_import(args, ctx):
+    password = getattr(args, "vcf_password", None)
+    if not password and not getattr(args, "non_interactive", False):
+        password = getpass.getpass("VCF password: ")
+    act_vcf_import(
+        vcf_host=args.vcf_host,
+        vcf_user=args.vcf_user,
+        vcf_password=password or "",
+        out_path=args.out,
+        ca_bundle=getattr(args, "ca_bundle", None),
+        enable_writes=getattr(args, "enable_writes", False),
+        exporter=ctx.exporter,
+    )
     return 0
 
 
