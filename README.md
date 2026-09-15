@@ -1,153 +1,163 @@
+<div align="center">
+
 # nsxctl
 
 **NSX Toolkit — distributed firewall, groups, tags and operational health from the command line.**
 
-`nsxctl` is a read-first, write-gated CLI for VMware NSX. It talks to a Global Manager and every Local Manager simultaneously, surfaces policy intent alongside live state, and guards every change behind an audited write gate. The tool ships as both a standard Python package and a zero-dependency single-file script for jumpbox use.
-
 [![CI](https://github.com/sampath9966/nsx-vDefend/actions/workflows/ci.yml/badge.svg)](https://github.com/sampath9966/nsx-vDefend/actions/workflows/ci.yml)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://pypi.org/project/nsxctl/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%20|%203.10%20|%203.11%20|%203.12%20|%203.13-3776ab?logo=python&logoColor=white)](https://pypi.org/project/nsxctl/)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
+[![540 tests](https://img.shields.io/badge/tests-540%20passing-brightgreen)](https://github.com/sampath9966/nsx-vDefend/actions)
+
+</div>
+
+---
+
+Query every NSX manager in your estate in a single command. Trace flows. Audit and roll back every change. Export as Terraform. No dependencies — runs on a jumpbox with nothing but Python.
+
+```
+$ nsxctl rule hygiene --fail-on high
+
+  DFW hygiene (12 checks) ─────────────────────────────────────────
+
+  CRITICAL  any-any-allow     [default] Emergency-Access         any → any ALLOW
+  HIGH      drop-not-logged   [lm-lon]  Block-Untrusted          any → Untrusted DROP
+  HIGH      shadowed          [lm-fra]  Allow-HTTPS              shadowed by Emergency-Access above it
+  soft      disabled-rule     [lm-lon]  Old-Allow-RDP            disabled, 90+ days
+
+  3 findings at HIGH or above.
+
+$ echo $?
+1
+```
 
 ---
 
 ## Contents
 
 - [Why nsxctl](#why-nsxctl)
-- [Feature overview](#feature-overview)
-- [Installation](#installation)
+- [What it does](#what-it-does)
+- [Install](#install)
 - [Quick start](#quick-start)
-- [Command reference](#command-reference)
+- [Commands](#commands)
 - [Configuration](#configuration)
 - [Writing changes](#writing-changes)
 - [VCF integration](#vcf-integration)
-- [CI and automation](#ci-and-automation)
+- [CI and pipelines](#ci-and-pipelines)
 - [Contributing](#contributing)
-- [License](#license)
 
 ---
 
 ## Why nsxctl
 
-NSX ships with a capable UI and a REST API, but neither is optimised for an engineer who needs to answer operational questions quickly across a fleet of managers, or who wants change control baked into the workflow rather than bolted on. `nsxctl` fills that gap:
+The NSX UI answers one question at a time. The API answers whatever you can script. `nsxctl` sits between them: a read-first CLI built for the engineers who maintain NSX rather than the ones who deployed it.
 
-- **Read by default.** Every command is read-only unless `--enable-writes` is passed. There are no accidental mutations.
-- **Audited writes.** Every change is logged with its author, timestamp and before/after diff. `nsxctl audit` lists history; `nsxctl audit undo` rolls back individual changes.
-- **Fan-out.** A single invocation queries the Global Manager and all Local Managers in parallel and merges the results.
-- **No API sprawl.** The tool maps a small set of composable flags (`--manager`, `--all-lm`, `--domain`, `--project`) onto the correct API paths so you don't have to.
-- **Zero dependencies on a jumpbox.** The `nsx-toolkit.py` amalgam runs with only the Python standard library.
-
----
-
-## Feature overview
-
-| Area | Commands |
-|---|---|
-| **Configuration** | `init`, `status`, `login`, `config`, `managers`, `profiles`, `projects` |
-| **Groups** | `group list`, `group show`, `group members` |
-| **Tags** | `tag show`, `tag set`, `tag bulk` |
-| **Distributed Firewall** | `rule list`, `rule show`, `policy list`, `service list`, `rule hygiene`, `rule search` |
-| **Gateway Firewall** | `gw-policy list`, `gw-rule list`, `gw-rule hygiene` |
-| **Tracing** | `trace` — static evaluation + live NSX traceflow |
-| **Impact analysis** | `impact`, `parity`, `compliance`, `vm groups` |
-| **Recommendations** | `recommend` — propose rules from a flow export |
-| **Snapshots & drift** | `snapshot save/restore`, `drift` |
-| **Declarative apply** | `apply` — idempotent group and rule authoring from YAML/JSON |
-| **Operational health** | `alarms`, `cert list`, `capacity` |
-| **Network topology** | `segment list`, `edge list`, `bgp` |
-| **Advanced security** | `context-profile list`, `idps events`, `idps profile list` |
-| **Terraform export** | `terraform export` — HCL per manager for the NSX Terraform provider |
-| **VCF integration** | `vcf import` — discover Local Managers from SDDC Manager |
-| **Audit & undo** | `audit list`, `audit undo` |
-| **Automation** | `--out-csv`, `--out-json`, `--out-html`, `--out-junit`, `--out-sarif`, `--out-metrics`, `--notify` |
+- **Read by default.** Nothing mutates unless you pass `--enable-writes`. No accidental changes.
+- **Audited writes.** Every change is logged with before/after diff and a change ticket. One command to roll back.
+- **Fan-out.** One invocation hits the GM and every LM in parallel and merges results.
+- **No dependencies.** The `nsx-toolkit.py` amalgam runs on Python standard library only — drop it on a jumpbox and use it immediately.
+- **Pipeline-native.** JUnit, SARIF, Prometheus metrics, and webhook notification built in.
 
 ---
 
-## Installation
+## What it does
 
-### pip (recommended)
+<table>
+<tr><th>Area</th><th>Commands</th></tr>
+<tr><td><b>Connectivity</b></td><td><code>init</code> · <code>status</code> · <code>login</code> · <code>config</code> · <code>managers</code> · <code>profiles</code></td></tr>
+<tr><td><b>Groups</b></td><td><code>group list</code> · <code>group show</code> · <code>group members</code></td></tr>
+<tr><td><b>Tags</b></td><td><code>tag show</code> · <code>tag set</code> · <code>tag bulk</code></td></tr>
+<tr><td><b>Distributed firewall</b></td><td><code>rule list</code> · <code>rule show</code> · <code>rule hygiene</code> · <code>rule search --ip</code> · <code>policy list</code> · <code>service list</code></td></tr>
+<tr><td><b>Gateway firewall</b></td><td><code>gw-policy list</code> · <code>gw-rule list</code> · <code>gw-rule hygiene</code></td></tr>
+<tr><td><b>Tracing</b></td><td><code>trace</code> — static evaluation + live NSX traceflow</td></tr>
+<tr><td><b>Impact & analysis</b></td><td><code>impact</code> · <code>vm groups</code> · <code>parity</code> · <code>compliance</code></td></tr>
+<tr><td><b>Declarative authoring</b></td><td><code>apply</code> · <code>audit list</code> · <code>audit undo</code></td></tr>
+<tr><td><b>Snapshots</b></td><td><code>snapshot save</code> · <code>snapshot restore</code> · <code>drift</code></td></tr>
+<tr><td><b>Recommendations</b></td><td><code>recommend</code> — rules from a flow export</td></tr>
+<tr><td><b>Operational health</b></td><td><code>alarms</code> · <code>cert list</code> · <code>capacity</code></td></tr>
+<tr><td><b>Network topology</b></td><td><code>segment list</code> · <code>edge list</code> · <code>bgp</code></td></tr>
+<tr><td><b>Advanced security</b></td><td><code>context-profile list</code> · <code>idps events</code> · <code>idps profile list</code></td></tr>
+<tr><td><b>Terraform</b></td><td><code>terraform export</code> — HCL per manager for the NSX provider</td></tr>
+<tr><td><b>VCF</b></td><td><code>vcf import</code> — discover managers from SDDC Manager</td></tr>
+</table>
 
+---
+
+## Install
+
+**pip**
 ```sh
 pip install nsxctl
 ```
 
-### Single-file script — no dependencies, works on any jumpbox
-
+**Single file — zero dependencies, works anywhere Python runs**
 ```sh
 curl -LO https://github.com/sampath9966/nsx-vDefend/releases/latest/download/nsx-toolkit.py
 python3 nsx-toolkit.py --help
 ```
 
-### From source
-
+**Source**
 ```sh
 git clone https://github.com/sampath9966/nsx-vDefend.git
-cd nsx-vDefend
-pip install -e ".[dev]"
+cd nsx-vDefend && pip install -e ".[dev]"
 ```
 
-**Requirements:** Python 3.9 or later. No runtime dependencies. `requests` is used automatically when present; the stdlib `urllib` transport is the fallback.
+> **Requirements:** Python ≥ 3.9. No runtime dependencies. `requests` is used when present; stdlib `urllib` is the fallback.
 
 ---
 
 ## Quick start
 
 ```sh
-# 1. Create an inventory file
+# Create inventory.json and verify connectivity
 nsxctl init
-
-# 2. Verify connectivity
 nsxctl status
 
-# 3. List all security groups across every manager
+# Explore
 nsxctl group list
-
-# 4. List DFW rules, filtered by policy name
 nsxctl rule list --policy web-tier
+nsxctl alarms --severity high
 
-# 5. Trace a flow between two VMs
+# Trace a flow
 nsxctl trace web-prod-01 db-prod-01 --port 5432
 
-# 6. Show open alarms
-nsxctl alarms
+# Run a hygiene check (exits 1 when findings ≥ HIGH)
+nsxctl rule hygiene --fail-on high --out-sarif hygiene.sarif
 
-# 7. Export configuration as Terraform HCL
+# Export the full estate as Terraform HCL
 nsxctl terraform export --out ./tf-export
 
-# 8. Discover NSX managers from VCF SDDC Manager
-nsxctl vcf import --vcf-host sddc-mgr.example.com
+# In a VCF environment, auto-populate the inventory from SDDC Manager
+nsxctl vcf import --vcf-host sddc-mgr.corp.example.com --enable-writes
 ```
 
 ---
 
-## Command reference
+## Commands
 
-Full per-command documentation lives in [`docs/commands.md`](docs/commands.md).
+Full documentation: **[docs/commands.md](docs/commands.md)**
 
-A shell completion script is available for bash, zsh and fish:
+Shell completion:
 
 ```sh
-# bash
-nsxctl completion bash >> ~/.bash_completion
-
-# zsh
-nsxctl completion zsh >> ~/.zshrc
+nsxctl completion bash >> ~/.bash_completion   # bash
+nsxctl completion zsh  >> ~/.zshrc             # zsh
+nsxctl completion fish >> ~/.config/fish/completions/nsxctl.fish
 ```
 
 ---
 
 ## Configuration
 
-`nsxctl` reads an **inventory file** that describes the managers in your estate. By default it looks for `./inventory.json` and then `~/.nsx_toolkit/inventory.json`.
+`nsxctl` reads an inventory file (`./inventory.json` → `~/.nsx_toolkit/inventory.json`).
 
 ```jsonc
-// inventory.json
 {
   "managers": [
     {
       "name": "gm",
-      "role": "gm",
+      "role": "gm",                           // "gm" | "lm"
       "host": "gm.nsx.example.com",
-      "port": 443,
       "verify_ssl": true,
       "auth": "session",
       "username_env": "NSX_GM_USER",
@@ -157,7 +167,6 @@ nsxctl completion zsh >> ~/.zshrc
       "name": "lm-london",
       "role": "lm",
       "host": "lm-lon.nsx.example.com",
-      "verify_ssl": true,
       "ca_bundle": "/etc/pki/tls/certs/corp-ca.pem",
       "auth": "session",
       "username_env": "NSX_LM_LONDON_USER",
@@ -167,35 +176,39 @@ nsxctl completion zsh >> ~/.zshrc
 }
 ```
 
-See [`docs/configuration.md`](docs/configuration.md) for the full schema, credential storage options (keyring, plaintext, environment variables), multi-profile inventories, NSX Projects scoping, and CA bundle configuration.
+See **[docs/configuration.md](docs/configuration.md)** for the full schema, credential backends (keyring, plaintext, env), multi-profile inventories, NSX Projects scoping, and tag taxonomy.
 
 ---
 
 ## Writing changes
 
-All write commands require `--enable-writes`. Without it, every mutating path is a dry run that shows what would change.
+Everything is read-only by default. Mutations require an explicit opt-in:
 
 ```sh
-# Preview what would change
-nsxctl apply groups.yaml
+# Preview (safe — no API writes)
+nsxctl apply policy.yaml
 
-# Apply the change
-nsxctl apply groups.yaml --enable-writes
+# Apply
+nsxctl apply policy.yaml --enable-writes
 
-# Review the audit log
+# Review what changed
 nsxctl audit list
 
 # Roll back a specific change
 nsxctl audit undo <change-id> --enable-writes
 ```
 
-See [`docs/authoring.md`](docs/authoring.md) for the declarative file format, change-ticket integration, and the write-gate design.
+The declarative format supports groups, policies, and rules in YAML or JSON. Every write is logged with its before/after diff and an optional change ticket reference (`--change-ticket CHG0012345`).
+
+See **[docs/authoring.md](docs/authoring.md)** for the format, ticket integration, and rollback.
+
+---
 
 ---
 
 ## VCF integration
 
-In a VMware Cloud Foundation environment, `nsxctl vcf import` queries the SDDC Manager API and populates `inventory.json` automatically:
+`nsxctl vcf import` discovers NSX Local Managers from a VCF SDDC Manager and populates the inventory automatically:
 
 ```sh
 nsxctl vcf import \
@@ -205,62 +218,75 @@ nsxctl vcf import \
   --enable-writes
 ```
 
-The command discovers every SDDC's NSX Local Manager, merges new entries into the existing inventory without duplicating hosts already present, and prints a status table. Omit `--enable-writes` for a dry-run preview.
+Discovers every SDDC, extracts `nsxtManager.hostname`, merges new entries into the inventory (existing hosts are never duplicated), and prints a status table. Omit `--enable-writes` for a dry-run preview.
 
-See [`docs/vcf.md`](docs/vcf.md) for TLS options and multi-SDDC fleet patterns.
+See **[docs/vcf.md](docs/vcf.md)** for TLS options and multi-SDDC fleet patterns.
 
 ---
 
-## CI and automation
+## CI and pipelines
 
-`nsxctl` is designed to run unattended. Key flags for pipelines:
+`nsxctl` is built for unattended runs. Key flags:
 
 | Flag | Purpose |
 |---|---|
-| `--non-interactive` | Never prompt; fail fast instead |
+| `--non-interactive` | Never prompt — fail fast instead |
 | `--no-color` | Plain output for log aggregators |
-| `--only-on-change` | Exit 0 silently when nothing changed (drift, hygiene) |
+| `--only-on-change` | Exit 0 silently when nothing changed |
 | `--out-junit PATH` | JUnit XML for test reporters |
 | `--out-sarif PATH` | SARIF for GitHub Code Scanning |
 | `--out-metrics PATH` | Prometheus text format for push-gateway |
-| `--notify URL` | POST a JSON summary to a webhook after each run |
+| `--notify URL` | POST a JSON summary to a webhook |
 
-Example: nightly drift detection in GitHub Actions:
+Full pipeline recipes (GitHub Actions, Jenkins, Prometheus, webhooks): **[docs/ci.md](docs/ci.md)**
+
+**Example: nightly drift detection**
 
 ```yaml
-- name: Check NSX drift
+- name: NSX drift check
   run: |
     nsxctl drift \
       --non-interactive \
       --no-color \
       --only-on-change \
-      --out-sarif drift.sarif
+      --out-sarif nsx-drift.sarif
   env:
     NSX_GM_USER: ${{ secrets.NSX_GM_USER }}
     NSX_GM_PASS: ${{ secrets.NSX_GM_PASS }}
+
+- name: Upload drift to Code Scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: nsx-drift.sarif
+```
+
+**Example: hygiene gate in a change pipeline**
+
+```sh
+nsxctl rule hygiene \
+  --fail-on high \
+  --non-interactive \
+  --out-junit hygiene.xml \
+  --notify "$TEAMS_WEBHOOK"
 ```
 
 ---
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup, the test suite, the single-file build, and the coding conventions.
-
-The short version:
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full guide. The short version:
 
 ```sh
-git clone https://github.com/sampath9966/nsx-vDefend.git
-cd nsx-vDefend
 pip install -e ".[dev]"
-pytest
+pytest                                          # 540 tests, ~3 min
 ruff check src/ tests/
-python tools/build_single_file.py --check
+python tools/build_single_file.py --check       # single-file sync
 ```
 
-All PRs must keep the full test suite green across Python 3.9–3.13 and pass the single-file sync check.
+PRs must keep all five Python versions green and pass the single-file sync check. See the [PR template](.github/pull_request_template.md) for the full checklist.
 
 ---
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+[Apache License 2.0](LICENSE)
