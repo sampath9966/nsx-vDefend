@@ -40,6 +40,7 @@ GLOBAL_DEFAULTS = {
     "force": False,
     "out_csv": None,
     "out_json": None,
+    "out_xlsx": None,
     "out_html": None,
     "out_junit": None,
     "out_sarif": None,
@@ -142,6 +143,8 @@ def add_global_args(parser):
                      help="Write results to CSV.")
     out.add_argument("--out-json", metavar="PATH", default=argparse.SUPPRESS,
                      help="Write results to JSON.")
+    out.add_argument("--out-xlsx", metavar="PATH", default=argparse.SUPPRESS,
+                     help="Write results to an Excel workbook.")
     out.add_argument("--out-html", metavar="PATH", default=argparse.SUPPRESS,
                      help="Write a shareable HTML report where supported.")
     out.add_argument("--out-junit", metavar="PATH", default=argparse.SUPPRESS,

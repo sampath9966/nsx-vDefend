@@ -35,6 +35,7 @@ MODULES = [
     "creds.py",
     "http.py",
     "audit.py",
+    "excel.py",
     "export.py",
     "render.py",
     "policy.py",

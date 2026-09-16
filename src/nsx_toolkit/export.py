@@ -12,6 +12,7 @@ import json
 import os
 import re
 
+from .excel import write_xlsx
 from .output import ask, cC, is_json_mode, ok_msg, say
 from .paths import DEFAULT_EXPORT_DIR, local_stamp, utc_now_iso
 
@@ -131,6 +132,23 @@ class Exporter:
             written.append(target)
         return written
 
+    def to_xlsx(self, path=None):
+        sets = [rs for rs in self._sets if rs.rows]
+        if not sets:
+            return []
+        if path and len(sets) > 1:
+            sheets = [(rs.label, rs.headers, rs.rows) for rs in sets]
+            self._ensure_dir(path)
+            write_xlsx(path, sheets)
+            return [path]
+        written = []
+        for i, rs in enumerate(sets):
+            target = self._target(path, rs, i, len(sets), "xlsx")
+            self._ensure_dir(target)
+            write_xlsx(target, [(rs.label, rs.headers, rs.rows)])
+            written.append(target)
+        return written
+
     def json_payload(self):
         return [{"label": rs.label, "count": len(rs.rows),
                  "records": rs.as_dicts()} for rs in self._sets]
@@ -143,12 +161,15 @@ def offer_export(exporter):
         return
     total = sum(len(rs.rows) for rs in exporter.sets)
     say("\n  {} record(s) available.".format(cC(str(total))))
-    c = ask("  Export? [c]sv / [j]son / [n]o: ",
+    c = ask("  Export? [c]sv / [j]son / [x]lsx / [n]o: ",
             default="n", allow_back=False).lower()
     if c in ("c", "csv"):
         for p in exporter.to_csv():
             ok_msg("Saved: {}".format(p))
     elif c in ("j", "json"):
         for p in exporter.to_json():
+            ok_msg("Saved: {}".format(p))
+    elif c in ("x", "xlsx"):
+        for p in exporter.to_xlsx():
             ok_msg("Saved: {}".format(p))
     exporter.clear()

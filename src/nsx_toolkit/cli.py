@@ -371,6 +371,9 @@ def main(argv=None, via_module=False):
         if first.out_json and exporter.has_staged():
             for path in exporter.to_json(first.out_json):
                 say("  Exported: {}".format(path))
+        if first.out_xlsx and exporter.has_staged():
+            for path in exporter.to_xlsx(first.out_xlsx):
+                say("  Exported: {}".format(path))
         if any((first.out_junit, first.out_sarif, first.out_metrics,
                 first.notify)):
             _write_sinks(first, exporter, command, profile, first.project,
