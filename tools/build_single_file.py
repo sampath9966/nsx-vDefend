@@ -69,6 +69,7 @@ MODULES = [
     "actions/terraform.py",
     "actions/topo.py",
     "actions/gw_inspect.py",
+    "actions/gw_write.py",
     "actions/idps.py",
     "actions/vcf.py",
     "wizard.py",

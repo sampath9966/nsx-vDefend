@@ -54,6 +54,8 @@ from .api import (
     p_context_profiles,
     p_groups,
     p_gw_policies,
+    p_gw_policy,
+    p_gw_rule,
     p_gw_rules,
     p_ids_events,
     p_ids_profiles,
@@ -559,6 +561,24 @@ class Nsx:
             return self.get_all(p_gw_rules(self.base(domain), domain, pid))
         except NsxError:
             return []
+
+    def put_gw_policy(self, domain, pid, body):
+        return self.put(p_gw_policy(self.base(domain), domain, pid), body)
+
+    def delete_gw_policy(self, domain, pid):
+        return self.delete(p_gw_policy(self.base(domain), domain, pid))
+
+    def put_gw_rule(self, domain, pid, rid, body):
+        return self.put(p_gw_rule(self.base(domain), domain, pid, rid), body)
+
+    def delete_gw_rule(self, domain, pid, rid):
+        return self.delete(p_gw_rule(self.base(domain), domain, pid, rid))
+
+    def get_gw_rule(self, domain, pid, rid):
+        try:
+            return self.get(p_gw_rule(self.base(domain), domain, pid, rid))
+        except NsxError:
+            return None
 
     def get_context_profiles(self):
         try:

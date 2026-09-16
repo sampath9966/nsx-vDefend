@@ -1926,6 +1926,24 @@ class Nsx:
         except NsxError:
             return []
 
+    def put_gw_policy(self, domain, pid, body):
+        return self.put(p_gw_policy(self.base(domain), domain, pid), body)
+
+    def delete_gw_policy(self, domain, pid):
+        return self.delete(p_gw_policy(self.base(domain), domain, pid))
+
+    def put_gw_rule(self, domain, pid, rid, body):
+        return self.put(p_gw_rule(self.base(domain), domain, pid, rid), body)
+
+    def delete_gw_rule(self, domain, pid, rid):
+        return self.delete(p_gw_rule(self.base(domain), domain, pid, rid))
+
+    def get_gw_rule(self, domain, pid, rid):
+        try:
+            return self.get(p_gw_rule(self.base(domain), domain, pid, rid))
+        except NsxError:
+            return None
+
     def get_context_profiles(self):
         try:
             return self.get_all(p_context_profiles(self.base()))
@@ -10127,6 +10145,218 @@ def act_gw_hygiene(sessions, domain, exporter):
 
 
 # ==========================================================================
+# actions/gw_write.py  --  Gateway Firewall write operations: create, edit, move, delete rules and policies.
+# ==========================================================================
+
+def _gw_slug(name):
+    """Turn a display name into a valid NSX object ID."""
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "-", name).strip("-")
+    return slug or "rule"
+
+
+def _resolve_policy(nsx, name, domain):
+    """Return the first gateway policy matching *name* (exact then substring)."""
+    policies = nsx.get_gw_policies(domain)
+    exact = next((p for p in policies
+                  if p.get(F_DISPLAY_NAME) == name or p.get(F_ID) == name), None)
+    if exact:
+        return exact
+    hits = [p for p in policies
+            if name.lower() in (p.get(F_DISPLAY_NAME) or "").lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise NsxError(
+            "Ambiguous policy name '{}': matches {}. Use the full name.".format(
+                name, ", ".join(p.get(F_DISPLAY_NAME, p.get(F_ID)) for p in hits)))
+    raise NsxError("Gateway policy '{}' not found.".format(name))
+
+
+def _resolve_rule(nsx, policy_id, name, domain):
+    """Return the first rule in *policy_id* matching *name*."""
+    rules = nsx.get_gw_rules(policy_id, domain)
+    exact = next((r for r in rules
+                  if r.get(F_DISPLAY_NAME) == name or r.get(F_ID) == name), None)
+    if exact:
+        return exact
+    hits = [r for r in rules
+            if name.lower() in (r.get(F_DISPLAY_NAME) or "").lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        raise NsxError(
+            "Ambiguous rule name '{}': matches {}.".format(
+                name, ", ".join(r.get(F_DISPLAY_NAME, r.get(F_ID)) for r in hits)))
+    raise NsxError("Rule '{}' not found in policy.".format(name))
+
+
+# ── gw-policy create / delete ────────────────────────────────────────────────
+
+def act_gw_policy_create(sessions, domain, exporter, name, category,
+                         seq, enable_writes, yes):
+    """Create a gateway policy on every session."""
+    pid = _gw_slug(name)
+    body = {
+        "id": pid,
+        "display_name": name,
+        "category": category,
+        "sequence_number": seq,
+    }
+    section("GW policy create — {}".format(name))
+    if not enable_writes:
+        say("  {} id={} category={} seq={}".format(
+            cBY("DRY RUN:"), pid, category, seq))
+        say("  Re-run with --enable-writes to apply.")
+        return
+    for nsx in sessions:
+        try:
+            nsx.put_gw_policy(domain, pid, body)
+            say("  {} [{}]".format(cBG("Created"), nsx.name))
+        except NsxError as e:
+            say("  {} [{}] {}".format(cBR("FAILED"), nsx.name, str(e)))
+
+
+def act_gw_policy_delete(sessions, domain, exporter, name, enable_writes, yes):
+    """Delete a gateway policy on every session."""
+    section("GW policy delete — {}".format(name))
+    if not enable_writes:
+        say("  {} Re-run with --enable-writes to apply.".format(cBY("DRY RUN.")))
+        return
+    for nsx in sessions:
+        try:
+            pol = _resolve_policy(nsx, name, domain)
+            pid = pol[F_ID]
+            say("  About to delete policy '{}' ({}) from [{}]".format(
+                pol.get(F_DISPLAY_NAME, pid), pid, nsx.name))
+            if not confirm("  Proceed? [y/N]: "):
+                say("  Cancelled.")
+                continue
+            nsx.delete_gw_policy(domain, pid)
+            say("  {} [{}]".format(cBG("Deleted"), nsx.name))
+        except NsxError as e:
+            say("  {} [{}] {}".format(cBR("FAILED"), nsx.name, str(e)))
+
+
+# ── gw-rule create / edit / move / delete ────────────────────────────────────
+
+def act_gw_rule_create(sessions, domain, exporter, policy, name,
+                       src, dst, service, action, seq, logged,
+                       disabled, enable_writes, yes):
+    """Create a gateway firewall rule."""
+    rid = _gw_slug(name)
+    body = {
+        "id": rid,
+        "display_name": name,
+        "action": action.upper(),
+        "source_groups": src or [ANY],
+        "destination_groups": dst or [ANY],
+        "services": [service] if service else [ANY],
+        "sequence_number": seq,
+        "logged": logged,
+        "disabled": disabled,
+    }
+    section("GW rule create — {}".format(name))
+    if not enable_writes:
+        say("  {} policy={} action={} src={} dst={} service={}".format(
+            cBY("DRY RUN:"), policy, action,
+            src or ["ANY"], dst or ["ANY"], service or "ANY"))
+        say("  Re-run with --enable-writes to apply.")
+        return
+    for nsx in sessions:
+        try:
+            pol = _resolve_policy(nsx, policy, domain)
+            pid = pol[F_ID]
+            nsx.put_gw_rule(domain, pid, rid, body)
+            say("  {} [{}]".format(cBG("Created"), nsx.name))
+        except NsxError as e:
+            say("  {} [{}] {}".format(cBR("FAILED"), nsx.name, str(e)))
+
+
+def act_gw_rule_edit(sessions, domain, exporter, policy, name,
+                     action, src, dst, service, logged, disabled,
+                     enable_writes, yes):
+    """Edit fields on an existing gateway firewall rule."""
+    section("GW rule edit — {}".format(name))
+    if not enable_writes:
+        say("  {} Re-run with --enable-writes to apply.".format(cBY("DRY RUN.")))
+        return
+    for nsx in sessions:
+        try:
+            pol = _resolve_policy(nsx, policy, domain)
+            pid = pol[F_ID]
+            rule = _resolve_rule(nsx, pid, name, domain)
+            updated = dict(rule)
+            if action is not None:
+                updated["action"] = action.upper()
+            if src is not None:
+                updated["source_groups"] = src
+            if dst is not None:
+                updated["destination_groups"] = dst
+            if service is not None:
+                updated["services"] = [service]
+            if logged is not None:
+                updated["logged"] = logged
+            if disabled is not None:
+                updated["disabled"] = disabled
+            if not confirm("  Apply changes to '{}' in [{}]? [y/N]: ".format(
+                    name, nsx.name)):
+                say("  Cancelled.")
+                continue
+            nsx.put_gw_rule(domain, pid, rule[F_ID], updated)
+            say("  {} [{}]".format(cBG("Updated"), nsx.name))
+        except NsxError as e:
+            say("  {} [{}] {}".format(cBR("FAILED"), nsx.name, str(e)))
+
+
+def act_gw_rule_move(sessions, domain, exporter, policy, name,
+                     before, enable_writes, yes):
+    """Reorder a gateway rule to appear before another rule."""
+    section("GW rule move — {} before {}".format(name, before))
+    if not enable_writes:
+        say("  {} Re-run with --enable-writes to apply.".format(cBY("DRY RUN.")))
+        return
+    for nsx in sessions:
+        try:
+            pol = _resolve_policy(nsx, policy, domain)
+            pid = pol[F_ID]
+            rule = _resolve_rule(nsx, pid, name, domain)
+            anchor = _resolve_rule(nsx, pid, before, domain)
+            anchor_seq = anchor.get(F_SEQUENCE_NUMBER, 10)
+            new_seq = max(1, anchor_seq - 1)
+            updated = dict(rule)
+            updated[F_SEQUENCE_NUMBER] = new_seq
+            nsx.put_gw_rule(domain, pid, rule[F_ID], updated)
+            say("  {} seq={} [{}]".format(cBG("Moved"), new_seq, nsx.name))
+        except NsxError as e:
+            say("  {} [{}] {}".format(cBR("FAILED"), nsx.name, str(e)))
+
+
+def act_gw_rule_delete(sessions, domain, exporter, policy, name,
+                       enable_writes, yes):
+    """Delete a gateway firewall rule."""
+    section("GW rule delete — {}".format(name))
+    if not enable_writes:
+        say("  {} Re-run with --enable-writes to apply.".format(cBY("DRY RUN.")))
+        return
+    for nsx in sessions:
+        try:
+            pol = _resolve_policy(nsx, policy, domain)
+            pid = pol[F_ID]
+            rule = _resolve_rule(nsx, pid, name, domain)
+            rid = rule[F_ID]
+            say("  About to delete '{}' ({}) from policy '{}' [{}]".format(
+                rule.get(F_DISPLAY_NAME, rid), rid,
+                pol.get(F_DISPLAY_NAME, pid), nsx.name))
+            if not confirm("  Proceed? [y/N]: "):
+                say("  Cancelled.")
+                continue
+            nsx.delete_gw_rule(domain, pid, rid)
+            say("  {} [{}]".format(cBG("Deleted"), nsx.name))
+        except NsxError as e:
+            say("  {} [{}] {}".format(cBR("FAILED"), nsx.name, str(e)))
+
+
+# ==========================================================================
 # actions/idps.py  --  Advanced security: context profiles and IDS/IPS events.
 # ==========================================================================
 
@@ -12952,10 +13182,27 @@ def register_gw(sub, parents):
     # --- gw-policy ---
     gp = add_command(sub, parents, "gw-policy", "Gateway firewall policies.")
     gpsub = gp.add_subparsers(dest="gp_action", metavar="<action>")
+
     gpl = add_action(gpsub, parents, "list", "List gateway policies.")
     gpl.add_argument("--contains", metavar="TEXT",
                      help="Filter by name substring.")
     gpl.set_defaults(func=cmd_gw_policy_list)
+
+    gpc = add_action(gpsub, parents, "create",
+                     "Create a gateway policy (--enable-writes).")
+    gpc.add_argument("name", help="Display name for the new policy.")
+    gpc.add_argument("--category", default="LocalGatewayRules",
+                     metavar="CAT",
+                     help="Policy category (default: LocalGatewayRules).")
+    gpc.add_argument("--seq", type=int, default=10, metavar="N",
+                     help="Sequence number (default: 10).")
+    gpc.set_defaults(func=cmd_gw_policy_create)
+
+    gpd = add_action(gpsub, parents, "delete",
+                     "Delete a gateway policy (--enable-writes).")
+    gpd.add_argument("name", help="Policy name or id.")
+    gpd.set_defaults(func=cmd_gw_policy_delete)
+
     gp.set_defaults(func=lambda a, ctx: gp.print_help())
 
     # --- gw-rule ---
@@ -12978,6 +13225,68 @@ def register_gw(sub, parents):
                      "Check gateway rules for common issues.")
     grh.set_defaults(func=cmd_gw_hygiene)
 
+    grc = add_action(grsub, parents, "create",
+                     "Create a gateway rule (--enable-writes).")
+    grc.add_argument("name", help="Display name for the new rule.")
+    grc.add_argument("--policy", required=True, metavar="NAME",
+                     help="Gateway policy to add the rule to.")
+    grc.add_argument("--from", dest="src", metavar="GROUP", action="append",
+                     help="Source group (repeat for multiple; default: ANY).")
+    grc.add_argument("--to", dest="dst", metavar="GROUP", action="append",
+                     help="Destination group (repeat for multiple; default: ANY).")
+    grc.add_argument("--service", metavar="PATH",
+                     help="Service path (default: ANY).")
+    grc.add_argument("--action", dest="rule_action", default="ALLOW",
+                     choices=["ALLOW", "DROP", "REJECT"],
+                     help="Rule action (default: ALLOW).")
+    grc.add_argument("--seq", type=int, default=10, metavar="N",
+                     help="Sequence number (default: 10).")
+    grc.add_argument("--no-log", dest="logged", action="store_false",
+                     help="Disable logging for this rule.")
+    grc.add_argument("--disabled", action="store_true",
+                     help="Create the rule in disabled state.")
+    grc.set_defaults(func=cmd_gw_rule_create, logged=True)
+
+    gre = add_action(grsub, parents, "edit",
+                     "Edit a gateway rule in place (--enable-writes).")
+    gre.add_argument("name", help="Rule name or id.")
+    gre.add_argument("--policy", required=True, metavar="NAME",
+                     help="Policy containing the rule.")
+    gre.add_argument("--action", dest="rule_action", metavar="ACTION",
+                     choices=["ALLOW", "DROP", "REJECT"],
+                     help="New action.")
+    gre.add_argument("--from", dest="src", metavar="GROUP", action="append",
+                     help="Replace source groups.")
+    gre.add_argument("--to", dest="dst", metavar="GROUP", action="append",
+                     help="Replace destination groups.")
+    gre.add_argument("--service", metavar="PATH",
+                     help="Replace service.")
+    gre.add_argument("--enable-logging", dest="logged", action="store_true",
+                     default=None, help="Enable logging.")
+    gre.add_argument("--disable-logging", dest="logged", action="store_false",
+                     help="Disable logging.")
+    gre.add_argument("--enable-rule", dest="disabled", action="store_false",
+                     default=None, help="Enable the rule.")
+    gre.add_argument("--disable-rule", dest="disabled", action="store_true",
+                     help="Disable the rule.")
+    gre.set_defaults(func=cmd_gw_rule_edit)
+
+    grm = add_action(grsub, parents, "move",
+                     "Reorder a gateway rule (--enable-writes).")
+    grm.add_argument("name", help="Rule to reorder.")
+    grm.add_argument("--policy", required=True, metavar="NAME",
+                     help="Policy containing both rules.")
+    grm.add_argument("--before", required=True, metavar="OTHER",
+                     help="Move the rule immediately before this rule.")
+    grm.set_defaults(func=cmd_gw_rule_move)
+
+    grd = add_action(grsub, parents, "delete",
+                     "Delete a gateway rule (--enable-writes).")
+    grd.add_argument("name", help="Rule name or id.")
+    grd.add_argument("--policy", required=True, metavar="NAME",
+                     help="Policy containing the rule.")
+    grd.set_defaults(func=cmd_gw_rule_delete)
+
     gr.set_defaults(func=lambda a, ctx: gr.print_help())
 
 
@@ -12985,6 +13294,24 @@ def cmd_gw_policy_list(args, ctx):
     act_gw_policy_list(ctx.sessions, getattr(args, "domain", "default"),
                        ctx.exporter,
                        contains=getattr(args, "contains", None))
+    return 0
+
+
+def cmd_gw_policy_create(args, ctx):
+    act_gw_policy_create(
+        ctx.sessions, getattr(args, "domain", "default"), ctx.exporter,
+        name=args.name, category=args.category, seq=args.seq,
+        enable_writes=getattr(args, "enable_writes", False),
+        yes=getattr(args, "yes", False))
+    return 0
+
+
+def cmd_gw_policy_delete(args, ctx):
+    act_gw_policy_delete(
+        ctx.sessions, getattr(args, "domain", "default"), ctx.exporter,
+        name=args.name,
+        enable_writes=getattr(args, "enable_writes", False),
+        yes=getattr(args, "yes", False))
     return 0
 
 
@@ -13001,6 +13328,55 @@ def cmd_gw_rule_list(args, ctx):
 def cmd_gw_hygiene(args, ctx):
     act_gw_hygiene(ctx.sessions, getattr(args, "domain", "default"),
                    ctx.exporter)
+    return 0
+
+
+def cmd_gw_rule_create(args, ctx):
+    act_gw_rule_create(
+        ctx.sessions, getattr(args, "domain", "default"), ctx.exporter,
+        policy=args.policy, name=args.name,
+        src=getattr(args, "src", None),
+        dst=getattr(args, "dst", None),
+        service=getattr(args, "service", None),
+        action=getattr(args, "rule_action", "ALLOW"),
+        seq=getattr(args, "seq", 10),
+        logged=getattr(args, "logged", True),
+        disabled=getattr(args, "disabled", False),
+        enable_writes=getattr(args, "enable_writes", False),
+        yes=getattr(args, "yes", False))
+    return 0
+
+
+def cmd_gw_rule_edit(args, ctx):
+    act_gw_rule_edit(
+        ctx.sessions, getattr(args, "domain", "default"), ctx.exporter,
+        policy=args.policy, name=args.name,
+        action=getattr(args, "rule_action", None),
+        src=getattr(args, "src", None),
+        dst=getattr(args, "dst", None),
+        service=getattr(args, "service", None),
+        logged=getattr(args, "logged", None),
+        disabled=getattr(args, "disabled", None),
+        enable_writes=getattr(args, "enable_writes", False),
+        yes=getattr(args, "yes", False))
+    return 0
+
+
+def cmd_gw_rule_move(args, ctx):
+    act_gw_rule_move(
+        ctx.sessions, getattr(args, "domain", "default"), ctx.exporter,
+        policy=args.policy, name=args.name, before=args.before,
+        enable_writes=getattr(args, "enable_writes", False),
+        yes=getattr(args, "yes", False))
+    return 0
+
+
+def cmd_gw_rule_delete(args, ctx):
+    act_gw_rule_delete(
+        ctx.sessions, getattr(args, "domain", "default"), ctx.exporter,
+        policy=args.policy, name=args.name,
+        enable_writes=getattr(args, "enable_writes", False),
+        yes=getattr(args, "yes", False))
     return 0
 
 

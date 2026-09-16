@@ -499,6 +499,15 @@ class _Handler(BaseHTTPRequestHandler):
                 hit = next((r for r in rules if r["id"] == oid), None)
                 if hit:
                     return hit
+        if kind == "gw_policy":
+            return next((p for p in st.gw_policies if p["id"] == oid), None)
+        if kind == "gw_rule":
+            for policy_id, rules in st.gw_rules.items():
+                if pid and policy_id != pid:
+                    continue
+                hit = next((r for r in rules if r["id"] == oid), None)
+                if hit:
+                    return hit
         return None
 
     def _policy_target(self, rel):
@@ -512,6 +521,12 @@ class _Handler(BaseHTTPRequestHandler):
                 return "policy", parts[3], None
             if len(parts) == 6 and parts[4] == "rules":
                 return "rule", parts[5], parts[3]
+        if len(parts) >= 4 and parts[0] == "domains" and \
+                parts[2] == "gateway-policies":
+            if len(parts) == 4:
+                return "gw_policy", parts[3], None
+            if len(parts) == 6 and parts[4] == "rules":
+                return "gw_rule", parts[5], parts[3]
         return None, None, None
 
     # --- routing -----------------------------------------------------------
@@ -605,11 +620,16 @@ class _Handler(BaseHTTPRequestHandler):
 
             created = dict(body)
             created["id"] = oid
-            created["path"] = "{}/domains/default/{}".format(
-                "/infra",
-                "groups/{}".format(oid) if kind == "group"
-                else ("security-policies/{}".format(oid) if kind == "policy"
-                      else "security-policies/{}/rules/{}".format(pid, oid)))
+            if kind == "group":
+                created["path"] = "/infra/domains/default/groups/{}".format(oid)
+            elif kind == "policy":
+                created["path"] = "/infra/domains/default/security-policies/{}".format(oid)
+            elif kind == "rule":
+                created["path"] = "/infra/domains/default/security-policies/{}/rules/{}".format(pid, oid)
+            elif kind == "gw_policy":
+                created["path"] = "/infra/domains/default/gateway-policies/{}".format(oid)
+            else:
+                created["path"] = "/infra/domains/default/gateway-policies/{}/rules/{}".format(pid, oid)
             created.update(_meta(created["path"]))
             if kind == "group":
                 st.groups.append(created)
@@ -617,9 +637,15 @@ class _Handler(BaseHTTPRequestHandler):
             elif kind == "policy":
                 st.policies.append(created)
                 st.rules.setdefault(oid, [])
-            else:
+            elif kind == "rule":
                 created.setdefault("rule_id", _next_rule_id())
                 st.rules.setdefault(pid, []).append(created)
+            elif kind == "gw_policy":
+                st.gw_policies.append(created)
+                st.gw_rules.setdefault(oid, [])
+            else:
+                created.setdefault("rule_id", _next_rule_id())
+                st.gw_rules.setdefault(pid, []).append(created)
             return self._send(200, created)
 
     def do_DELETE(self):
@@ -653,8 +679,13 @@ class _Handler(BaseHTTPRequestHandler):
             elif kind == "policy":
                 st.policies.remove(target)
                 st.rules.pop(oid, None)
-            else:
+            elif kind == "rule":
                 st.rules[pid].remove(target)
+            elif kind == "gw_policy":
+                st.gw_policies.remove(target)
+                st.gw_rules.pop(oid, None)
+            else:
+                st.gw_rules[pid].remove(target)
         return self._send(200, {})
 
     def do_GET(self):
