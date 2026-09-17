@@ -16,7 +16,20 @@ from ..api import (
     p_vm_group_assoc,
 )
 from ..errors import NsxError
-from ..output import Spinner, cB, cBG, cBR, cC, cD, err, hr, parallel_run, say, section, table
+from ..output import (
+    Spinner,
+    cB,
+    cBG,
+    cBR,
+    cC,
+    cD,
+    err,
+    hr,
+    parallel_run,
+    say,
+    section,
+    table,
+)
 from ..policy import sweep_rules
 from ..render import criteria_summary
 
@@ -119,7 +132,7 @@ def act_vm_groups(all_sessions, needle, domain, exporter):
         label="Fetching group criteria",
         key=lambda item: (item[0].name, item[1]),
     )
-    for (sname, gid), value in fetched_exprs.items():
+    for (_sname, gid), value in fetched_exprs.items():
         if gid not in group_results and not isinstance(value, Exception):
             group_results[gid] = criteria_summary(value.get(F_EXPRESSION))
 

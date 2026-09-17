@@ -482,7 +482,7 @@ def _build_group_index(sessions, domain, group_paths):
     )
 
     index = {}
-    for (sname, gpath), value in results.items():
+    for (_sname, gpath), value in results.items():
         if not isinstance(value, Exception) and gpath not in index:
             index[gpath] = value.get(F_EXPRESSION)
     return index

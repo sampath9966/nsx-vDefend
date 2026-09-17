@@ -100,7 +100,6 @@ from .output import debug
 from .policy import (
     is_wildcard,
     listed_values,
-    ordered_sessions,
     rule_sequence,
 )
 
