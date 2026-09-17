@@ -2859,19 +2859,8 @@ def load_service_index(sessions, domain):
     Needed because a rule names its services by path, and "does this rule
     cover port 3306" cannot be answered from the path alone.
     """
-    gm_sessions, lm_sessions = ordered_sessions(sessions)
-    index = {}
-    for nsx in gm_sessions + lm_sessions:
-        try:
-            services = nsx.get_all(p_services(nsx.base(domain)))
-        except NsxError as e:
-            debug("service listing on {} failed: {}".format(nsx.name, e))
-            continue
-        for service in services:
-            path = service.get(F_PATH)
-            if path and path not in index:
-                index[path] = service
-    return index
+    pass
+    return service_inventory(sessions, domain)
 
 
 def port_in_spec(port, spec):
@@ -6458,19 +6447,30 @@ def act_vm_groups(all_sessions, needle, domain, exporter):
         for gp in record.group_refs() & group_paths:
             rule_counts[gp] = rule_counts.get(gp, 0) + 1
 
-    # Fetch group expressions for the criteria column
+    # Fetch group expressions for the criteria column — all groups in parallel.
+    def _fetch_group(item):
+        nsx, gid = item
+        return nsx.get(p_group(nsx.base(domain), domain, gid))
+
+    group_work = [(nsx, gid)
+                  for gid in matched
+                  for nsx in (lm_sessions + gm_sessions)]
+    group_results = {}
+    fetched_exprs = parallel_run(
+        group_work,
+        _fetch_group,
+        label="Fetching group criteria",
+        key=lambda item: (item[0].name, item[1]),
+    )
+    for (_sname, gid), value in fetched_exprs.items():
+        if gid not in group_results and not isinstance(value, Exception):
+            group_results[gid] = criteria_summary(value.get(F_EXPRESSION))
+
     rows = []
     display_rows = []
     for gid, (gpath, gname, origin) in sorted(matched.items(),
                                                key=lambda kv: kv[1][1].lower()):
-        criteria = ""
-        for nsx in (lm_sessions + gm_sessions):
-            try:
-                g = nsx.get(p_group(nsx.base(domain), domain, gid))
-                criteria = criteria_summary(g.get(F_EXPRESSION))
-                break
-            except NsxError:
-                continue
+        criteria = group_results.get(gid, "")
         rc = rule_counts.get(gpath, 0)
         origin_lbl = cC("GM") if origin == "GM" else cD("LM")
         rows.append([vname, nsx_lm.name, gid, gname, origin, criteria, str(rc)])
@@ -6892,9 +6892,12 @@ def group_member_counts(groups, domain):
 
     def fetch(item):
         path, (nsx, group) = item
-        members = nsx.get_all(p_group_members(nsx.base(domain), domain,
-                                              group.get(F_ID, "?")))
-        return len(members)
+        # Read only the first page (page_size=1) and return result_count,
+        # avoiding pagination through potentially thousands of members.
+        resp = nsx.get(p_group_members(nsx.base(domain), domain,
+                                       group.get(F_ID, "?")),
+                       params={PARAM_PAGE_SIZE: 1})
+        return int(resp.get(F_RESULT_COUNT, 0))
 
     results = parallel_run(list(measurable.items()), fetch,
                            label="Group members",
@@ -8353,19 +8356,32 @@ def _group_match_basis(query_net, expression):
 
 def _build_group_index(sessions, domain, group_paths):
     """Map group_path -> match basis for as many groups as we can fetch."""
-    index = {}
+    # Build (nsx, gpath) work items — one per (session, unresolved path).
+    # We stop trying a path as soon as any session resolves it, so we avoid
+    # duplicate fetches when GM and LM both know the same group.
+    work = []
+    resolved = set()
     for nsx in sessions:
-        for gpath in list(group_paths):
-            if gpath in index:
-                continue
+        for gpath in group_paths:
             gid = group_id_from_path(gpath)
-            if not gid:
-                continue
-            try:
-                g = nsx.get(p_group(nsx.base(domain), domain, gid))
-                index[gpath] = g.get(F_EXPRESSION)
-            except Exception:  # noqa: BLE001
-                pass
+            if gid and gpath not in resolved:
+                work.append((nsx, gpath, gid))
+
+    def fetch(item):
+        nsx, gpath, gid = item
+        return nsx.get(p_group(nsx.base(domain), domain, gid))
+
+    results = parallel_run(
+        work,
+        fetch,
+        label="Fetching groups",
+        key=lambda item: (item[0].name, item[1]),
+    )
+
+    index = {}
+    for (_sname, gpath), value in results.items():
+        if not isinstance(value, Exception) and gpath not in index:
+            index[gpath] = value.get(F_EXPRESSION)
     return index
 
 
@@ -10007,7 +10023,9 @@ def act_gw_policy_list(sessions, domain, exporter, contains=None):
         lambda s: s.get_gw_policies(domain),
         label="Fetching gateway policies",
     )
-    rows = []
+    # Collect (session, policy_id) pairs that pass the name filter so we can
+    # fetch all rules for all policies in parallel rather than serially.
+    pol_map = {}  # (s.name, pid) -> (s, pol)
     for s in sessions:
         result = fetched.get(s.name)
         if isinstance(result, Exception):
@@ -10017,22 +10035,35 @@ def act_gw_policy_list(sessions, domain, exporter, contains=None):
             name = pol.get(F_DISPLAY_NAME, pol.get(F_ID, ""))
             if contains and contains.lower() not in name.lower():
                 continue
-            pid = pol.get(F_ID, "")
-            rules = s.get_gw_rules(pid, domain)
-            scope_parts = [
-                g.rsplit("/", 1)[-1]
-                for g in (pol.get(F_SCOPE) or [])
-                if g != ANY
-            ]
-            rows.append([
-                s.name,
-                pid,
-                name,
-                pol.get(F_CATEGORY, ""),
-                str(pol.get(F_SEQUENCE_NUMBER, "")),
-                str(len(rules)),
-                ", ".join(scope_parts) or ANY,
-            ])
+            pol_map[(s.name, pol.get(F_ID, ""))] = (s, pol)
+
+    rules_fetched = parallel_run(
+        list(pol_map.items()),
+        lambda item: item[1][0].get_gw_rules(item[0][1], domain),
+        label="Fetching gateway rules",
+        key=lambda item: item[0],
+    )
+
+    rows = []
+    for (sname, pid), (s, pol) in pol_map.items():
+        rules = rules_fetched.get((sname, pid))
+        if isinstance(rules, Exception):
+            rules = []
+        name = pol.get(F_DISPLAY_NAME, pol.get(F_ID, ""))
+        scope_parts = [
+            g.rsplit("/", 1)[-1]
+            for g in (pol.get(F_SCOPE) or [])
+            if g != ANY
+        ]
+        rows.append([
+            s.name,
+            pid,
+            name,
+            pol.get(F_CATEGORY, ""),
+            str(pol.get(F_SEQUENCE_NUMBER, "")),
+            str(len(rules)),
+            ", ".join(scope_parts) or ANY,
+        ])
     section("Gateway policies ({})".format(len(rows)))
     if rows:
         table(GW_POLICY_HEADERS, rows)
@@ -10049,7 +10080,7 @@ def act_gw_rule_list(sessions, domain, exporter, policy=None,
         lambda s: s.get_gw_policies(domain),
         label="Fetching gateway policies",
     )
-    all_rows = []
+    pol_map = {}  # (s.name, pid) -> (s, pname)
     for s in sessions:
         policies = fetched.get(s.name)
         if isinstance(policies, Exception) or not policies:
@@ -10058,9 +10089,21 @@ def act_gw_rule_list(sessions, domain, exporter, policy=None,
             pname = pol.get(F_DISPLAY_NAME, pol.get(F_ID, ""))
             if policy and policy.lower() not in pname.lower():
                 continue
-            pid = pol.get(F_ID, "")
-            rules = s.get_gw_rules(pid, domain)
-            for rule in rules:
+            pol_map[(s.name, pol.get(F_ID, ""))] = (s, pname)
+
+    rules_fetched = parallel_run(
+        list(pol_map.items()),
+        lambda item: item[1][0].get_gw_rules(item[0][1], domain),
+        label="Fetching gateway rules",
+        key=lambda item: item[0],
+    )
+
+    all_rows = []
+    for (sname, pid), (s, pname) in pol_map.items():
+        rules = rules_fetched.get((sname, pid))
+        if isinstance(rules, Exception) or not rules:
+            continue
+        for rule in rules:
                 rname = rule.get(F_DISPLAY_NAME, rule.get(F_ID, ""))
                 if contains and contains.lower() not in rname.lower():
                     continue
@@ -10098,14 +10141,33 @@ def act_gw_rule_list(sessions, domain, exporter, policy=None,
 
 def act_gw_hygiene(sessions, domain, exporter):
     """Gateway firewall hygiene: any-any-allow, disabled rules, drop-not-logged."""
-    findings = []
+    fetched = parallel_run(
+        sessions,
+        lambda s: s.get_gw_policies(domain),
+        label="Fetching gateway policies",
+    )
+    pol_map = {}  # (s.name, pid) -> (s, pname)
     for s in sessions:
-        policies = s.get_gw_policies(domain)
+        policies = fetched.get(s.name)
+        if isinstance(policies, Exception) or not policies:
+            continue
         for pol in policies:
             pid = pol.get(F_ID, "")
-            pname = pol.get(F_DISPLAY_NAME, pid)
-            rules = s.get_gw_rules(pid, domain)
-            for rule in rules:
+            pol_map[(s.name, pid)] = (s, pol.get(F_DISPLAY_NAME, pid))
+
+    rules_fetched = parallel_run(
+        list(pol_map.items()),
+        lambda item: item[1][0].get_gw_rules(item[0][1], domain),
+        label="Fetching gateway rules",
+        key=lambda item: item[0],
+    )
+
+    findings = []
+    for (sname, pid), (s, pname) in pol_map.items():
+        rules = rules_fetched.get((sname, pid))
+        if isinstance(rules, Exception) or not rules:
+            continue
+        for rule in rules:
                 rname = rule.get(F_DISPLAY_NAME, rule.get(F_ID, ""))
                 act = rule.get(F_ACTION_FIELD, "")
                 src = rule.get(F_SOURCE_GROUPS, [])

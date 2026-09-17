@@ -35,11 +35,13 @@ from ..api import (
     F_LAST_UPDATE,
     F_LOGGED,
     F_MEMBER_TYPE,
+    F_RESULT_COUNT,
     F_RESULTS,
     F_RULE_PATH,
     F_SCOPE,
     F_SERVICES,
     F_STATISTICS,
+    PARAM_PAGE_SIZE,
     RT,
     RT_CONDITION,
     RT_CONJUNCTION,
@@ -220,9 +222,12 @@ def group_member_counts(groups, domain):
 
     def fetch(item):
         path, (nsx, group) = item
-        members = nsx.get_all(p_group_members(nsx.base(domain), domain,
-                                              group.get(F_ID, "?")))
-        return len(members)
+        # Read only the first page (page_size=1) and return result_count,
+        # avoiding pagination through potentially thousands of members.
+        resp = nsx.get(p_group_members(nsx.base(domain), domain,
+                                       group.get(F_ID, "?")),
+                       params={PARAM_PAGE_SIZE: 1})
+        return int(resp.get(F_RESULT_COUNT, 0))
 
     results = parallel_run(list(measurable.items()), fetch,
                            label="Group members",

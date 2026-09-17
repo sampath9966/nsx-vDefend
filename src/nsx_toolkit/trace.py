@@ -91,7 +91,6 @@ from .api import (
     TF_TERMINAL_STATES,
     category_rank,
     group_id_from_path,
-    p_services,
     p_traceflow_observations,
     p_traceflow_one,
     p_vm_group_assoc,
@@ -101,7 +100,6 @@ from .output import debug
 from .policy import (
     is_wildcard,
     listed_values,
-    ordered_sessions,
     rule_sequence,
 )
 
@@ -406,19 +404,8 @@ def load_service_index(sessions, domain):
     Needed because a rule names its services by path, and "does this rule
     cover port 3306" cannot be answered from the path alone.
     """
-    gm_sessions, lm_sessions = ordered_sessions(sessions)
-    index = {}
-    for nsx in gm_sessions + lm_sessions:
-        try:
-            services = nsx.get_all(p_services(nsx.base(domain)))
-        except NsxError as e:
-            debug("service listing on {} failed: {}".format(nsx.name, e))
-            continue
-        for service in services:
-            path = service.get(F_PATH)
-            if path and path not in index:
-                index[path] = service
-    return index
+    from .authoring import service_inventory  # avoid circular import at module level
+    return service_inventory(sessions, domain)
 
 
 def port_in_spec(port, spec):

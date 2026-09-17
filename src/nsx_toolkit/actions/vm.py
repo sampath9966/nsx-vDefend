@@ -16,7 +16,20 @@ from ..api import (
     p_vm_group_assoc,
 )
 from ..errors import NsxError
-from ..output import Spinner, cB, cBG, cBR, cC, cD, err, hr, say, section, table
+from ..output import (
+    Spinner,
+    cB,
+    cBG,
+    cBR,
+    cC,
+    cD,
+    err,
+    hr,
+    parallel_run,
+    say,
+    section,
+    table,
+)
 from ..policy import sweep_rules
 from ..render import criteria_summary
 
@@ -104,19 +117,30 @@ def act_vm_groups(all_sessions, needle, domain, exporter):
         for gp in record.group_refs() & group_paths:
             rule_counts[gp] = rule_counts.get(gp, 0) + 1
 
-    # Fetch group expressions for the criteria column
+    # Fetch group expressions for the criteria column — all groups in parallel.
+    def _fetch_group(item):
+        nsx, gid = item
+        return nsx.get(p_group(nsx.base(domain), domain, gid))
+
+    group_work = [(nsx, gid)
+                  for gid in matched
+                  for nsx in (lm_sessions + gm_sessions)]
+    group_results = {}
+    fetched_exprs = parallel_run(
+        group_work,
+        _fetch_group,
+        label="Fetching group criteria",
+        key=lambda item: (item[0].name, item[1]),
+    )
+    for (_sname, gid), value in fetched_exprs.items():
+        if gid not in group_results and not isinstance(value, Exception):
+            group_results[gid] = criteria_summary(value.get(F_EXPRESSION))
+
     rows = []
     display_rows = []
     for gid, (gpath, gname, origin) in sorted(matched.items(),
                                                key=lambda kv: kv[1][1].lower()):
-        criteria = ""
-        for nsx in (lm_sessions + gm_sessions):
-            try:
-                g = nsx.get(p_group(nsx.base(domain), domain, gid))
-                criteria = criteria_summary(g.get(F_EXPRESSION))
-                break
-            except NsxError:
-                continue
+        criteria = group_results.get(gid, "")
         rc = rule_counts.get(gpath, 0)
         origin_lbl = cC("GM") if origin == "GM" else cD("LM")
         rows.append([vname, nsx_lm.name, gid, gname, origin, criteria, str(rc)])
