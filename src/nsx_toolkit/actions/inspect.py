@@ -65,6 +65,7 @@ from ..output import (
     err,
     hr,
     more_note,
+    parallel_run,
     say,
     section,
     table,
@@ -458,19 +459,32 @@ def _group_match_basis(query_net, expression):
 
 def _build_group_index(sessions, domain, group_paths):
     """Map group_path -> match basis for as many groups as we can fetch."""
-    index = {}
+    # Build (nsx, gpath) work items — one per (session, unresolved path).
+    # We stop trying a path as soon as any session resolves it, so we avoid
+    # duplicate fetches when GM and LM both know the same group.
+    work = []
+    resolved = set()
     for nsx in sessions:
-        for gpath in list(group_paths):
-            if gpath in index:
-                continue
+        for gpath in group_paths:
             gid = group_id_from_path(gpath)
-            if not gid:
-                continue
-            try:
-                g = nsx.get(p_group(nsx.base(domain), domain, gid))
-                index[gpath] = g.get(F_EXPRESSION)
-            except Exception:  # noqa: BLE001
-                pass
+            if gid and gpath not in resolved:
+                work.append((nsx, gpath, gid))
+
+    def fetch(item):
+        nsx, gpath, gid = item
+        return nsx.get(p_group(nsx.base(domain), domain, gid))
+
+    results = parallel_run(
+        work,
+        fetch,
+        label="Fetching groups",
+        key=lambda item: (item[0].name, item[1]),
+    )
+
+    index = {}
+    for (sname, gpath), value in results.items():
+        if not isinstance(value, Exception) and gpath not in index:
+            index[gpath] = value.get(F_EXPRESSION)
     return index
 
 
